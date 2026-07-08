@@ -38,6 +38,8 @@ android_logger = "0.15"
 # Reading the phone's GNSS via Android LocationManager over JNI. The JVM and
 # Activity pointers come from AndroidApp, so ndk-context is not needed.
 jni = "0.21"
+# Compass heading from the native rotation-vector sensor (no JNI/Java needed).
+ndk-sys = "0.6"
 
 # Read by cargo-apk / cargo-ndk tooling. INTERNET is needed for online tiles;
 # the BLUETOOTH/LOCATION permissions are here for the BLE source added later.

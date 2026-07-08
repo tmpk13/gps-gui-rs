@@ -27,23 +27,41 @@ pub struct MyApp {
     tiles: HttpTiles,
     map_memory: MapMemory,
     gps_rx: Receiver<GpsFix>,
+    /// Optional device-facing compass heading stream (Android only).
+    compass_rx: Option<Receiver<f32>>,
     current: Option<Position>,
+    /// Course over ground from the GPS fix.
     heading: Option<f32>,
+    /// Device-facing heading from the compass sensor.
+    compass_heading: Option<f32>,
     track: Vec<Position>,
 }
 
 impl MyApp {
     /// `cache_dir` is where tiles are cached to disk (`None` to disable). Desktop
     /// passes a local `.cache`; Android passes its writable data directory.
-    pub fn new(ctx: egui::Context, gps_rx: Receiver<GpsFix>, cache_dir: Option<PathBuf>) -> Self {
+    /// `compass_rx` is the device-facing heading stream (`None` on desktop).
+    pub fn new(
+        ctx: egui::Context,
+        gps_rx: Receiver<GpsFix>,
+        cache_dir: Option<PathBuf>,
+        compass_rx: Option<Receiver<f32>>,
+    ) -> Self {
         Self {
             tiles: HttpTiles::with_options(OpenStreetMap, http_options(cache_dir), ctx),
             map_memory: MapMemory::default(),
             gps_rx,
+            compass_rx,
             current: None,
             heading: None,
+            compass_heading: None,
             track: Vec::new(),
         }
+    }
+
+    /// Device-facing compass heading if available, otherwise course over ground.
+    fn effective_heading(&self) -> Option<f32> {
+        self.compass_heading.or(self.heading)
     }
 
     /// Pull every pending fix out of the channel, updating the current position
@@ -55,6 +73,12 @@ impl MyApp {
             self.heading = fix.bearing;
             if self.track.last() != Some(&pos) {
                 self.track.push(pos);
+            }
+        }
+
+        if let Some(rx) = &self.compass_rx {
+            while let Ok(heading) = rx.try_recv() {
+                self.compass_heading = Some(heading);
             }
         }
     }
@@ -80,7 +104,7 @@ impl MyApp {
             ui.separator();
             match self.current {
                 Some(pos) => {
-                    let hdg = match self.heading {
+                    let hdg = match self.effective_heading() {
                         Some(b) => format!("  hdg {b:.0}"),
                         None => String::new(),
                     };
@@ -97,7 +121,7 @@ impl MyApp {
         let layer = GpsLayer {
             current: self.current,
             track: self.track.clone(),
-            heading: self.heading,
+            heading: self.effective_heading(),
         };
 
         let map = Map::new(Some(&mut self.tiles), &mut self.map_memory, my_position)

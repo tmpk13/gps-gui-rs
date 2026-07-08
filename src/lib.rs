@@ -2,6 +2,9 @@ pub mod app;
 pub mod gps;
 pub mod marker;
 
+#[cfg(target_os = "android")]
+mod compass;
+
 /// Android entry point.
 ///
 /// The Android activity glue calls the exported `android_main` symbol.
@@ -41,10 +44,12 @@ fn android_main(android_app: egui_winit::winit::platform::android::activity::And
         options,
         Box::new(move |cc| {
             let gps_rx = gps::spawn_android_location(cc.egui_ctx.clone(), vm_ptr, activity_ptr);
+            let compass_rx = Some(compass::spawn(cc.egui_ctx.clone()));
             Ok(Box::new(app::MyApp::new(
                 cc.egui_ctx.clone(),
                 gps_rx,
                 cache_dir,
+                compass_rx,
             )))
         }),
     );
