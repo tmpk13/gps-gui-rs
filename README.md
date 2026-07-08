@@ -7,9 +7,10 @@ position and the track behind it.
 - **Map**: [walkers](https://github.com/podusowski/walkers) slippy-map widget
 - **Tiles**: OpenStreetMap over HTTP, cached to disk (`.cache/`) so previously
   viewed areas keep rendering offline
-- **GPS**: currently a simulated source on a background thread; a BLE
-  ([btleplug](https://github.com/deviceplug/btleplug)) source is planned behind
-  the same channel interface
+- **GPS**: the phone's built-in GNSS (Android LocationManager over JNI) on
+  device; a simulated source on desktop. Both feed the same channel, so an
+  external BLE ([btleplug](https://github.com/deviceplug/btleplug)) source could
+  slot in the same way
 
 ## Run (desktop)
 
@@ -24,7 +25,8 @@ The map opens on Greenwich and a simulated fix traces a slow loop. Use
 
 One crate builds both: the desktop `[[bin]]` and an Android `cdylib` loaded from
 a NativeActivity via `android_main` (`src/lib.rs`). The Android build uses the
-`wgpu` renderer and disables the tile cache (the working dir is not writable).
+`wgpu` renderer, reads the phone's GNSS via LocationManager, and caches tiles to
+the app's writable data dir for offline reuse.
 
 Prerequisites: Android SDK + NDK, and `rustup target add aarch64-linux-android`.
 
@@ -32,6 +34,7 @@ Prerequisites: Android SDK + NDK, and `rustup target add aarch64-linux-android`.
 # no-Java flow with xbuild (recommended)
 cargo install xbuild
 x doctor                              # verify SDK/NDK are found
+adb devices -l
 x run --release --device adb:<serial> # build APK, install, launch
 
 # or with cargo-apk
@@ -40,8 +43,9 @@ cargo apk run --release
 ```
 
 Point `ANDROID_HOME` / `ANDROID_NDK_HOME` at your installs (or let `x doctor`
-locate them). Permissions (INTERNET, and BLUETOOTH/LOCATION for later BLE) are
-declared under `[package.metadata.android]` in `Cargo.toml`.
+locate them). Permissions (INTERNET for tiles, LOCATION for GPS) are declared in
+`manifest.yaml`, which is what xbuild reads — it ignores Cargo.toml's
+`[package.metadata.android]`.
 
 ## Architecture
 

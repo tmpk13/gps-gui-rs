@@ -34,7 +34,7 @@ fn android_main(android_app: egui_winit::winit::platform::android::activity::And
         "gps-gui-rs",
         options,
         Box::new(move |cc| {
-            let gps_rx = gps::spawn_simulated(cc.egui_ctx.clone());
+            let gps_rx = gps::spawn_android_location(cc.egui_ctx.clone());
             Ok(Box::new(app::MyApp::new(
                 cc.egui_ctx.clone(),
                 gps_rx,
