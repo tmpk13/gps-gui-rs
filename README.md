@@ -11,7 +11,7 @@ position and the track behind it.
   ([btleplug](https://github.com/deviceplug/btleplug)) source is planned behind
   the same channel interface
 
-## Run
+## Run (desktop)
 
 ```sh
 cargo run
@@ -19,6 +19,29 @@ cargo run
 
 The map opens on Greenwich and a simulated fix traces a slow loop. Use
 **Center on GPS** to follow the position, **Zoom in/out**, and **Clear track**.
+
+## Run (Android)
+
+One crate builds both: the desktop `[[bin]]` and an Android `cdylib` loaded from
+a NativeActivity via `android_main` (`src/lib.rs`). The Android build uses the
+`wgpu` renderer and disables the tile cache (the working dir is not writable).
+
+Prerequisites: Android SDK + NDK, and `rustup target add aarch64-linux-android`.
+
+```sh
+# no-Java flow with xbuild (recommended)
+cargo install xbuild
+x doctor                              # verify SDK/NDK are found
+x run --release --device adb:<serial> # build APK, install, launch
+
+# or with cargo-apk
+cargo install cargo-apk
+cargo apk run --release
+```
+
+Point `ANDROID_HOME` / `ANDROID_NDK_HOME` at your installs (or let `x doctor`
+locate them). Permissions (INTERNET, and BLUETOOTH/LOCATION for later BLE) are
+declared under `[package.metadata.android]` in `Cargo.toml`.
 
 ## Architecture
 

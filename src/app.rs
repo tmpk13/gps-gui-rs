@@ -14,9 +14,16 @@ fn default_position() -> Position {
 
 /// HTTP tile options with an on-disk cache. Tiles fetched once are reused from
 /// `.cache`, so previously viewed areas keep working without a network.
+///
+/// The working directory is not writable on Android, so the cache is disabled
+/// there (tiles are still fetched, just not persisted).
 fn http_options() -> HttpOptions {
     HttpOptions {
-        cache: Some(".cache".into()),
+        cache: if cfg!(target_os = "android") {
+            None
+        } else {
+            Some(".cache".into())
+        },
         ..Default::default()
     }
 }

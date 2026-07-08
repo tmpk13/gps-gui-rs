@@ -1,10 +1,10 @@
-mod app;
-mod gps;
-mod marker;
+// Desktop entry point. On Android the crate is built as a cdylib and started
+// through `android_main` in lib.rs instead, so this binary is empty there.
 
-use app::MyApp;
-
+#[cfg(not(target_os = "android"))]
 fn main() -> eframe::Result<()> {
+    use gps_gui_rs::{app::MyApp, gps};
+
     env_logger::init();
 
     let options = eframe::NativeOptions {
@@ -18,11 +18,11 @@ fn main() -> eframe::Result<()> {
         "gps-gui-rs",
         options,
         Box::new(|cc| {
-            // The GPS source runs on its own thread and pushes fixes over a
-            // channel. Today it is simulated; swapping in a BLE-backed source
-            // later only means changing this one line.
             let gps_rx = gps::spawn_simulated(cc.egui_ctx.clone());
             Ok(Box::new(MyApp::new(cc.egui_ctx.clone(), gps_rx)))
         }),
     )
 }
+
+#[cfg(target_os = "android")]
+fn main() {}
