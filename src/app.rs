@@ -171,18 +171,8 @@ impl MyApp {
         let start = ui.ctx().graphics_mut(|g| g.entry(layer_id).next_idx());
 
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(map_rect));
-        // Dragging pans in the unrotated tile space, so it fights the rotated
-        // view on touch. Disable panning while heading-up is active on mobile;
-        // zoom (pinch and buttons) is unaffected.
-        let allow_pan = !(rotation.is_some() && cfg!(target_os = "android"));
         let map = Map::new(Some(&mut self.tiles), &mut self.map_memory, my_position)
-            .with_plugin(layer)
-            .panning(allow_pan)
-            .drag_pan_buttons(if allow_pan {
-                egui::DragPanButtons::PRIMARY
-            } else {
-                egui::DragPanButtons::empty()
-            });
+            .with_plugin(layer);
         child.add(map);
 
         if let Some(rot) = rotation {
@@ -232,6 +222,13 @@ impl eframe::App for MyApp {
                 None
             }
         };
+
+        // Heading-up locks the map to the current position: it stays centered on
+        // you (re-following each frame), which also makes dragging a no-op so the
+        // rotated view can't be panned off. Zoom (buttons) still works.
+        if self.heading_up && self.current.is_some() {
+            self.map_memory.follow_my_position();
+        }
 
         // A rotated map needs to paint past the screen edges, otherwise the
         // corners rotate away to nothing. Overscan to a square whose side is the
