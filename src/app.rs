@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
+use egui::emath::Rot2;
+use egui::{Pos2, Shape};
 use walkers::{
     lat_lon, sources::OpenStreetMap, HttpOptions, HttpTiles, Map, MapMemory, Position,
 };
@@ -37,6 +39,11 @@ pub struct MyApp {
     heading: Option<f32>,
     /// Device-facing heading from the compass sensor.
     compass_heading: Option<f32>,
+    /// When set, the map is rotated so the current heading points up.
+    heading_up: bool,
+    /// Rotation angle actually drawn, eased toward the live heading each frame so
+    /// the map turns smoothly instead of snapping between sensor readings.
+    smoothed_heading: Option<f32>,
     track: Vec<Position>,
 }
 
@@ -61,6 +68,8 @@ impl MyApp {
             current: None,
             heading: None,
             compass_heading: None,
+            heading_up: false,
+            smoothed_heading: None,
             track: Vec::new(),
         }
     }
@@ -105,6 +114,14 @@ impl MyApp {
             if ui.button("Center on GPS").clicked() {
                 self.map_memory.follow_my_position();
             }
+            let rotate_label = if self.heading_up {
+                "North up"
+            } else {
+                "Heading up"
+            };
+            if ui.button(rotate_label).clicked() {
+                self.heading_up = !self.heading_up;
+            }
             if ui.button("Zoom in").clicked() {
                 let _ = self.map_memory.zoom_in();
             }
@@ -129,7 +146,17 @@ impl MyApp {
         });
     }
 
-    fn map(&mut self, ui: &mut egui::Ui) {
+    /// Paint the map into `map_rect` (which may overscan past `clip`). When
+    /// `rotation` is set, the painted shapes are rotated about the center of
+    /// `clip` and then clipped back to `clip`, so the visible map spins with the
+    /// heading while its corners stay filled by the overscan.
+    fn map(
+        &mut self,
+        ui: &mut egui::Ui,
+        map_rect: egui::Rect,
+        rotation: Option<Rot2>,
+        clip: egui::Rect,
+    ) {
         let my_position = self.current.unwrap_or_else(default_position);
 
         let layer = GpsLayer {
@@ -138,10 +165,29 @@ impl MyApp {
             heading: self.effective_heading(),
         };
 
+        // walkers sizes itself to the child's available space, so give it the
+        // (possibly overscanned) map rect.
+        let layer_id = ui.layer_id();
+        let start = ui.ctx().graphics_mut(|g| g.entry(layer_id).next_idx());
+
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(map_rect));
         let map = Map::new(Some(&mut self.tiles), &mut self.map_memory, my_position)
             .with_plugin(layer);
+        child.add(map);
 
-        ui.add(map);
+        if let Some(rot) = rotation {
+            let pivot = clip.center();
+            let end = ui.ctx().graphics_mut(|g| g.entry(layer_id).next_idx());
+            ui.ctx().graphics_mut(|g| {
+                let list = g.entry(layer_id);
+                for i in start.0..end.0 {
+                    list.mutate_shape(egui::layers::ShapeIdx(i), |cs| {
+                        rotate_shape(&mut cs.shape, rot, pivot);
+                        cs.clip_rect = clip;
+                    });
+                }
+            });
+        }
     }
 }
 
@@ -149,16 +195,128 @@ impl eframe::App for MyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_gps();
 
-        // Push the controls below the status bar / notch on Android.
-        let top = self.top_inset(ui.ctx());
-        egui::Panel::top("controls").show(ui, |ui| {
-            ui.add_space(top + 4.0);
-            self.controls(ui);
-            ui.add_space(4.0);
-        });
+        let ctx = ui.ctx().clone();
+        let screen = ctx.input(|i| i.viewport_rect());
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.map(ui);
-        });
+        // Rotate the map so the heading points up, when enabled and known. The
+        // drawn angle eases toward the live heading each frame (shortest way
+        // round the circle), so the map glides rather than stepping between
+        // sensor updates. We keep requesting repaints until it settles.
+        let rotation = match (self.heading_up, self.effective_heading()) {
+            (true, Some(target)) => {
+                let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+                let current = self.smoothed_heading.unwrap_or(target);
+                // Signed shortest angular distance to the target, in (-180, 180].
+                let delta = (target - current + 540.0).rem_euclid(360.0) - 180.0;
+                // Time-constant easing so the feel is frame-rate independent.
+                let alpha = 1.0 - (-dt / 0.12).exp();
+                let next = (current + delta * alpha).rem_euclid(360.0);
+                self.smoothed_heading = Some(next);
+                if delta.abs() > 0.05 {
+                    ctx.request_repaint();
+                }
+                Some(Rot2::from_angle(-next.to_radians()))
+            }
+            _ => {
+                self.smoothed_heading = None;
+                None
+            }
+        };
+
+        // A rotated map needs to paint past the screen edges, otherwise the
+        // corners rotate away to nothing. Overscan to a square whose side is the
+        // screen diagonal - large enough to cover the screen at any angle.
+        let map_rect = if rotation.is_some() {
+            egui::Rect::from_center_size(screen.center(), egui::Vec2::splat(screen.size().length()))
+        } else {
+            screen
+        };
+
+        // Full-bleed map in the background layer. It lives in its own Area (not a
+        // CentralPanel) so its clip rect can extend past the screen for overscan.
+        egui::Area::new(egui::Id::new("map"))
+            .order(egui::Order::Background)
+            .fixed_pos(map_rect.min)
+            .movable(false)
+            .constrain(false)
+            .show(&ctx, |ui| {
+                ui.set_clip_rect(map_rect);
+                self.map(ui, map_rect, rotation, screen);
+            });
+
+        // Controls float on top in the foreground layer, so they keep pointer
+        // priority over the (interactive) map behind them. The fill spans the
+        // status-bar area; the top inset pushes the buttons clear of it.
+        let top = self.top_inset(&ctx);
+        egui::Area::new(egui::Id::new("controls"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::ZERO)
+            .movable(false)
+            .constrain(false)
+            .show(&ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.set_width(screen.width());
+                        ui.add_space(top);
+                        self.controls(ui);
+                    });
+            });
+    }
+}
+
+/// Rotate `p` by `rot` about `origin` (screen-space points).
+fn rotate_pos(p: Pos2, rot: Rot2, origin: Pos2) -> Pos2 {
+    origin + rot * (p - origin)
+}
+
+/// Rotate a painted [`Shape`] in place about `origin`. Mirrors the point-moving
+/// arm of `Shape::transform`, but applies a rotation instead of a scale/offset.
+/// Axis-aligned rects and callbacks can only follow their center; everything
+/// else (meshes, paths, text) rotates faithfully.
+fn rotate_shape(shape: &mut Shape, rot: Rot2, origin: Pos2) {
+    match shape {
+        Shape::Noop => {}
+        Shape::Vec(shapes) => {
+            for s in shapes {
+                rotate_shape(s, rot, origin);
+            }
+        }
+        Shape::Circle(c) => c.center = rotate_pos(c.center, rot, origin),
+        Shape::Ellipse(e) => e.center = rotate_pos(e.center, rot, origin),
+        Shape::LineSegment { points, .. } => {
+            for p in points {
+                *p = rotate_pos(*p, rot, origin);
+            }
+        }
+        Shape::Path(path) => {
+            for p in &mut path.points {
+                *p = rotate_pos(*p, rot, origin);
+            }
+        }
+        Shape::Rect(r) => {
+            let center = rotate_pos(r.rect.center(), rot, origin);
+            r.rect = egui::Rect::from_center_size(center, r.rect.size());
+        }
+        Shape::Text(t) => {
+            t.pos = rotate_pos(t.pos, rot, origin);
+            t.angle += rot.angle();
+        }
+        Shape::Mesh(mesh) => std::sync::Arc::make_mut(mesh).rotate(rot, origin),
+        Shape::QuadraticBezier(b) => {
+            for p in &mut b.points {
+                *p = rotate_pos(*p, rot, origin);
+            }
+        }
+        Shape::CubicBezier(b) => {
+            for p in &mut b.points {
+                *p = rotate_pos(*p, rot, origin);
+            }
+        }
+        Shape::Callback(cb) => {
+            let center = rotate_pos(cb.rect.center(), rot, origin);
+            cb.rect = egui::Rect::from_center_size(center, cb.rect.size());
+        }
     }
 }
