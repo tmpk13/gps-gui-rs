@@ -1,0 +1,12 @@
+# xbuild reads THIS file (not Cargo.toml's [package.metadata.android], which is
+# cargo-apk's schema). Without the INTERNET permission here, Android blocks the
+# tile downloads. Location + Bluetooth permissions are for the GPS source.
+android:
+  manifest:
+    package: rs.gps.gui
+    uses_permission:
+      - name: android.permission.INTERNET
+      - name: android.permission.ACCESS_FINE_LOCATION
+      - name: android.permission.ACCESS_COARSE_LOCATION
+      - name: android.permission.BLUETOOTH_SCAN
+      - name: android.permission.BLUETOOTH_CONNECT

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use walkers::{
@@ -12,18 +13,12 @@ fn default_position() -> Position {
     lat_lon(51.4779, -0.0015)
 }
 
-/// HTTP tile options with an on-disk cache. Tiles fetched once are reused from
-/// `.cache`, so previously viewed areas keep working without a network.
-///
-/// The working directory is not writable on Android, so the cache is disabled
-/// there (tiles are still fetched, just not persisted).
-fn http_options() -> HttpOptions {
+/// HTTP tile options caching to `cache_dir` (when writable). Tiles fetched once
+/// are reused from disk, so previously viewed areas keep working without a
+/// network. `None` disables the cache.
+fn http_options(cache_dir: Option<PathBuf>) -> HttpOptions {
     HttpOptions {
-        cache: if cfg!(target_os = "android") {
-            None
-        } else {
-            Some(".cache".into())
-        },
+        cache: cache_dir,
         ..Default::default()
     }
 }
@@ -37,9 +32,11 @@ pub struct MyApp {
 }
 
 impl MyApp {
-    pub fn new(ctx: egui::Context, gps_rx: Receiver<GpsFix>) -> Self {
+    /// `cache_dir` is where tiles are cached to disk (`None` to disable). Desktop
+    /// passes a local `.cache`; Android passes its writable data directory.
+    pub fn new(ctx: egui::Context, gps_rx: Receiver<GpsFix>, cache_dir: Option<PathBuf>) -> Self {
         Self {
-            tiles: HttpTiles::with_options(OpenStreetMap, http_options(), ctx),
+            tiles: HttpTiles::with_options(OpenStreetMap, http_options(cache_dir), ctx),
             map_memory: MapMemory::default(),
             gps_rx,
             current: None,

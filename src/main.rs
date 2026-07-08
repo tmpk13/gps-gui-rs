@@ -19,7 +19,8 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             let gps_rx = gps::spawn_simulated(cc.egui_ctx.clone());
-            Ok(Box::new(MyApp::new(cc.egui_ctx.clone(), gps_rx)))
+            let cache_dir = Some(std::path::PathBuf::from(".cache"));
+            Ok(Box::new(MyApp::new(cc.egui_ctx.clone(), gps_rx, cache_dir)))
         }),
     )
 }
