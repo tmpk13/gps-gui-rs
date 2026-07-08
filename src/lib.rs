@@ -35,6 +35,22 @@ fn android_main(android_app: egui_winit::winit::platform::android::activity::And
     let vm_ptr = android_app.vm_as_ptr() as usize;
     let activity_ptr = android_app.activity_as_ptr() as usize;
 
+    // Safe-area insets: `content_rect` is the region inside the system bars.
+    // Updates on rotation via the InsetsChanged event, so query it each frame.
+    let insets_app = android_app.clone();
+    let insets: Option<Box<dyn Fn() -> [f32; 4]>> = Some(Box::new(move || {
+        let rect = insets_app.content_rect();
+        let (w, h) = insets_app
+            .native_window()
+            .map(|win| (win.width(), win.height()))
+            .unwrap_or((0, 0));
+        let top = rect.top.max(0) as f32;
+        let left = rect.left.max(0) as f32;
+        let right = if w > 0 { (w - rect.right).max(0) as f32 } else { 0.0 };
+        let bottom = if h > 0 { (h - rect.bottom).max(0) as f32 } else { 0.0 };
+        [top, right, bottom, left]
+    }));
+
     let mut options = NativeOptions::default();
     options.renderer = Renderer::Wgpu;
     options.android_app = Some(android_app);
@@ -50,6 +66,7 @@ fn android_main(android_app: egui_winit::winit::platform::android::activity::And
                 gps_rx,
                 cache_dir,
                 compass_rx,
+                insets,
             )))
         }),
     );

@@ -29,6 +29,9 @@ pub struct MyApp {
     gps_rx: Receiver<GpsFix>,
     /// Optional device-facing compass heading stream (Android only).
     compass_rx: Option<Receiver<f32>>,
+    /// Returns the current safe-area insets `[top, right, bottom, left]` in
+    /// physical pixels. `None` on desktop (no system bars to avoid).
+    insets: Option<Box<dyn Fn() -> [f32; 4]>>,
     current: Option<Position>,
     /// Course over ground from the GPS fix.
     heading: Option<f32>,
@@ -41,21 +44,32 @@ impl MyApp {
     /// `cache_dir` is where tiles are cached to disk (`None` to disable). Desktop
     /// passes a local `.cache`; Android passes its writable data directory.
     /// `compass_rx` is the device-facing heading stream (`None` on desktop).
+    /// `insets` reports the safe-area insets in physical pixels (`None` on desktop).
     pub fn new(
         ctx: egui::Context,
         gps_rx: Receiver<GpsFix>,
         cache_dir: Option<PathBuf>,
         compass_rx: Option<Receiver<f32>>,
+        insets: Option<Box<dyn Fn() -> [f32; 4]>>,
     ) -> Self {
         Self {
             tiles: HttpTiles::with_options(OpenStreetMap, http_options(cache_dir), ctx),
             map_memory: MapMemory::default(),
             gps_rx,
             compass_rx,
+            insets,
             current: None,
             heading: None,
             compass_heading: None,
             track: Vec::new(),
+        }
+    }
+
+    /// Safe-area inset at the top (status bar) in egui points.
+    fn top_inset(&self, ctx: &egui::Context) -> f32 {
+        match &self.insets {
+            Some(f) => f()[0] / ctx.pixels_per_point(),
+            None => 0.0,
         }
     }
 
@@ -135,8 +149,10 @@ impl eframe::App for MyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_gps();
 
+        // Push the controls below the status bar / notch on Android.
+        let top = self.top_inset(ui.ctx());
         egui::Panel::top("controls").show(ui, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(top + 4.0);
             self.controls(ui);
             ui.add_space(4.0);
         });
