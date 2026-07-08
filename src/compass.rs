@@ -11,7 +11,7 @@ use std::thread;
 use ndk_sys as ns;
 
 /// Spawn the compass sensor loop. Emits the device heading in degrees clockwise
-/// from north whenever it changes by more than ~1 degree.
+/// from north whenever it changes by more than ~0.2 degree.
 pub fn spawn(ctx: egui::Context) -> Receiver<f32> {
     let (tx, rx) = channel();
     thread::spawn(move || unsafe { run(&tx, &ctx) });
@@ -57,7 +57,7 @@ unsafe fn run(tx: &Sender<f32>, ctx: &egui::Context) {
     }
 
     ns::ASensorEventQueue_enableSensor(queue, sensor);
-    ns::ASensorEventQueue_setEventRate(queue, sensor, 100_000); // 10 Hz
+    ns::ASensorEventQueue_setEventRate(queue, sensor, 16_000); // ~60 Hz
 
     let mut last_sent: Option<f32> = None;
 
@@ -81,7 +81,7 @@ unsafe fn run(tx: &Sender<f32>, ctx: &egui::Context) {
         }
 
         if let Some(az) = latest {
-            if last_sent.map_or(true, |prev| angle_diff(prev, az) > 1.0) {
+            if last_sent.map_or(true, |prev| angle_diff(prev, az) > 0.2) {
                 last_sent = Some(az);
                 if tx.send(az).is_err() {
                     break; // UI has gone away.
