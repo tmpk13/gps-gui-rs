@@ -170,21 +170,39 @@ impl MyApp {
         let layer_id = ui.layer_id();
         let start = ui.ctx().graphics_mut(|g| g.entry(layer_id).next_idx());
 
+        let android = cfg!(target_os = "android");
+        // Heading-up on mobile locks the view (centered, no pan/zoom gesture);
+        // the zoom buttons still work. North-up keeps normal pan.
+        let locked = rotation.is_some() && android;
+
+        // On Android the map lives in a background Area (for the rotation
+        // overscan), and walkers' pinch-zoom gate does not fire there. Drive zoom
+        // from the multi-touch delta ourselves in north-up, mirroring walkers'
+        // own `zoom_by((delta - 1) * zoom_speed)`.
+        let zoom_delta = ui.ctx().input(|i| i.zoom_delta());
+        let pinching = android && !locked && (zoom_delta - 1.0).abs() > 0.001;
+
+        #[cfg(target_os = "android")]
+        if pinching {
+            let zoom = self.map_memory.zoom() + (zoom_delta as f64 - 1.0) * 2.0;
+            let _ = self.map_memory.set_zoom(zoom);
+        }
+
+        // Suppress pan while pinching so the two-finger gesture zooms instead of
+        // dragging (walkers normally keeps zoom and pan mutually exclusive).
+        let allow_pan = !locked && !pinching;
+
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(map_rect));
-        // Pan and pinch-zoom act in the unrotated tile space, so they fight the
-        // rotated view on touch. Lock both out while heading-up is active on
-        // mobile - centering keeps the view on the user, and disabling the pan
-        // gesture stops the one-frame rubber-band a drag would otherwise show.
-        // North-up keeps normal pinch/pan; the zoom buttons always work.
-        let locked = rotation.is_some() && cfg!(target_os = "android");
         let map = Map::new(Some(&mut self.tiles), &mut self.map_memory, my_position)
             .with_plugin(layer)
-            .zoom_gesture(!locked)
-            .panning(!locked)
-            .drag_pan_buttons(if locked {
-                egui::DragPanButtons::empty()
-            } else {
+            // Walkers' gesture zoom works on desktop; on Android we drive it
+            // manually above, so turn walkers' own gesture off there.
+            .zoom_gesture(!android)
+            .panning(allow_pan)
+            .drag_pan_buttons(if allow_pan {
                 egui::DragPanButtons::PRIMARY
+            } else {
+                egui::DragPanButtons::empty()
             });
         child.add(map);
 
