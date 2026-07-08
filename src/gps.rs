@@ -53,12 +53,17 @@ pub fn spawn_simulated(ctx: egui::Context) -> Receiver<GpsFix> {
 /// Requests the fine-location permission if needed, then polls the freshest
 /// last-known fix across providers once per second and emits it on change.
 /// Feeds the same channel as [`spawn_simulated`].
+///
+/// `vm` and `activity` are the raw `JavaVM` and Activity pointers from
+/// `AndroidApp` (passed as `usize` so they can cross the thread boundary). The
+/// Activity is required: `requestPermissions` is an Activity method, and
+/// `ndk_context`'s context is the Application, which does not have it.
 #[cfg(target_os = "android")]
-pub fn spawn_android_location(ctx: egui::Context) -> Receiver<GpsFix> {
+pub fn spawn_android_location(ctx: egui::Context, vm: usize, activity: usize) -> Receiver<GpsFix> {
     let (tx, rx) = channel();
 
     thread::spawn(move || {
-        if let Err(err) = android_location_loop(&tx, &ctx) {
+        if let Err(err) = android_location_loop(&tx, &ctx, vm, activity) {
             log::error!("android location source stopped: {err}");
         }
     });
@@ -70,14 +75,15 @@ pub fn spawn_android_location(ctx: egui::Context) -> Receiver<GpsFix> {
 fn android_location_loop(
     tx: &std::sync::mpsc::Sender<GpsFix>,
     ctx: &egui::Context,
+    vm: usize,
+    activity: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use jni::objects::{JObject, JValue};
     use jni::JavaVM;
 
-    // Pointers provided by android-activity, valid for the process lifetime.
-    let native = ndk_context::android_context();
-    let vm = unsafe { JavaVM::from_raw(native.vm().cast()) }?;
-    let activity = unsafe { JObject::from_raw(native.context().cast()) };
+    // Pointers from AndroidApp, valid for the process lifetime.
+    let vm = unsafe { JavaVM::from_raw(vm as *mut jni::sys::JavaVM) }?;
+    let activity = unsafe { JObject::from_raw(activity as jni::sys::jobject) };
     let mut env = vm.attach_current_thread()?;
 
     // Ensure the fine-location permission is granted (poll after prompting;
@@ -105,34 +111,41 @@ fn android_location_loop(
     let mut last: Option<GpsFix> = None;
 
     loop {
-        // Pick the most recent last-known location across providers.
-        let mut best: Option<(GpsFix, i64)> = None;
+        // Scope JNI local references to each iteration. We never return to Java,
+        // so without this the local-reference table grows every call and
+        // eventually overflows.
+        let best = env.with_local_frame(16, |env| -> Result<Option<GpsFix>, jni::errors::Error> {
+            // Pick the most recent last-known location across providers.
+            let mut best: Option<(GpsFix, i64)> = None;
 
-        for provider in providers {
-            let name = env.new_string(provider)?;
-            let location = match env.call_method(
-                &location_manager,
-                "getLastKnownLocation",
-                "(Ljava/lang/String;)Landroid/location/Location;",
-                &[JValue::Object(&name)],
-            ) {
-                Ok(value) => value.l()?,
-                Err(_) => continue, // provider not present on this device
-            };
-            if location.is_null() {
-                continue;
+            for provider in providers {
+                let name = env.new_string(provider)?;
+                let location = match env.call_method(
+                    &location_manager,
+                    "getLastKnownLocation",
+                    "(Ljava/lang/String;)Landroid/location/Location;",
+                    &[JValue::Object(&name)],
+                ) {
+                    Ok(value) => value.l()?,
+                    Err(_) => continue, // provider not present on this device
+                };
+                if location.is_null() {
+                    continue;
+                }
+
+                let lat = env.call_method(&location, "getLatitude", "()D", &[])?.d()?;
+                let lon = env.call_method(&location, "getLongitude", "()D", &[])?.d()?;
+                let time = env.call_method(&location, "getTime", "()J", &[])?.j()?;
+
+                if best.map_or(true, |(_, t)| time > t) {
+                    best = Some((GpsFix { lat, lon }, time));
+                }
             }
 
-            let lat = env.call_method(&location, "getLatitude", "()D", &[])?.d()?;
-            let lon = env.call_method(&location, "getLongitude", "()D", &[])?.d()?;
-            let time = env.call_method(&location, "getTime", "()J", &[])?.j()?;
+            Ok(best.map(|(fix, _)| fix))
+        })?;
 
-            if best.map_or(true, |(_, t)| time > t) {
-                best = Some((GpsFix { lat, lon }, time));
-            }
-        }
-
-        if let Some((fix, _)) = best {
+        if let Some(fix) = best {
             if last != Some(fix) {
                 last = Some(fix);
                 if tx.send(fix).is_err() {
@@ -156,19 +169,28 @@ fn check_permission(
     permission: &str,
 ) -> Result<bool, jni::errors::Error> {
     use jni::objects::JValue;
-    let name = env.new_string(permission)?;
-    let result = env
-        .call_method(
-            activity,
-            "checkSelfPermission",
-            "(Ljava/lang/String;)I",
-            &[JValue::Object(&name)],
-        )?
-        .i()?;
-    Ok(result == 0)
+    // Scoped frame: this is polled in a loop, so per-call refs must not leak.
+    env.with_local_frame(8, |env| -> Result<bool, jni::errors::Error> {
+        let name = env.new_string(permission)?;
+        let granted = env
+            .call_method(
+                activity,
+                "checkSelfPermission",
+                "(Ljava/lang/String;)I",
+                &[JValue::Object(&name)],
+            )?
+            .i()?
+            == 0;
+        Ok(granted)
+    })
 }
 
 /// `Activity.requestPermissions({ name }, requestCode)`.
+///
+/// Best-effort: if the call throws (e.g. some devices insist it run on the UI
+/// thread), the pending exception is cleared and logged rather than left to
+/// crash the process. The caller polls `checkSelfPermission` regardless, so the
+/// user can also grant the permission from Settings or via `adb`.
 #[cfg(target_os = "android")]
 fn request_permission(
     env: &mut jni::JNIEnv,
@@ -177,13 +199,22 @@ fn request_permission(
 ) -> Result<(), jni::errors::Error> {
     use jni::objects::JValue;
     let name = env.new_string(permission)?;
-    let string_class = env.find_class("java/lang/String")?;
-    let array = env.new_object_array(1, &string_class, &name)?;
-    env.call_method(
+    let array = env.new_object_array(1, "java/lang/String", &name)?;
+
+    let result = env.call_method(
         activity,
         "requestPermissions",
         "([Ljava/lang/String;I)V",
         &[JValue::Object(&array), JValue::Int(1)],
-    )?;
+    );
+
+    if env.exception_check()? {
+        let _ = env.exception_describe();
+        env.exception_clear()?;
+    }
+    if let Err(err) = result {
+        log::warn!("requestPermissions failed ({err}); grant ACCESS_FINE_LOCATION manually");
+    }
+
     Ok(())
 }

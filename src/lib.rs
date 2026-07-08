@@ -26,6 +26,12 @@ fn android_main(android_app: egui_winit::winit::platform::android::activity::And
         let _ = std::fs::create_dir_all(dir);
     }
 
+    // Grab the JVM + Activity pointers before `android_app` is moved into the
+    // options. Passed as usize so they can cross into the GPS thread. The
+    // Activity (not ndk_context's Application) is needed for requestPermissions.
+    let vm_ptr = android_app.vm_as_ptr() as usize;
+    let activity_ptr = android_app.activity_as_ptr() as usize;
+
     let mut options = NativeOptions::default();
     options.renderer = Renderer::Wgpu;
     options.android_app = Some(android_app);
@@ -34,7 +40,7 @@ fn android_main(android_app: egui_winit::winit::platform::android::activity::And
         "gps-gui-rs",
         options,
         Box::new(move |cc| {
-            let gps_rx = gps::spawn_android_location(cc.egui_ctx.clone());
+            let gps_rx = gps::spawn_android_location(cc.egui_ctx.clone(), vm_ptr, activity_ptr);
             Ok(Box::new(app::MyApp::new(
                 cc.egui_ctx.clone(),
                 gps_rx,
