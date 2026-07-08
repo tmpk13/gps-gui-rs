@@ -177,10 +177,11 @@ impl MyApp {
 
         // On Android the map lives in a background Area (for the rotation
         // overscan), and walkers' pinch-zoom gate does not fire there. Drive zoom
-        // from the multi-touch delta ourselves in north-up, mirroring walkers'
-        // own `zoom_by((delta - 1) * zoom_speed)`.
+        // from the multi-touch delta ourselves, mirroring walkers' own
+        // `zoom_by((delta - 1) * zoom_speed)`. Zoom is a scalar, so it is fine in
+        // heading-up too (unlike pan, which stays locked while rotated).
         let zoom_delta = ui.ctx().input(|i| i.zoom_delta());
-        let pinching = android && !locked && (zoom_delta - 1.0).abs() > 0.001;
+        let pinching = android && (zoom_delta - 1.0).abs() > 0.001;
 
         #[cfg(target_os = "android")]
         if pinching {
