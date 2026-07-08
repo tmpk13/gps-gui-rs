@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 pub struct GpsFix {
     pub lat: f64,
     pub lon: f64,
+    /// Course over ground: degrees clockwise from true north. Only present when
+    /// moving (GPS cannot derive a bearing while stationary).
+    pub bearing: Option<f32>,
 }
 
 /// Spawn a simulated GPS source that emits a fix roughly once per second,
@@ -28,11 +31,20 @@ pub fn spawn_simulated(ctx: egui::Context) -> Receiver<GpsFix> {
         let base_lon = -0.0015;
         let start = Instant::now();
 
+        let w = 0.12;
+
         loop {
             let t = start.elapsed().as_secs_f64();
+            // Velocity direction along the circular path (derivative of the
+            // position below) gives a plausible course over ground.
+            let d_north = (t * w).cos();
+            let d_east = -(t * w).sin();
+            let bearing = d_east.atan2(d_north).to_degrees().rem_euclid(360.0);
+
             let fix = GpsFix {
-                lat: base_lat + 0.0015 * (t * 0.12).sin(),
-                lon: base_lon + 0.0015 * (t * 0.12).cos(),
+                lat: base_lat + 0.0015 * (t * w).sin(),
+                lon: base_lon + 0.0015 * (t * w).cos(),
+                bearing: Some(bearing as f32),
             };
 
             if tx.send(fix).is_err() {
@@ -137,8 +149,15 @@ fn android_location_loop(
                 let lon = env.call_method(&location, "getLongitude", "()D", &[])?.d()?;
                 let time = env.call_method(&location, "getTime", "()J", &[])?.j()?;
 
+                // Course over ground, only valid while moving.
+                let bearing = if env.call_method(&location, "hasBearing", "()Z", &[])?.z()? {
+                    Some(env.call_method(&location, "getBearing", "()F", &[])?.f()?)
+                } else {
+                    None
+                };
+
                 if best.map_or(true, |(_, t)| time > t) {
-                    best = Some((GpsFix { lat, lon }, time));
+                    best = Some((GpsFix { lat, lon, bearing }, time));
                 }
             }
 

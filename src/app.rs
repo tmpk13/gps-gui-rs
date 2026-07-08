@@ -28,6 +28,7 @@ pub struct MyApp {
     map_memory: MapMemory,
     gps_rx: Receiver<GpsFix>,
     current: Option<Position>,
+    heading: Option<f32>,
     track: Vec<Position>,
 }
 
@@ -40,6 +41,7 @@ impl MyApp {
             map_memory: MapMemory::default(),
             gps_rx,
             current: None,
+            heading: None,
             track: Vec::new(),
         }
     }
@@ -50,6 +52,7 @@ impl MyApp {
         while let Ok(fix) = self.gps_rx.try_recv() {
             let pos = lat_lon(fix.lat, fix.lon);
             self.current = Some(pos);
+            self.heading = fix.bearing;
             if self.track.last() != Some(&pos) {
                 self.track.push(pos);
             }
@@ -76,7 +79,13 @@ impl MyApp {
 
             ui.separator();
             match self.current {
-                Some(pos) => ui.label(format!("lat {:.5}  lon {:.5}", pos.y(), pos.x())),
+                Some(pos) => {
+                    let hdg = match self.heading {
+                        Some(b) => format!("  hdg {b:.0}"),
+                        None => String::new(),
+                    };
+                    ui.label(format!("lat {:.5}  lon {:.5}{hdg}", pos.y(), pos.x()))
+                }
                 None => ui.label("waiting for GPS fix..."),
             };
         });
@@ -88,6 +97,7 @@ impl MyApp {
         let layer = GpsLayer {
             current: self.current,
             track: self.track.clone(),
+            heading: self.heading,
         };
 
         let map = Map::new(Some(&mut self.tiles), &mut self.map_memory, my_position)
