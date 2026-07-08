@@ -171,13 +171,21 @@ impl MyApp {
         let start = ui.ctx().graphics_mut(|g| g.entry(layer_id).next_idx());
 
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(map_rect));
-        // Pinch-zoom acts in the unrotated tile space, so it fights the rotated
-        // view on touch. Disable the zoom gesture while heading-up is active on
-        // mobile; north-up keeps normal pinch, and the zoom buttons always work.
-        let allow_pinch_zoom = !(rotation.is_some() && cfg!(target_os = "android"));
+        // Pan and pinch-zoom act in the unrotated tile space, so they fight the
+        // rotated view on touch. Lock both out while heading-up is active on
+        // mobile - centering keeps the view on the user, and disabling the pan
+        // gesture stops the one-frame rubber-band a drag would otherwise show.
+        // North-up keeps normal pinch/pan; the zoom buttons always work.
+        let locked = rotation.is_some() && cfg!(target_os = "android");
         let map = Map::new(Some(&mut self.tiles), &mut self.map_memory, my_position)
             .with_plugin(layer)
-            .zoom_gesture(allow_pinch_zoom);
+            .zoom_gesture(!locked)
+            .panning(!locked)
+            .drag_pan_buttons(if locked {
+                egui::DragPanButtons::empty()
+            } else {
+                egui::DragPanButtons::PRIMARY
+            });
         child.add(map);
 
         if let Some(rot) = rotation {
