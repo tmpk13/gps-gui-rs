@@ -171,8 +171,13 @@ impl MyApp {
         let start = ui.ctx().graphics_mut(|g| g.entry(layer_id).next_idx());
 
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(map_rect));
+        // Pinch/scroll zoom acts in the unrotated tile space, so it fights the
+        // rotated view on touch. Disable the zoom gesture while heading-up is
+        // active on mobile; the zoom buttons still work.
+        let allow_zoom_gesture = !(rotation.is_some() && cfg!(target_os = "android"));
         let map = Map::new(Some(&mut self.tiles), &mut self.map_memory, my_position)
-            .with_plugin(layer);
+            .with_plugin(layer)
+            .zoom_gesture(allow_zoom_gesture);
         child.add(map);
 
         if let Some(rot) = rotation {
