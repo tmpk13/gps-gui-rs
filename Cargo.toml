@@ -1,0 +1,19 @@
+[package]
+name = "gps-gui-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "GPS tracking GUI with offline maps and (later) BLE coordinate reception"
+
+[dependencies]
+eframe = "0.35"
+egui = "0.35"
+walkers = "0.56"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
