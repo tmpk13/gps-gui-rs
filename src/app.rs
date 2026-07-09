@@ -7,12 +7,45 @@ use walkers::{
     lat_lon, sources::OpenStreetMap, HttpOptions, HttpTiles, Map, MapMemory, Position,
 };
 
+use crate::config::MarkerColors;
 use crate::gps::GpsFix;
 use crate::marker::GpsLayer;
 
 /// Where the map looks before the first GPS fix arrives.
 fn default_position() -> Position {
     lat_lon(51.4779, -0.0015)
+}
+
+/// Great-circle distance between two positions in meters (haversine formula).
+fn haversine_m(a: Position, b: Position) -> f64 {
+    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    let lat1 = a.y().to_radians();
+    let lat2 = b.y().to_radians();
+    let dlat = (b.y() - a.y()).to_radians();
+    let dlon = (b.x() - a.x()).to_radians();
+    let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_M * h.sqrt().asin()
+}
+
+/// Format a distance given in meters: kilometers once it is at least 1 km,
+/// otherwise whole meters.
+fn format_distance(m: f64) -> String {
+    if m >= 1000.0 {
+        format!("{:.2} km", m / 1000.0)
+    } else {
+        format!("{m:.0} m")
+    }
+}
+
+/// Which screen is shown. The corner toggle switches between them.
+#[derive(Clone, Copy, PartialEq)]
+enum Page {
+    /// The interactive map with the position marker and track.
+    Map,
+    /// A plain read-out of the current latitude and longitude.
+    Data,
+    /// Loading the TOML config file (marker colors).
+    Settings,
 }
 
 /// HTTP tile options caching to `cache_dir` (when writable). Tiles fetched once
@@ -45,6 +78,16 @@ pub struct MyApp {
     /// the map turns smoothly instead of snapping between sensor readings.
     smoothed_heading: Option<f32>,
     track: Vec<Position>,
+    /// A fixed reference point a line is drawn to from the current position.
+    fixed_point: Option<Position>,
+    /// Which screen is currently shown.
+    page: Page,
+    /// Marker colors, replaced when a config file is loaded.
+    marker_colors: MarkerColors,
+    /// The config-file path typed on the Settings page.
+    config_path: String,
+    /// Result of the last load attempt: `Ok` message (green) or error (red).
+    config_feedback: Option<Result<String, String>>,
 }
 
 impl MyApp {
@@ -71,7 +114,31 @@ impl MyApp {
             heading_up: false,
             smoothed_heading: None,
             track: Vec::new(),
+            // Arbitrary fixed point for now: the center of the simulated loop
+            // (Greenwich observatory), so the line is always in view.
+            fixed_point: Some(lat_lon(51.4779, -0.0015)),
+            page: Page::Map,
+            marker_colors: MarkerColors::default(),
+            config_path: String::new(),
+            config_feedback: None,
         }
+    }
+
+    /// Load marker colors from the TOML file at `config_path`, recording a
+    /// human-readable result for the Settings page to show.
+    fn load_config(&mut self) {
+        let path = self.config_path.trim().to_string();
+        if path.is_empty() {
+            self.config_feedback = Some(Err("Enter a file path.".to_string()));
+            return;
+        }
+        self.config_feedback = Some(match MarkerColors::load(&path) {
+            Ok(colors) => {
+                self.marker_colors = colors;
+                Ok(format!("Loaded {path}"))
+            }
+            Err(e) => Err(e),
+        });
     }
 
     /// Safe-area inset at the top (status bar) in egui points.
@@ -85,6 +152,15 @@ impl MyApp {
     /// Device-facing compass heading if available, otherwise course over ground.
     fn effective_heading(&self) -> Option<f32> {
         self.compass_heading.or(self.heading)
+    }
+
+    /// Great-circle distance from the current position to the fixed point, in
+    /// meters. `None` until both a fix and a fixed point are known.
+    fn distance_to_fixed(&self) -> Option<f64> {
+        match (self.current, self.fixed_point) {
+            (Some(cur), Some(fixed)) => Some(haversine_m(cur, fixed)),
+            _ => None,
+        }
     }
 
     /// Pull every pending fix out of the channel, updating the current position
@@ -139,7 +215,11 @@ impl MyApp {
                         Some(b) => format!("  hdg {b:.0}"),
                         None => String::new(),
                     };
-                    ui.label(format!("lat {:.5}  lon {:.5}{hdg}", pos.y(), pos.x()))
+                    let dist = match self.distance_to_fixed() {
+                        Some(m) => format!("  dist {}", format_distance(m)),
+                        None => String::new(),
+                    };
+                    ui.label(format!("lat {:.5}  lon {:.5}{hdg}{dist}", pos.y(), pos.x()))
                 }
                 None => ui.label("waiting for GPS fix..."),
             };
@@ -163,6 +243,8 @@ impl MyApp {
             current: self.current,
             track: self.track.clone(),
             heading: self.effective_heading(),
+            fixed_point: self.fixed_point,
+            colors: self.marker_colors,
         };
 
         // walkers sizes itself to the child's available space, so give it the
@@ -230,6 +312,20 @@ impl eframe::App for MyApp {
         let ctx = ui.ctx().clone();
         let screen = ctx.input(|i| i.viewport_rect());
 
+        match self.page {
+            Page::Map => self.map_page(&ctx, screen),
+            Page::Data => self.data_page(&ctx, screen),
+            Page::Settings => self.settings_page(&ctx, screen),
+        }
+
+        // Page toggle floats in the top-right corner, above both pages.
+        self.page_toggle(&ctx, screen);
+    }
+}
+
+impl MyApp {
+    /// The interactive map page: full-bleed map with the floating controls.
+    fn map_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
         // Rotate the map so the heading points up, when enabled and known. The
         // drawn angle eases toward the live heading each frame (shortest way
         // round the circle), so the map glides rather than stepping between
@@ -278,7 +374,7 @@ impl eframe::App for MyApp {
             .fixed_pos(map_rect.min)
             .movable(false)
             .constrain(false)
-            .show(&ctx, |ui| {
+            .show(ctx, |ui| {
                 ui.set_clip_rect(map_rect);
                 self.map(ui, map_rect, rotation, screen);
             });
@@ -286,13 +382,13 @@ impl eframe::App for MyApp {
         // Controls float on top in the foreground layer, so they keep pointer
         // priority over the (interactive) map behind them. The fill spans the
         // status-bar area; the top inset pushes the buttons clear of it.
-        let top = self.top_inset(&ctx);
+        let top = self.top_inset(ctx);
         egui::Area::new(egui::Id::new("controls"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::Pos2::ZERO)
             .movable(false)
             .constrain(false)
-            .show(&ctx, |ui| {
+            .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(ui.visuals().panel_fill)
                     .inner_margin(egui::Margin::symmetric(8, 4))
@@ -303,6 +399,151 @@ impl eframe::App for MyApp {
                     });
             });
     }
+
+    /// The data page: a plain, large read-out of the current latitude and
+    /// longitude, centered on an otherwise empty screen.
+    fn data_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        egui::Area::new(egui::Id::new("data"))
+            .order(egui::Order::Background)
+            .fixed_pos(egui::Pos2::ZERO)
+            .movable(false)
+            .constrain(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(ui.visuals().panel_fill)
+                    .show(ui, |ui| {
+                        ui.set_min_size(screen.size());
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(screen.height() * 0.35);
+                            match self.current {
+                                Some(pos) => {
+                                    ui.label(
+                                        egui::RichText::new(format!("lat {:.5}", pos.y()))
+                                            .size(40.0),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new(format!("lon {:.5}", pos.x()))
+                                            .size(40.0),
+                                    );
+                                    if let Some(m) = self.distance_to_fixed() {
+                                        ui.add_space(24.0);
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "dist {}",
+                                                format_distance(m)
+                                            ))
+                                            .size(40.0),
+                                        );
+                                    }
+                                }
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new("waiting for GPS fix...").size(24.0),
+                                    );
+                                }
+                            }
+                        });
+                    });
+            });
+    }
+
+    /// The settings page: type a path to a TOML config file and load it. The
+    /// only setting for now is the marker colors; current values are shown as
+    /// swatches below the loader.
+    fn settings_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let top = self.top_inset(ctx);
+        egui::Area::new(egui::Id::new("settings"))
+            .order(egui::Order::Background)
+            .fixed_pos(egui::Pos2::ZERO)
+            .movable(false)
+            .constrain(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.set_min_size(screen.size());
+                        ui.add_space(top + 8.0);
+                        ui.heading("Settings");
+                        ui.add_space(12.0);
+
+                        ui.label("Config file (TOML):");
+                        ui.horizontal(|ui| {
+                            let field = egui::TextEdit::singleline(&mut self.config_path)
+                                .hint_text("/path/to/config.toml")
+                                .desired_width((screen.width() - 120.0).clamp(120.0, 400.0));
+                            let resp = ui.add(field);
+                            let entered =
+                                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if ui.button("Load").clicked() || entered {
+                                self.load_config();
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        match &self.config_feedback {
+                            Some(Ok(msg)) => {
+                                ui.colored_label(egui::Color32::from_rgb(60, 180, 75), msg);
+                            }
+                            Some(Err(msg)) => {
+                                ui.colored_label(egui::Color32::from_rgb(220, 80, 60), msg);
+                            }
+                            None => {}
+                        }
+
+                        ui.add_space(16.0);
+                        ui.label("Marker colors:");
+                        color_swatch(ui, "track", self.marker_colors.track);
+                        color_swatch(ui, "fixed", self.marker_colors.fixed);
+
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "[colors]\ntrack = \"#0078ff\"\nfixed = \"#ff5028\"",
+                            )
+                            .monospace()
+                            .size(13.0),
+                        );
+                    });
+            });
+    }
+
+    /// Small button in the top-right corner that switches between the pages.
+    fn page_toggle(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let (label, next) = match self.page {
+            Page::Map => ("Data", Page::Data),
+            Page::Data => ("Settings", Page::Settings),
+            Page::Settings => ("Map", Page::Map),
+        };
+        let top = self.top_inset(ctx);
+        egui::Area::new(egui::Id::new("page_toggle"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::new(screen.right() - 8.0, top + 8.0))
+            .pivot(egui::Align2::RIGHT_TOP)
+            .movable(false)
+            .constrain(false)
+            .show(ctx, |ui| {
+                if ui.button(label).clicked() {
+                    self.page = next;
+                }
+            });
+    }
+}
+
+/// A small filled square in `color` followed by its name and hex value.
+fn color_swatch(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(18.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(3), color);
+        ui.label(format!(
+            "{label}  #{:02x}{:02x}{:02x}",
+            color.r(),
+            color.g(),
+            color.b()
+        ));
+    });
 }
 
 /// Rotate `p` by `rot` about `origin` (screen-space points).
