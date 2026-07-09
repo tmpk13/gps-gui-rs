@@ -13,7 +13,7 @@ use crate::marker::GpsLayer;
 
 /// Where the map looks before the first GPS fix arrives.
 fn default_position() -> Position {
-    lat_lon(51.4779, -0.0015)
+    lat_lon(54.333, -122.676)
 }
 
 /// Great-circle distance between two positions in meters (haversine formula).
@@ -183,28 +183,27 @@ impl MyApp {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().button_padding = egui::vec2(15.0, 10.0);
         ui.horizontal(|ui| {
-            ui.heading("gps-gui-rs");
-            ui.separator();
 
-            if ui.button("Center on GPS").clicked() {
+            if ui.button("Center").clicked() {
                 self.map_memory.follow_my_position();
             }
             let rotate_label = if self.heading_up {
-                "North up"
+                "North"
             } else {
-                "Heading up"
+                "Heading"
             };
             if ui.button(rotate_label).clicked() {
                 self.heading_up = !self.heading_up;
             }
-            if ui.button("Zoom in").clicked() {
+            if ui.button("+").clicked() {
                 let _ = self.map_memory.zoom_in();
             }
-            if ui.button("Zoom out").clicked() {
+            if ui.button("-").clicked() {
                 let _ = self.map_memory.zoom_out();
             }
-            if ui.button("Clear track").clicked() {
+            if ui.button("Clear").clicked() {
                 self.track.clear();
             }
 
