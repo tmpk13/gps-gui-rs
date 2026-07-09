@@ -4,6 +4,7 @@ use egui::{Color32, Response, Shape, Stroke, Ui, Vec2};
 use walkers::{MapMemory, Plugin, Position, Projector};
 
 const TRACK_COLOR: Color32 = Color32::from_rgb(0, 120, 255);
+const FIXED_COLOR: Color32 = Color32::from_rgb(255, 80, 40);
 
 /// A walkers [`Plugin`] rendering the live position marker and its trail.
 ///
@@ -14,6 +15,8 @@ pub struct GpsLayer {
     pub track: Vec<Position>,
     /// Heading in degrees clockwise from north, if known.
     pub heading: Option<f32>,
+    /// A fixed reference point; a line is drawn to it from the current position.
+    pub fixed_point: Option<Position>,
 }
 
 impl Plugin for GpsLayer {
@@ -38,6 +41,18 @@ impl Plugin for GpsLayer {
 
         let Some(pos) = self.current else { return };
         let screen = projector.project(pos).to_pos2();
+
+        // Line from the current position to the fixed reference point, with a
+        // marker at the fixed point itself.
+        if let Some(fixed) = self.fixed_point {
+            let fixed_screen = projector.project(fixed).to_pos2();
+            painter.add(Shape::line_segment(
+                [screen, fixed_screen],
+                Stroke::new(3.0, FIXED_COLOR),
+            ));
+            painter.circle_filled(fixed_screen, 6.0, FIXED_COLOR);
+            painter.circle_stroke(fixed_screen, 6.0, Stroke::new(2.0, Color32::WHITE));
+        }
 
         // Heading arrow (under the dot). North is up, angle increases clockwise.
         if let Some(deg) = self.heading {
