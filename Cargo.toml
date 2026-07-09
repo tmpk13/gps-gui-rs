@@ -19,6 +19,10 @@ path = "src/main.rs"
 egui = "0.35"
 walkers = "0.56"
 log = "0.4"
+# Loading the TOML config file (marker colors, more later). Both pure Rust, so
+# they cross-compile to Android unchanged.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 eframe = "0.35"

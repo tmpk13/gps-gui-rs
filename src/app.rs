@@ -7,6 +7,7 @@ use walkers::{
     lat_lon, sources::OpenStreetMap, HttpOptions, HttpTiles, Map, MapMemory, Position,
 };
 
+use crate::config::MarkerColors;
 use crate::gps::GpsFix;
 use crate::marker::GpsLayer;
 
@@ -43,6 +44,8 @@ enum Page {
     Map,
     /// A plain read-out of the current latitude and longitude.
     Data,
+    /// Loading the TOML config file (marker colors).
+    Settings,
 }
 
 /// HTTP tile options caching to `cache_dir` (when writable). Tiles fetched once
@@ -79,6 +82,12 @@ pub struct MyApp {
     fixed_point: Option<Position>,
     /// Which screen is currently shown.
     page: Page,
+    /// Marker colors, replaced when a config file is loaded.
+    marker_colors: MarkerColors,
+    /// The config-file path typed on the Settings page.
+    config_path: String,
+    /// Result of the last load attempt: `Ok` message (green) or error (red).
+    config_feedback: Option<Result<String, String>>,
 }
 
 impl MyApp {
@@ -109,7 +118,27 @@ impl MyApp {
             // (Greenwich observatory), so the line is always in view.
             fixed_point: Some(lat_lon(51.4779, -0.0015)),
             page: Page::Map,
+            marker_colors: MarkerColors::default(),
+            config_path: String::new(),
+            config_feedback: None,
         }
+    }
+
+    /// Load marker colors from the TOML file at `config_path`, recording a
+    /// human-readable result for the Settings page to show.
+    fn load_config(&mut self) {
+        let path = self.config_path.trim().to_string();
+        if path.is_empty() {
+            self.config_feedback = Some(Err("Enter a file path.".to_string()));
+            return;
+        }
+        self.config_feedback = Some(match MarkerColors::load(&path) {
+            Ok(colors) => {
+                self.marker_colors = colors;
+                Ok(format!("Loaded {path}"))
+            }
+            Err(e) => Err(e),
+        });
     }
 
     /// Safe-area inset at the top (status bar) in egui points.
@@ -215,6 +244,7 @@ impl MyApp {
             track: self.track.clone(),
             heading: self.effective_heading(),
             fixed_point: self.fixed_point,
+            colors: self.marker_colors,
         };
 
         // walkers sizes itself to the child's available space, so give it the
@@ -285,6 +315,7 @@ impl eframe::App for MyApp {
         match self.page {
             Page::Map => self.map_page(&ctx, screen),
             Page::Data => self.data_page(&ctx, screen),
+            Page::Settings => self.settings_page(&ctx, screen),
         }
 
         // Page toggle floats in the top-right corner, above both pages.
@@ -417,11 +448,73 @@ impl MyApp {
             });
     }
 
+    /// The settings page: type a path to a TOML config file and load it. The
+    /// only setting for now is the marker colors; current values are shown as
+    /// swatches below the loader.
+    fn settings_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let top = self.top_inset(ctx);
+        egui::Area::new(egui::Id::new("settings"))
+            .order(egui::Order::Background)
+            .fixed_pos(egui::Pos2::ZERO)
+            .movable(false)
+            .constrain(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.set_min_size(screen.size());
+                        ui.add_space(top + 8.0);
+                        ui.heading("Settings");
+                        ui.add_space(12.0);
+
+                        ui.label("Config file (TOML):");
+                        ui.horizontal(|ui| {
+                            let field = egui::TextEdit::singleline(&mut self.config_path)
+                                .hint_text("/path/to/config.toml")
+                                .desired_width((screen.width() - 120.0).clamp(120.0, 400.0));
+                            let resp = ui.add(field);
+                            let entered =
+                                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if ui.button("Load").clicked() || entered {
+                                self.load_config();
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        match &self.config_feedback {
+                            Some(Ok(msg)) => {
+                                ui.colored_label(egui::Color32::from_rgb(60, 180, 75), msg);
+                            }
+                            Some(Err(msg)) => {
+                                ui.colored_label(egui::Color32::from_rgb(220, 80, 60), msg);
+                            }
+                            None => {}
+                        }
+
+                        ui.add_space(16.0);
+                        ui.label("Marker colors:");
+                        color_swatch(ui, "track", self.marker_colors.track);
+                        color_swatch(ui, "fixed", self.marker_colors.fixed);
+
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "[colors]\ntrack = \"#0078ff\"\nfixed = \"#ff5028\"",
+                            )
+                            .monospace()
+                            .size(13.0),
+                        );
+                    });
+            });
+    }
+
     /// Small button in the top-right corner that switches between the pages.
     fn page_toggle(&mut self, ctx: &egui::Context, screen: egui::Rect) {
         let (label, next) = match self.page {
             Page::Map => ("Data", Page::Data),
-            Page::Data => ("Map", Page::Map),
+            Page::Data => ("Settings", Page::Settings),
+            Page::Settings => ("Map", Page::Map),
         };
         let top = self.top_inset(ctx);
         egui::Area::new(egui::Id::new("page_toggle"))
@@ -436,6 +529,21 @@ impl MyApp {
                 }
             });
     }
+}
+
+/// A small filled square in `color` followed by its name and hex value.
+fn color_swatch(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(18.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(3), color);
+        ui.label(format!(
+            "{label}  #{:02x}{:02x}{:02x}",
+            color.r(),
+            color.g(),
+            color.b()
+        ));
+    });
 }
 
 /// Rotate `p` by `rot` about `origin` (screen-space points).
