@@ -1,4 +1,5 @@
-//! Loadable TOML configuration: marker colors and the BLE beacon settings.
+//! Loadable TOML configuration: marker colors, track recording, and the BLE
+//! beacon settings.
 //!
 //! Schema (all fields optional; missing ones keep their defaults):
 //!
@@ -11,6 +12,9 @@
 //! enabled = true      # master switch for the BLE GPS source
 //! show_path = false   # draw the path of the incoming BLE GPS data
 //! mac = "AA:BB:CC:DD:EE:FF"  # pin a specific device; omit to scan by service
+//!
+//! [track]
+//! min_distance = 3.0  # meters of movement before a new track point is recorded
 //! ```
 
 use egui::Color32;
@@ -55,11 +59,26 @@ impl Default for BleSettings {
     }
 }
 
+/// Track recording settings.
+#[derive(Clone, Copy)]
+pub struct TrackSettings {
+    /// Minimum distance in meters from the last recorded point before another
+    /// is appended to a track. Decimates GPS jitter; 0 records every fix.
+    pub min_distance: f64,
+}
+
+impl Default for TrackSettings {
+    fn default() -> Self {
+        Self { min_distance: 3.0 }
+    }
+}
+
 /// Everything a config file can carry.
 #[derive(Clone, Default)]
 pub struct AppConfig {
     pub colors: MarkerColors,
     pub ble: BleSettings,
+    pub track: TrackSettings,
 }
 
 /// Mirrors the TOML shape; every field optional so a partial file keeps the
@@ -70,6 +89,8 @@ struct RawConfig {
     colors: RawColors,
     #[serde(default)]
     ble: RawBle,
+    #[serde(default)]
+    track: RawTrack,
 }
 
 #[derive(Deserialize, Default)]
@@ -83,6 +104,11 @@ struct RawBle {
     enabled: Option<bool>,
     show_path: Option<bool>,
     mac: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawTrack {
+    min_distance: Option<f64>,
 }
 
 /// Parse a `#rrggbb` (or bare `rrggbb`) hex string into a color.
@@ -122,6 +148,12 @@ impl AppConfig {
         // Treat an empty string as unset so a template line can stay in the
         // file.
         config.ble.mac = raw.ble.mac.filter(|m| !m.trim().is_empty());
+        if let Some(v) = raw.track.min_distance {
+            if !v.is_finite() || v < 0.0 {
+                return Err(format!("track.min_distance must be >= 0, got {v}"));
+            }
+            config.track.min_distance = v;
+        }
         Ok(config)
     }
 }

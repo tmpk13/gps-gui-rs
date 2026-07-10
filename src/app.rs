@@ -32,6 +32,16 @@ fn haversine_m(a: Position, b: Position) -> f64 {
     2.0 * EARTH_RADIUS_M * h.sqrt().asin()
 }
 
+/// Whether `pos` is far enough from the last recorded track point to append it.
+/// Always true for the first point; otherwise the move must be at least
+/// `min_distance_m`, so a track is decimated to points that far apart.
+fn far_enough(last: Option<&Position>, pos: Position, min_distance_m: f64) -> bool {
+    match last {
+        None => true,
+        Some(&last) => haversine_m(last, pos) >= min_distance_m,
+    }
+}
+
 /// Format a distance given in meters: kilometers once it is at least 1 km,
 /// otherwise whole meters.
 fn format_distance(m: f64) -> String {
@@ -245,7 +255,7 @@ impl MyApp {
             let pos = lat_lon(fix.lat, fix.lon);
             self.current = Some(pos);
             self.heading = fix.bearing;
-            if self.track.last() != Some(&pos) {
+            if far_enough(self.track.last(), pos, self.config.track.min_distance) {
                 self.track.push(pos);
             }
         }
@@ -265,7 +275,7 @@ impl MyApp {
                     if p.has_fix() {
                         let pos = lat_lon(p.lat_deg(), p.lon_deg());
                         self.beacon = Some(pos);
-                        if self.beacon_track.last() != Some(&pos) {
+                        if far_enough(self.beacon_track.last(), pos, self.config.track.min_distance) {
                             self.beacon_track.push(pos);
                         }
                     }
@@ -692,7 +702,7 @@ impl MyApp {
                         ui.add_space(16.0);
                         ui.label(
                             egui::RichText::new(
-                                "[colors]\ntrack = \"#0078ff\"\nfixed = \"#ff5028\"\n\n[ble]\nenabled = true\nshow_path = true\n# mac = \"AA:BB:CC:DD:EE:FF\"",
+                                "[colors]\ntrack = \"#0078ff\"\nfixed = \"#ff5028\"\n\n[ble]\nenabled = true\nshow_path = true\n# mac = \"AA:BB:CC:DD:EE:FF\"\n\n[track]\nmin_distance = 3.0",
                             )
                             .monospace()
                             .size(13.0),

@@ -7,3 +7,8 @@ enabled = true
 show_path = true
 # Pin a specific beacon instead of scanning for the GPS service:
 # mac = "AA:BB:CC:DD:EE:FF"
+
+[track]
+# Meters of movement from the last recorded point before a new one is added to
+# a track. Decimates GPS jitter; 0 records every fix.
+min_distance = 3.0
