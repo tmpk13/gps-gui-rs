@@ -3,7 +3,7 @@
 
 #[cfg(not(target_os = "android"))]
 fn main() -> eframe::Result<()> {
-    use gps_gui_rs::{app::MyApp, gps};
+    use gps_gui_rs::{app::MyApp, ble, gps};
 
     env_logger::init();
 
@@ -19,6 +19,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             let gps_rx = gps::spawn_simulated(cc.egui_ctx.clone());
+            let ble = ble::spawn(cc.egui_ctx.clone());
             let cache_dir = Some(std::path::PathBuf::from(".cache"));
             Ok(Box::new(MyApp::new(
                 cc.egui_ctx.clone(),
@@ -26,6 +27,7 @@ fn main() -> eframe::Result<()> {
                 cache_dir,
                 None,
                 None,
+                ble,
             )))
         }),
     )
