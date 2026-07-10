@@ -1,4 +1,5 @@
 pub mod app;
+pub mod ble;
 pub mod config;
 pub mod gps;
 pub mod marker;
@@ -31,7 +32,7 @@ fn android_main(android_app: egui_winit::winit::platform::android::activity::And
     }
 
     // Grab the JVM + Activity pointers before `android_app` is moved into the
-    // options. Passed as usize so they can cross into the GPS thread. The
+    // options. Passed as usize so they can cross into the GPS/BLE threads. The
     // Activity (not ndk_context's Application) is needed for requestPermissions.
     let vm_ptr = android_app.vm_as_ptr() as usize;
     let activity_ptr = android_app.activity_as_ptr() as usize;
@@ -62,12 +63,16 @@ fn android_main(android_app: egui_winit::winit::platform::android::activity::And
         Box::new(move |cc| {
             let gps_rx = gps::spawn_android_location(cc.egui_ctx.clone(), vm_ptr, activity_ptr);
             let compass_rx = Some(compass::spawn(cc.egui_ctx.clone()));
+            // The BLE worker also loads the dex shim and applies
+            // keep-screen-on through it.
+            let ble = ble::spawn(cc.egui_ctx.clone(), vm_ptr, activity_ptr);
             Ok(Box::new(app::MyApp::new(
                 cc.egui_ctx.clone(),
                 gps_rx,
                 cache_dir,
                 compass_rx,
                 insets,
+                ble,
             )))
         }),
     );

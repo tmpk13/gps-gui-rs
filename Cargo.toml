@@ -23,10 +23,21 @@ log = "0.4"
 # they cross-compile to Android unchanged.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# SVG button icons (resvg is pure Rust, so it cross-compiles to Android).
+egui_extras = { version = "0.35", features = ["svg"] }
+# Shared BLE protocol with the esp32c3-gps firmware (lives in the same parent
+# directory).
+gps-proto = { path = "../gps-proto" }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 eframe = "0.35"
 env_logger = "0.11"
+# BLE central for the ESP32-C3 GPS beacon on desktop (Linux/bluez). Android
+# uses a JNI bridge instead (src/ble/android.rs).
+btleplug = "0.12"
+tokio = { version = "1", features = ["rt"] }
+uuid = "1"
+futures = "0.3"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Android needs the wgpu renderer. native-activity works with the no-Java

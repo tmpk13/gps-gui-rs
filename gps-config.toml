@@ -1,3 +1,9 @@
 [colors]
 track = "#0078ff"
 fixed = "#ff9028"
+
+[ble]
+enabled = true
+show_path = true
+# Pin a specific beacon instead of scanning for the GPS service:
+# mac = "AA:BB:CC:DD:EE:FF"

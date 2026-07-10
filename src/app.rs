@@ -3,11 +3,13 @@ use std::sync::mpsc::Receiver;
 
 use egui::emath::Rot2;
 use egui::{Pos2, Shape};
+use gps_proto::packet::{self, PositionPacket};
 use walkers::{
     lat_lon, sources::OpenStreetMap, HttpOptions, HttpTiles, Map, MapMemory, Position,
 };
 
-use crate::config::MarkerColors;
+use crate::ble::{BleCommand, BleEvent, BleHandle};
+use crate::config::AppConfig;
 use crate::gps::GpsFix;
 use crate::marker::GpsLayer;
 
@@ -15,6 +17,9 @@ use crate::marker::GpsLayer;
 fn default_position() -> Position {
     lat_lon(54.333, -122.676)
 }
+
+/// Side length of the square button icons, in points.
+const ICON_SIZE: f32 = 22.0;
 
 /// Great-circle distance between two positions in meters (haversine formula).
 fn haversine_m(a: Position, b: Position) -> f64 {
@@ -37,6 +42,17 @@ fn format_distance(m: f64) -> String {
     }
 }
 
+/// A square icon button. The icons are white SVGs tinted to the current text
+/// color so they follow the theme.
+fn icon_button(ui: &mut egui::Ui, source: egui::ImageSource<'_>) -> egui::Response {
+    let tint = ui.visuals().text_color();
+    ui.add(egui::Button::image(
+        egui::Image::new(source)
+            .fit_to_exact_size(egui::vec2(ICON_SIZE, ICON_SIZE))
+            .tint(tint),
+    ))
+}
+
 /// Which screen is shown. The corner toggle switches between them.
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -44,7 +60,7 @@ enum Page {
     Map,
     /// A plain read-out of the current latitude and longitude.
     Data,
-    /// Loading the TOML config file (marker colors).
+    /// Loading the TOML config file (marker colors, BLE beacon).
     Settings,
 }
 
@@ -64,6 +80,8 @@ pub struct MyApp {
     gps_rx: Receiver<GpsFix>,
     /// Optional device-facing compass heading stream (Android only).
     compass_rx: Option<Receiver<f32>>,
+    /// The BLE worker streaming the ESP32-C3 beacon's GPS data.
+    ble: BleHandle,
     /// Returns the current safe-area insets `[top, right, bottom, left]` in
     /// physical pixels. `None` on desktop (no system bars to avoid).
     insets: Option<Box<dyn Fn() -> [f32; 4]>>,
@@ -78,12 +96,29 @@ pub struct MyApp {
     /// the map turns smoothly instead of snapping between sensor readings.
     smoothed_heading: Option<f32>,
     track: Vec<Position>,
-    /// A fixed reference point a line is drawn to from the current position.
-    fixed_point: Option<Position>,
+    /// Live position of the BLE beacon; replaces the old fixed reference
+    /// point, so the distance line tracks the real device.
+    beacon: Option<Position>,
+    /// The last full packet from the beacon (satellites, speed, ...).
+    beacon_packet: Option<PositionPacket>,
+    /// Every beacon position seen, for the path drawing.
+    beacon_track: Vec<Position>,
+    /// Draw the beacon path (TOML `[ble] show_path`, also togglable in
+    /// Settings).
+    show_beacon_path: bool,
+    /// Last BLE status line, for the Settings page.
+    ble_status: String,
+    ble_connected: bool,
+    /// Notify-interval input on the Settings page.
+    ble_interval_text: String,
+    /// Result of the last config write: device ack (green) or error (red).
+    ble_ack: Option<Result<String, String>>,
+    /// A config write is in flight and the ack has not arrived yet.
+    ble_ack_pending: bool,
     /// Which screen is currently shown.
     page: Page,
-    /// Marker colors, replaced when a config file is loaded.
-    marker_colors: MarkerColors,
+    /// Loaded configuration (marker colors, BLE settings).
+    config: AppConfig,
     /// The config-file path typed on the Settings page.
     config_path: String,
     /// Result of the last load attempt: `Ok` message (green) or error (red).
@@ -95,18 +130,24 @@ impl MyApp {
     /// passes a local `.cache`; Android passes its writable data directory.
     /// `compass_rx` is the device-facing heading stream (`None` on desktop).
     /// `insets` reports the safe-area insets in physical pixels (`None` on desktop).
+    /// `ble` is the worker connected to the ESP32-C3 GPS beacon.
     pub fn new(
         ctx: egui::Context,
         gps_rx: Receiver<GpsFix>,
         cache_dir: Option<PathBuf>,
         compass_rx: Option<Receiver<f32>>,
         insets: Option<Box<dyn Fn() -> [f32; 4]>>,
+        ble: BleHandle,
     ) -> Self {
-        Self {
+        // SVG loader for the button icons.
+        egui_extras::install_image_loaders(&ctx);
+
+        let mut app = Self {
             tiles: HttpTiles::with_options(OpenStreetMap, http_options(cache_dir), ctx),
             map_memory: MapMemory::default(),
             gps_rx,
             compass_rx,
+            ble,
             insets,
             current: None,
             heading: None,
@@ -114,27 +155,61 @@ impl MyApp {
             heading_up: false,
             smoothed_heading: None,
             track: Vec::new(),
-            // Arbitrary fixed point for now: the center of the simulated loop
-            // (Greenwich observatory), so the line is always in view.
-            fixed_point: Some(lat_lon(51.4779, -0.0015)),
+            beacon: None,
+            beacon_packet: None,
+            beacon_track: Vec::new(),
+            show_beacon_path: false,
+            ble_status: "idle".to_string(),
+            ble_connected: false,
+            ble_interval_text: packet::UPDATE_INTERVAL_DEFAULT_MS.to_string(),
+            ble_ack: None,
+            ble_ack_pending: false,
             page: Page::Map,
-            marker_colors: MarkerColors::default(),
+            config: AppConfig::default(),
             config_path: String::new(),
             config_feedback: None,
+        };
+
+        // Auto-load ./gps-config.toml when present (desktop convenience); the
+        // Settings page can load any path later. With no file the defaults
+        // apply, which include connecting to the beacon.
+        match AppConfig::load("gps-config.toml") {
+            Ok(cfg) => app.apply_config(cfg),
+            Err(_) => app.sync_ble_to_config(),
         }
+        app
     }
 
-    /// Load marker colors from the TOML file at `config_path`, recording a
-    /// human-readable result for the Settings page to show.
+    /// Adopt a loaded config: colors, path toggle, and the BLE connection.
+    fn apply_config(&mut self, cfg: AppConfig) {
+        self.show_beacon_path = cfg.ble.show_path;
+        self.config = cfg;
+        self.sync_ble_to_config();
+    }
+
+    /// Tell the BLE worker what the config wants (connect or stay away).
+    fn sync_ble_to_config(&mut self) {
+        let cmd = if self.config.ble.enabled {
+            BleCommand::Connect {
+                mac: self.config.ble.mac.clone(),
+            }
+        } else {
+            BleCommand::Disconnect
+        };
+        let _ = self.ble.commands.send(cmd);
+    }
+
+    /// Load the config file at `config_path`, recording a human-readable
+    /// result for the Settings page to show.
     fn load_config(&mut self) {
         let path = self.config_path.trim().to_string();
         if path.is_empty() {
             self.config_feedback = Some(Err("Enter a file path.".to_string()));
             return;
         }
-        self.config_feedback = Some(match MarkerColors::load(&path) {
-            Ok(colors) => {
-                self.marker_colors = colors;
+        self.config_feedback = Some(match AppConfig::load(&path) {
+            Ok(cfg) => {
+                self.apply_config(cfg);
                 Ok(format!("Loaded {path}"))
             }
             Err(e) => Err(e),
@@ -154,18 +229,18 @@ impl MyApp {
         self.compass_heading.or(self.heading)
     }
 
-    /// Great-circle distance from the current position to the fixed point, in
-    /// meters. `None` until both a fix and a fixed point are known.
-    fn distance_to_fixed(&self) -> Option<f64> {
-        match (self.current, self.fixed_point) {
-            (Some(cur), Some(fixed)) => Some(haversine_m(cur, fixed)),
+    /// Great-circle distance from the current position to the BLE beacon, in
+    /// meters. `None` until both a fix and a beacon position are known.
+    fn distance_to_beacon(&self) -> Option<f64> {
+        match (self.current, self.beacon) {
+            (Some(cur), Some(beacon)) => Some(haversine_m(cur, beacon)),
             _ => None,
         }
     }
 
-    /// Pull every pending fix out of the channel, updating the current position
-    /// and appending to the track.
-    fn drain_gps(&mut self) {
+    /// Pull every pending fix out of the channels, updating the current
+    /// position, the beacon, and their tracks.
+    fn drain_sources(&mut self) {
         while let Ok(fix) = self.gps_rx.try_recv() {
             let pos = lat_lon(fix.lat, fix.lon);
             self.current = Some(pos);
@@ -180,48 +255,83 @@ impl MyApp {
                 self.compass_heading = Some(heading);
             }
         }
+
+        while let Ok(event) = self.ble.events.try_recv() {
+            match event {
+                BleEvent::Status(s) => self.ble_status = s,
+                BleEvent::Connected(c) => self.ble_connected = c,
+                BleEvent::Fix(p) => {
+                    self.beacon_packet = Some(p);
+                    if p.has_fix() {
+                        let pos = lat_lon(p.lat_deg(), p.lon_deg());
+                        self.beacon = Some(pos);
+                        if self.beacon_track.last() != Some(&pos) {
+                            self.beacon_track.push(pos);
+                        }
+                    }
+                }
+                BleEvent::Ack(ack) => {
+                    self.ble_ack_pending = false;
+                    self.ble_ack = Some(match ack.status {
+                        packet::ACK_OK => Ok(format!(
+                            "Device applied: interval {} ms",
+                            ack.value_u32.unwrap_or(0)
+                        )),
+                        packet::ACK_UNKNOWN_ID => {
+                            Err("Device rejected: unknown setting".to_string())
+                        }
+                        _ => Err("Device rejected: bad value".to_string()),
+                    });
+                }
+            }
+        }
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().button_padding = egui::vec2(15.0, 10.0);
         ui.horizontal(|ui| {
-
-            if ui.button("Center").clicked() {
+            if icon_button(ui, egui::include_image!("../assets/icons/center.svg"))
+                .on_hover_text("Center on position")
+                .clicked()
+            {
                 self.map_memory.follow_my_position();
             }
-            let rotate_label = if self.heading_up {
-                "North"
+
+            // Shows the mode the button switches TO (like the old label).
+            let (rotate_icon, rotate_hint) = if self.heading_up {
+                (
+                    egui::include_image!("../assets/icons/north.svg"),
+                    "North up",
+                )
             } else {
-                "Heading"
+                (
+                    egui::include_image!("../assets/icons/heading.svg"),
+                    "Heading up",
+                )
             };
-            if ui.button(rotate_label).clicked() {
+            if icon_button(ui, rotate_icon).on_hover_text(rotate_hint).clicked() {
                 self.heading_up = !self.heading_up;
             }
-            if ui.button("+").clicked() {
+
+            if icon_button(ui, egui::include_image!("../assets/icons/zoom-in.svg"))
+                .on_hover_text("Zoom in")
+                .clicked()
+            {
                 let _ = self.map_memory.zoom_in();
             }
-            if ui.button("-").clicked() {
+            if icon_button(ui, egui::include_image!("../assets/icons/zoom-out.svg"))
+                .on_hover_text("Zoom out")
+                .clicked()
+            {
                 let _ = self.map_memory.zoom_out();
             }
-            if ui.button("Clear").clicked() {
+            if icon_button(ui, egui::include_image!("../assets/icons/clear.svg"))
+                .on_hover_text("Clear tracks")
+                .clicked()
+            {
                 self.track.clear();
+                self.beacon_track.clear();
             }
-
-            ui.separator();
-            match self.current {
-                Some(pos) => {
-                    let hdg = match self.effective_heading() {
-                        Some(b) => format!("  hdg {b:.0}"),
-                        None => String::new(),
-                    };
-                    let dist = match self.distance_to_fixed() {
-                        Some(m) => format!("  dist {}", format_distance(m)),
-                        None => String::new(),
-                    };
-                    ui.label(format!("lat {:.5}  lon {:.5}{hdg}{dist}", pos.y(), pos.x()))
-                }
-                None => ui.label("waiting for GPS fix..."),
-            };
         });
     }
 
@@ -242,8 +352,14 @@ impl MyApp {
             current: self.current,
             track: self.track.clone(),
             heading: self.effective_heading(),
-            fixed_point: self.fixed_point,
-            colors: self.marker_colors,
+            beacon: self.beacon,
+            beacon_track: if self.show_beacon_path {
+                self.beacon_track.clone()
+            } else {
+                Vec::new()
+            },
+            show_beacon_path: self.show_beacon_path,
+            colors: self.config.colors,
         };
 
         // walkers sizes itself to the child's available space, so give it the
@@ -280,6 +396,10 @@ impl MyApp {
             // Walkers' gesture zoom works on desktop; on Android we drive it
             // manually above, so turn walkers' own gesture off there.
             .zoom_gesture(!android)
+            // Walkers defaults to ctrl+scroll for zoom; enable bare mouse-wheel
+            // zoom on desktop. We pan by primary-button drag, not scroll, so
+            // losing scroll-to-pan (a side effect of this) does not matter.
+            .zoom_with_ctrl(true)
             .panning(allow_pan)
             .drag_pan_buttons(if allow_pan {
                 egui::DragPanButtons::PRIMARY
@@ -306,7 +426,7 @@ impl MyApp {
 
 impl eframe::App for MyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_gps();
+        self.drain_sources();
 
         let ctx = ui.ctx().clone();
         let screen = ctx.input(|i| i.viewport_rect());
@@ -400,7 +520,8 @@ impl MyApp {
     }
 
     /// The data page: a plain, large read-out of the current latitude and
-    /// longitude, centered on an otherwise empty screen.
+    /// longitude plus the beacon distance, centered on an otherwise empty
+    /// screen.
     fn data_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
         egui::Area::new(egui::Id::new("data"))
             .order(egui::Order::Background)
@@ -413,7 +534,7 @@ impl MyApp {
                     .show(ui, |ui| {
                         ui.set_min_size(screen.size());
                         ui.vertical_centered(|ui| {
-                            ui.add_space(screen.height() * 0.35);
+                            ui.add_space(screen.height() * 0.3);
                             match self.current {
                                 Some(pos) => {
                                     ui.label(
@@ -425,7 +546,7 @@ impl MyApp {
                                         egui::RichText::new(format!("lon {:.5}", pos.x()))
                                             .size(40.0),
                                     );
-                                    if let Some(m) = self.distance_to_fixed() {
+                                    if let Some(m) = self.distance_to_beacon() {
                                         ui.add_space(24.0);
                                         ui.label(
                                             egui::RichText::new(format!(
@@ -442,14 +563,34 @@ impl MyApp {
                                     );
                                 }
                             }
+
+                            // The beacon's own data, when it is streaming.
+                            if let (Some(b), Some(p)) = (self.beacon, self.beacon_packet) {
+                                ui.add_space(24.0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "beacon {:.5} {:.5}",
+                                        b.y(),
+                                        b.x()
+                                    ))
+                                    .size(24.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "sats {}  speed {:.1} m/s",
+                                        p.sats,
+                                        p.speed_mps()
+                                    ))
+                                    .size(24.0),
+                                );
+                            }
                         });
                     });
             });
     }
 
-    /// The settings page: type a path to a TOML config file and load it. The
-    /// only setting for now is the marker colors; current values are shown as
-    /// swatches below the loader.
+    /// The settings page: load a TOML config file, and talk to the BLE
+    /// beacon (status, notify interval with device ack, path toggle).
     fn settings_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
         let top = self.top_inset(ctx);
         egui::Area::new(egui::Id::new("settings"))
@@ -493,13 +634,65 @@ impl MyApp {
 
                         ui.add_space(16.0);
                         ui.label("Marker colors:");
-                        color_swatch(ui, "track", self.marker_colors.track);
-                        color_swatch(ui, "fixed", self.marker_colors.fixed);
+                        color_swatch(ui, "track", self.config.colors.track);
+                        color_swatch(ui, "beacon", self.config.colors.fixed);
+
+                        ui.add_space(16.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        ui.heading("GPS beacon (BLE)");
+                        ui.add_space(8.0);
+                        ui.label(format!("Status: {}", self.ble_status));
+                        ui.add_space(8.0);
+                        ui.checkbox(&mut self.show_beacon_path, "Show beacon path on map");
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Notify interval (ms):");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.ble_interval_text)
+                                    .desired_width(80.0),
+                            );
+                            let apply =
+                                ui.add_enabled(self.ble_connected, egui::Button::new("Apply"));
+                            if apply.clicked() {
+                                match self.ble_interval_text.trim().parse::<u32>() {
+                                    Ok(ms) => {
+                                        let _ =
+                                            self.ble.commands.send(BleCommand::SetInterval(ms));
+                                        self.ble_ack = None;
+                                        self.ble_ack_pending = true;
+                                    }
+                                    Err(_) => {
+                                        self.ble_ack = Some(Err(
+                                            "Enter a whole number of milliseconds.".to_string()
+                                        ));
+                                    }
+                                }
+                            }
+                        });
+                        match &self.ble_ack {
+                            Some(Ok(msg)) => {
+                                ui.colored_label(egui::Color32::from_rgb(60, 180, 75), msg);
+                            }
+                            Some(Err(msg)) => {
+                                ui.colored_label(egui::Color32::from_rgb(220, 80, 60), msg);
+                            }
+                            None if self.ble_ack_pending => {
+                                ui.label("waiting for device ack...");
+                            }
+                            None => {}
+                        }
+
+                        ui.add_space(8.0);
+                        if ui.button("Reconnect").clicked() {
+                            self.sync_ble_to_config();
+                        }
 
                         ui.add_space(16.0);
                         ui.label(
                             egui::RichText::new(
-                                "[colors]\ntrack = \"#0078ff\"\nfixed = \"#ff5028\"",
+                                "[colors]\ntrack = \"#0078ff\"\nfixed = \"#ff5028\"\n\n[ble]\nenabled = true\nshow_path = true\n# mac = \"AA:BB:CC:DD:EE:FF\"",
                             )
                             .monospace()
                             .size(13.0),
@@ -508,22 +701,40 @@ impl MyApp {
             });
     }
 
-    /// Small button in the top-right corner that switches between the pages.
+    /// Small icon button in the top-right corner that switches between the
+    /// pages. Shows the page it switches TO.
     fn page_toggle(&mut self, ctx: &egui::Context, screen: egui::Rect) {
-        let (label, next) = match self.page {
-            Page::Map => ("Data", Page::Data),
-            Page::Data => ("Settings", Page::Settings),
-            Page::Settings => ("Map", Page::Map),
+        let (icon, hint, next) = match self.page {
+            Page::Map => (
+                egui::include_image!("../assets/icons/data.svg"),
+                "Data",
+                Page::Data,
+            ),
+            Page::Data => (
+                egui::include_image!("../assets/icons/settings.svg"),
+                "Settings",
+                Page::Settings,
+            ),
+            Page::Settings => (
+                egui::include_image!("../assets/icons/map.svg"),
+                "Map",
+                Page::Map,
+            ),
         };
         let top = self.top_inset(ctx);
         egui::Area::new(egui::Id::new("page_toggle"))
-            .order(egui::Order::Foreground)
+            // A strictly higher layer than the map-page controls bar (also
+            // Foreground). Same-order areas get reordered by interaction, so
+            // clicking a control button would otherwise raise the opaque
+            // controls frame over this toggle and hide it.
+            .order(egui::Order::Tooltip)
             .fixed_pos(egui::Pos2::new(screen.right() - 8.0, top + 8.0))
             .pivot(egui::Align2::RIGHT_TOP)
             .movable(false)
             .constrain(false)
             .show(ctx, |ui| {
-                if ui.button(label).clicked() {
+                ui.spacing_mut().button_padding = egui::vec2(15.0, 10.0);
+                if icon_button(ui, icon).on_hover_text(hint).clicked() {
                     self.page = next;
                 }
             });

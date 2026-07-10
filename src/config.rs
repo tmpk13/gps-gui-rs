@@ -1,5 +1,17 @@
-//! Loadable TOML configuration. For now it only carries the marker colors, but
-//! the schema is meant to grow (fixed point, initial view, ...) later.
+//! Loadable TOML configuration: marker colors and the BLE beacon settings.
+//!
+//! Schema (all fields optional; missing ones keep their defaults):
+//!
+//! ```toml
+//! [colors]
+//! track = "#0078ff"   # phone track, heading arrow, position dot
+//! fixed = "#ff5028"   # BLE beacon marker, distance line, beacon path
+//!
+//! [ble]
+//! enabled = true      # master switch for the BLE GPS source
+//! show_path = false   # draw the path of the incoming BLE GPS data
+//! mac = "AA:BB:CC:DD:EE:FF"  # pin a specific device; omit to scan by service
+//! ```
 
 use egui::Color32;
 use serde::Deserialize;
@@ -9,7 +21,7 @@ use serde::Deserialize;
 pub struct MarkerColors {
     /// Track polyline, heading arrow, and the current-position dot.
     pub track: Color32,
-    /// Fixed reference point and the line drawn to it.
+    /// BLE beacon marker, the line drawn to it, and its path.
     pub fixed: Color32,
 }
 
@@ -22,18 +34,55 @@ impl Default for MarkerColors {
     }
 }
 
+/// BLE beacon settings.
+#[derive(Clone)]
+pub struct BleSettings {
+    /// Connect to the beacon at all.
+    pub enabled: bool,
+    /// Draw the path of the incoming BLE GPS data on the map.
+    pub show_path: bool,
+    /// Pin a specific device MAC; `None` scans for the GPS service.
+    pub mac: Option<String>,
+}
+
+impl Default for BleSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            show_path: false,
+            mac: None,
+        }
+    }
+}
+
+/// Everything a config file can carry.
+#[derive(Clone, Default)]
+pub struct AppConfig {
+    pub colors: MarkerColors,
+    pub ble: BleSettings,
+}
+
 /// Mirrors the TOML shape; every field optional so a partial file keeps the
 /// defaults for whatever it leaves out.
 #[derive(Deserialize, Default)]
 struct RawConfig {
     #[serde(default)]
     colors: RawColors,
+    #[serde(default)]
+    ble: RawBle,
 }
 
 #[derive(Deserialize, Default)]
 struct RawColors {
     track: Option<String>,
     fixed: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawBle {
+    enabled: Option<bool>,
+    show_path: Option<bool>,
+    mac: Option<String>,
 }
 
 /// Parse a `#rrggbb` (or bare `rrggbb`) hex string into a color.
@@ -46,9 +95,10 @@ fn parse_hex(s: &str) -> Result<Color32, String> {
     Ok(Color32::from_rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
 }
 
-impl MarkerColors {
-    /// Read marker colors from a TOML file at `path`. Missing fields fall back to
-    /// the defaults; a returned `Err` is a human-readable message for the UI.
+impl AppConfig {
+    /// Read the config from a TOML file at `path`. Missing fields fall back
+    /// to the defaults; a returned `Err` is a human-readable message for the
+    /// UI.
     pub fn load(path: &str) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         Self::from_toml(&text)
@@ -56,13 +106,22 @@ impl MarkerColors {
 
     fn from_toml(text: &str) -> Result<Self, String> {
         let raw: RawConfig = toml::from_str(text).map_err(|e| e.to_string())?;
-        let mut colors = Self::default();
+        let mut config = Self::default();
         if let Some(s) = raw.colors.track {
-            colors.track = parse_hex(&s)?;
+            config.colors.track = parse_hex(&s)?;
         }
         if let Some(s) = raw.colors.fixed {
-            colors.fixed = parse_hex(&s)?;
+            config.colors.fixed = parse_hex(&s)?;
         }
-        Ok(colors)
+        if let Some(v) = raw.ble.enabled {
+            config.ble.enabled = v;
+        }
+        if let Some(v) = raw.ble.show_path {
+            config.ble.show_path = v;
+        }
+        // Treat an empty string as unset so a template line can stay in the
+        // file.
+        config.ble.mac = raw.ble.mac.filter(|m| !m.trim().is_empty());
+        Ok(config)
     }
 }
