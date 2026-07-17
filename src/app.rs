@@ -1,17 +1,23 @@
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use egui::emath::Rot2;
 use egui::{Pos2, Shape};
 use gps_proto::packet::{self, PositionPacket};
 use walkers::{
-    lat_lon, sources::OpenStreetMap, HttpOptions, HttpTiles, Map, MapMemory, Position,
+    lat_lon, sources::OpenStreetMap, HeaderValue, HttpOptions, HttpTiles, Map, MapMemory,
+    Position, Projector,
 };
 
 use crate::ble::{BleCommand, BleEvent, BleHandle};
 use crate::config::AppConfig;
 use crate::gps::GpsFix;
 use crate::marker::GpsLayer;
+use crate::offline::{self, DownloadProgress};
+use crate::points::{age_text, PointSource, TrackPoint};
 
 /// Where the map looks before the first GPS fix arrives.
 fn default_position() -> Position {
@@ -70,16 +76,64 @@ enum Page {
     Map,
     /// A plain read-out of the current latitude and longitude.
     Data,
+    /// Searchable list of all recorded GPS points.
+    Points,
     /// Loading the TOML config file (marker colors, BLE beacon).
     Settings,
 }
 
+/// Refuse offline downloads bigger than this many tiles (tile-server
+/// courtesy; shrink the box or lower the max zoom instead).
+const MAX_REGION_TILES: u64 = 10_000;
+
+/// Rough average size of a cached OSM tile, for the download estimate.
+const TILE_SIZE_ESTIMATE_KB: u64 = 15;
+
+/// Box-selection state for the offline region download on the map page.
+#[derive(Clone, Copy)]
+enum RegionSelect {
+    /// Not selecting; the map behaves normally.
+    Inactive,
+    /// Waiting for / tracking the box drag. Panning is disabled so the drag
+    /// draws a box instead of moving the map.
+    Picking {
+        start: Option<Pos2>,
+        current: Option<Pos2>,
+    },
+    /// Box chosen; the confirm panel is shown over the map.
+    Confirm {
+        a: Position,
+        b: Position,
+        max_zoom: u8,
+    },
+}
+
+/// Source filter on the points page.
+#[derive(Clone, Copy, PartialEq)]
+enum PointFilter {
+    All,
+    Phone,
+    Esp,
+}
+
+impl PointFilter {
+    fn admits(self, source: PointSource) -> bool {
+        match self {
+            PointFilter::All => true,
+            PointFilter::Phone => source == PointSource::Phone,
+            PointFilter::Esp => source == PointSource::Esp,
+        }
+    }
+}
+
 /// HTTP tile options caching to `cache_dir` (when writable). Tiles fetched once
 /// are reused from disk, so previously viewed areas keep working without a
-/// network. `None` disables the cache.
+/// network. `None` disables the cache. The user agent matches the offline
+/// downloader's so both read and write the same cache entries.
 fn http_options(cache_dir: Option<PathBuf>) -> HttpOptions {
     HttpOptions {
         cache: cache_dir,
+        user_agent: Some(HeaderValue::from_static(offline::USER_AGENT)),
         ..Default::default()
     }
 }
@@ -105,14 +159,14 @@ pub struct MyApp {
     /// Rotation angle actually drawn, eased toward the live heading each frame so
     /// the map turns smoothly instead of snapping between sensor readings.
     smoothed_heading: Option<f32>,
-    track: Vec<Position>,
+    track: Vec<TrackPoint>,
     /// Live position of the BLE beacon; replaces the old fixed reference
     /// point, so the distance line tracks the real device.
     beacon: Option<Position>,
     /// The last full packet from the beacon (satellites, speed, ...).
     beacon_packet: Option<PositionPacket>,
-    /// Every beacon position seen, for the path drawing.
-    beacon_track: Vec<Position>,
+    /// Every beacon position recorded, for the path drawing and points list.
+    beacon_track: Vec<TrackPoint>,
     /// Draw the beacon path (TOML `[ble] show_path`, also togglable in
     /// Settings).
     show_beacon_path: bool,
@@ -133,6 +187,16 @@ pub struct MyApp {
     config_path: String,
     /// Result of the last load attempt: `Ok` message (green) or error (red).
     config_feedback: Option<Result<String, String>>,
+    /// Tile cache directory; also the target of offline region downloads.
+    cache_dir: Option<PathBuf>,
+    /// Box-selection state for the offline region download.
+    select: RegionSelect,
+    /// Progress of the running (or just-finished) offline tile download.
+    download: Option<Arc<DownloadProgress>>,
+    /// Search query on the points page.
+    points_search: String,
+    /// Source filter on the points page.
+    points_filter: PointFilter,
 }
 
 impl MyApp {
@@ -153,7 +217,7 @@ impl MyApp {
         egui_extras::install_image_loaders(&ctx);
 
         let mut app = Self {
-            tiles: HttpTiles::with_options(OpenStreetMap, http_options(cache_dir), ctx),
+            tiles: HttpTiles::with_options(OpenStreetMap, http_options(cache_dir.clone()), ctx),
             map_memory: MapMemory::default(),
             gps_rx,
             compass_rx,
@@ -178,6 +242,11 @@ impl MyApp {
             config: AppConfig::default(),
             config_path: String::new(),
             config_feedback: None,
+            cache_dir,
+            select: RegionSelect::Inactive,
+            download: None,
+            points_search: String::new(),
+            points_filter: PointFilter::All,
         };
 
         // Auto-load ./gps-config.toml when present (desktop convenience); the
@@ -234,6 +303,14 @@ impl MyApp {
         }
     }
 
+    /// Safe-area inset at the bottom (gesture bar) in egui points.
+    fn bottom_inset(&self, ctx: &egui::Context) -> f32 {
+        match &self.insets {
+            Some(f) => f()[2] / ctx.pixels_per_point(),
+            None => 0.0,
+        }
+    }
+
     /// Device-facing compass heading if available, otherwise course over ground.
     fn effective_heading(&self) -> Option<f32> {
         self.compass_heading.or(self.heading)
@@ -255,8 +332,16 @@ impl MyApp {
             let pos = lat_lon(fix.lat, fix.lon);
             self.current = Some(pos);
             self.heading = fix.bearing;
-            if far_enough(self.track.last(), pos, self.config.track.min_distance) {
-                self.track.push(pos);
+            if far_enough(
+                self.track.last().map(|t| &t.pos),
+                pos,
+                self.config.track.min_distance,
+            ) {
+                self.track.push(TrackPoint {
+                    pos,
+                    source: PointSource::Phone,
+                    time: SystemTime::now(),
+                });
             }
         }
 
@@ -275,8 +360,16 @@ impl MyApp {
                     if p.has_fix() {
                         let pos = lat_lon(p.lat_deg(), p.lon_deg());
                         self.beacon = Some(pos);
-                        if far_enough(self.beacon_track.last(), pos, self.config.track.min_distance) {
-                            self.beacon_track.push(pos);
+                        if far_enough(
+                            self.beacon_track.last().map(|t| &t.pos),
+                            pos,
+                            self.config.track.min_distance,
+                        ) {
+                            self.beacon_track.push(TrackPoint {
+                                pos,
+                                source: PointSource::Esp,
+                                time: SystemTime::now(),
+                            });
                         }
                     }
                 }
@@ -342,6 +435,30 @@ impl MyApp {
                 self.track.clear();
                 self.beacon_track.clear();
             }
+
+            // Offline region download: only when tiles are cached to disk,
+            // and one download at a time.
+            if self.cache_dir.is_some() && self.download.is_none() {
+                let selecting = !matches!(self.select, RegionSelect::Inactive);
+                let hint = if selecting {
+                    "Cancel region selection"
+                } else {
+                    "Download region"
+                };
+                if icon_button(ui, egui::include_image!("../assets/icons/download.svg"))
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    self.select = if selecting {
+                        RegionSelect::Inactive
+                    } else {
+                        RegionSelect::Picking {
+                            start: None,
+                            current: None,
+                        }
+                    };
+                }
+            }
         });
     }
 
@@ -360,11 +477,11 @@ impl MyApp {
 
         let layer = GpsLayer {
             current: self.current,
-            track: self.track.clone(),
+            track: self.track.iter().map(|t| t.pos).collect(),
             heading: self.effective_heading(),
             beacon: self.beacon,
             beacon_track: if self.show_beacon_path {
-                self.beacon_track.clone()
+                self.beacon_track.iter().map(|t| t.pos).collect()
             } else {
                 Vec::new()
             },
@@ -398,7 +515,9 @@ impl MyApp {
 
         // Suppress pan while pinching so the two-finger gesture zooms instead of
         // dragging (walkers normally keeps zoom and pan mutually exclusive).
-        let allow_pan = !locked && !pinching;
+        // While a download box is being picked, the drag draws the box instead.
+        let picking = matches!(self.select, RegionSelect::Picking { .. });
+        let allow_pan = !locked && !pinching && !picking;
 
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(map_rect));
         let map = Map::new(Some(&mut self.tiles), &mut self.map_memory, my_position)
@@ -444,22 +563,30 @@ impl eframe::App for MyApp {
         match self.page {
             Page::Map => self.map_page(&ctx, screen),
             Page::Data => self.data_page(&ctx, screen),
+            Page::Points => self.points_page(&ctx, screen),
             Page::Settings => self.settings_page(&ctx, screen),
         }
 
-        // Page toggle floats in the top-right corner, above both pages.
+        // Page toggle floats in the top-right corner, above all pages.
         self.page_toggle(&ctx, screen);
+        // Offline download progress floats above every page too.
+        self.download_ui(&ctx, screen);
     }
 }
 
 impl MyApp {
     /// The interactive map page: full-bleed map with the floating controls.
     fn map_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        // Box selection needs the screen to map 1:1 onto the north-up tile
+        // space (the projector knows nothing about our post-rotation), so
+        // heading-up rotation pauses while a region is being selected.
+        let selecting = !matches!(self.select, RegionSelect::Inactive);
+
         // Rotate the map so the heading points up, when enabled and known. The
         // drawn angle eases toward the live heading each frame (shortest way
         // round the circle), so the map glides rather than stepping between
         // sensor updates. We keep requesting repaints until it settles.
-        let rotation = match (self.heading_up, self.effective_heading()) {
+        let rotation = match (self.heading_up && !selecting, self.effective_heading()) {
             (true, Some(target)) => {
                 let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
                 let current = self.smoothed_heading.unwrap_or(target);
@@ -508,6 +635,9 @@ impl MyApp {
                 self.map(ui, map_rect, rotation, screen);
             });
 
+        // The box-selection layer sits between the map and the controls.
+        self.select_overlay(ctx, screen);
+
         // Controls float on top in the foreground layer, so they keep pointer
         // priority over the (interactive) map behind them. The fill spans the
         // status-bar area; the top inset pushes the buttons clear of it.
@@ -525,6 +655,310 @@ impl MyApp {
                         ui.set_width(screen.width());
                         ui.add_space(top);
                         self.controls(ui);
+                    });
+            });
+
+        // Selection hint / download confirmation, floating over everything.
+        self.select_ui(ctx, screen);
+    }
+
+    /// The box-drag layer for the offline region download. It sits between the
+    /// map (Background) and the floating controls (Foreground): drags land here
+    /// instead of panning the map, while the buttons above stay clickable.
+    fn select_overlay(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        if matches!(self.select, RegionSelect::Inactive) {
+            return;
+        }
+        let my_position = self.current.unwrap_or_else(default_position);
+        let color = self.config.colors.track;
+        let fill = color.gamma_multiply(0.15);
+        let stroke = egui::Stroke::new(2.0, color);
+
+        egui::Area::new(egui::Id::new("region_select"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .movable(false)
+            .constrain(false)
+            .show(ctx, |ui| match self.select {
+                RegionSelect::Inactive => {}
+                RegionSelect::Picking { mut start, mut current } => {
+                    let resp = ui.allocate_rect(screen, egui::Sense::drag());
+                    if resp.drag_started() {
+                        start = resp.interact_pointer_pos();
+                    }
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        current = Some(p);
+                    }
+                    if let (Some(s), Some(c)) = (start, current) {
+                        ui.painter().rect(
+                            egui::Rect::from_two_pos(s, c),
+                            egui::CornerRadius::ZERO,
+                            fill,
+                            stroke,
+                            egui::StrokeKind::Middle,
+                        );
+                    }
+
+                    self.select = match (resp.drag_stopped(), start, current) {
+                        (true, Some(s), Some(c)) => {
+                            let rect = egui::Rect::from_two_pos(s, c);
+                            // Ignore taps and hairline drags.
+                            if rect.width() >= 10.0 && rect.height() >= 10.0 {
+                                // Same clip rect and position the map was
+                                // drawn with (selection forces north-up, so
+                                // the map rect is exactly the screen).
+                                let projector =
+                                    Projector::new(screen, &self.map_memory, my_position);
+                                // Offer two zoom levels past the current view.
+                                let max_zoom = (self.map_memory.zoom().ceil() as u8)
+                                    .saturating_add(2)
+                                    .min(17);
+                                RegionSelect::Confirm {
+                                    a: projector.unproject(rect.min.to_vec2()),
+                                    b: projector.unproject(rect.max.to_vec2()),
+                                    max_zoom,
+                                }
+                            } else {
+                                RegionSelect::Picking { start: None, current: None }
+                            }
+                        }
+                        (true, ..) => RegionSelect::Picking { start: None, current: None },
+                        (false, ..) => RegionSelect::Picking { start, current },
+                    };
+                }
+                RegionSelect::Confirm { a, b, .. } => {
+                    let projector = Projector::new(screen, &self.map_memory, my_position);
+                    let rect = egui::Rect::from_two_pos(
+                        projector.project(a).to_pos2(),
+                        projector.project(b).to_pos2(),
+                    );
+                    ui.painter().rect(
+                        rect,
+                        egui::CornerRadius::ZERO,
+                        fill,
+                        stroke,
+                        egui::StrokeKind::Middle,
+                    );
+                }
+            });
+    }
+
+    /// The floating hint while picking a box, and the confirm panel (tile
+    /// count, max-zoom stepper) once one is chosen.
+    fn select_ui(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let top = self.top_inset(ctx);
+        match self.select {
+            RegionSelect::Inactive => {}
+            RegionSelect::Picking { .. } => {
+                egui::Area::new(egui::Id::new("select_hint"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::Pos2::new(screen.center().x, top + 64.0))
+                    .pivot(egui::Align2::CENTER_TOP)
+                    .movable(false)
+                    .constrain(false)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label("Drag a box over the region to download");
+                        });
+                    });
+            }
+            RegionSelect::Confirm { a, b, mut max_zoom } => {
+                let mut close = false;
+                egui::Area::new(egui::Id::new("select_confirm"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(screen.center())
+                    .pivot(egui::Align2::CENTER_CENTER)
+                    .movable(false)
+                    .constrain(false)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.spacing_mut().button_padding = egui::vec2(15.0, 10.0);
+                            ui.label(
+                                egui::RichText::new("Download region for offline use").strong(),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Max zoom:");
+                                if ui.add_enabled(max_zoom > 1, egui::Button::new("-")).clicked() {
+                                    max_zoom -= 1;
+                                }
+                                ui.label(format!("{max_zoom}"));
+                                if ui.add_enabled(max_zoom < 19, egui::Button::new("+")).clicked()
+                                {
+                                    max_zoom += 1;
+                                }
+                            });
+                            let count = offline::tile_count(a, b, max_zoom);
+                            ui.label(format!(
+                                "{count} tiles, ~{} MB",
+                                (count * TILE_SIZE_ESTIMATE_KB).div_ceil(1024).max(1)
+                            ));
+                            if count > MAX_REGION_TILES {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 80, 60),
+                                    "Too many tiles: shrink the box or lower the max zoom.",
+                                );
+                            }
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                let can_download =
+                                    count <= MAX_REGION_TILES && self.cache_dir.is_some();
+                                if ui
+                                    .add_enabled(can_download, egui::Button::new("Download"))
+                                    .clicked()
+                                {
+                                    if let Some(dir) = &self.cache_dir {
+                                        self.download = Some(offline::spawn_download(
+                                            dir.clone(),
+                                            offline::region_tiles(a, b, max_zoom),
+                                            ctx.clone(),
+                                        ));
+                                    }
+                                    close = true;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                    });
+                self.select = if close {
+                    RegionSelect::Inactive
+                } else {
+                    RegionSelect::Confirm { a, b, max_zoom }
+                };
+            }
+        }
+    }
+
+    /// Progress readout for the offline tile download, floating bottom-left
+    /// on every page.
+    fn download_ui(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let Some(progress) = self.download.clone() else { return };
+        let bottom = self.bottom_inset(ctx);
+        egui::Area::new(egui::Id::new("download_progress"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.left_bottom() + egui::vec2(8.0, -(8.0 + bottom)))
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .movable(false)
+            .constrain(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    let done = progress.done.load(Ordering::Relaxed);
+                    let failed = progress.failed.load(Ordering::Relaxed);
+                    let status = if progress.finished() {
+                        if failed > 0 {
+                            format!("Offline tiles: done, {failed} of {} failed", progress.total)
+                        } else {
+                            format!("Offline tiles: all {} done", progress.total)
+                        }
+                    } else if failed > 0 {
+                        format!("Offline tiles: {done}/{} ({failed} failed)", progress.total)
+                    } else {
+                        format!("Offline tiles: {done}/{}", progress.total)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(status);
+                        let button = if progress.finished() { "OK" } else { "Cancel" };
+                        if ui.button(button).clicked() {
+                            progress.cancel.store(true, Ordering::Relaxed);
+                            self.download = None;
+                        }
+                    });
+                });
+            });
+    }
+
+    /// The points page: a searchable, filterable list of every recorded GPS
+    /// point from both sources. Tapping a row shows it on the map.
+    fn points_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let top = self.top_inset(ctx);
+        let bottom = self.bottom_inset(ctx);
+        egui::Area::new(egui::Id::new("points"))
+            .order(egui::Order::Background)
+            .fixed_pos(egui::Pos2::ZERO)
+            .movable(false)
+            .constrain(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.set_min_size(screen.size());
+                        ui.add_space(top + 8.0);
+                        ui.heading("GPS points");
+                        ui.add_space(12.0);
+
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.points_search)
+                                    .hint_text("search (e.g. 51.47 or esp)")
+                                    .desired_width((screen.width() - 140.0).clamp(120.0, 320.0)),
+                            );
+                            if ui.button("Clear").clicked() {
+                                self.points_search.clear();
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Source:");
+                            ui.selectable_value(&mut self.points_filter, PointFilter::All, "all");
+                            ui.selectable_value(
+                                &mut self.points_filter,
+                                PointFilter::Phone,
+                                "phone",
+                            );
+                            ui.selectable_value(&mut self.points_filter, PointFilter::Esp, "esp");
+                        });
+                        ui.add_space(8.0);
+
+                        let query = self.points_search.trim().to_lowercase();
+                        let mut rows: Vec<TrackPoint> = self
+                            .track
+                            .iter()
+                            .chain(self.beacon_track.iter())
+                            .filter(|p| self.points_filter.admits(p.source))
+                            .filter(|p| query.is_empty() || p.matches(&query))
+                            .copied()
+                            .collect();
+                        // Newest first; the two tracks interleave by record time.
+                        rows.sort_by(|x, y| y.time.cmp(&x.time));
+
+                        let total = self.track.len() + self.beacon_track.len();
+                        ui.label(format!("{} of {total} points", rows.len()));
+                        ui.add_space(4.0);
+
+                        let now = SystemTime::now();
+                        let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+                        let list_height =
+                            (screen.bottom() - bottom - ui.cursor().min.y - 16.0).max(60.0);
+                        let mut goto: Option<Position> = None;
+                        egui::ScrollArea::vertical()
+                            .max_height(list_height)
+                            .auto_shrink([false, false])
+                            .show_rows(ui, row_height, rows.len(), |ui, range| {
+                                for p in &rows[range] {
+                                    let text = format!(
+                                        "{:<6} {}  {:>7}",
+                                        p.source.label(),
+                                        p.coord_text(),
+                                        age_text(now, p.time),
+                                    );
+                                    if ui
+                                        .selectable_label(
+                                            false,
+                                            egui::RichText::new(text).monospace(),
+                                        )
+                                        .clicked()
+                                    {
+                                        goto = Some(p.pos);
+                                    }
+                                }
+                            });
+                        if let Some(pos) = goto {
+                            self.map_memory.center_at(pos);
+                            self.page = Page::Map;
+                        }
                     });
             });
     }
@@ -721,6 +1155,11 @@ impl MyApp {
                 Page::Data,
             ),
             Page::Data => (
+                egui::include_image!("../assets/icons/points.svg"),
+                "Points",
+                Page::Points,
+            ),
+            Page::Points => (
                 egui::include_image!("../assets/icons/settings.svg"),
                 "Settings",
                 Page::Settings,

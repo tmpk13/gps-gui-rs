@@ -28,6 +28,14 @@ egui_extras = { version = "0.35", features = ["svg"] }
 # Shared BLE protocol with the esp32c3-gps firmware (lives in the same parent
 # directory).
 gps-proto = { path = "../gps-proto" }
+# Offline region downloads reuse the exact HTTP-cache stack walkers uses (same
+# crate versions, same cache format), so pre-fetched tiles land in the cache
+# the map already reads from. All already in the dependency tree via walkers.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest-middleware = "0.4"
+http-cache-reqwest = "0.16"
+tokio = { version = "1", features = ["rt"] }
+futures = "0.3"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 eframe = "0.35"
@@ -35,9 +43,7 @@ env_logger = "0.11"
 # BLE central for the ESP32-C3 GPS beacon on desktop (Linux/bluez). Android
 # uses a JNI bridge instead (src/ble/android.rs).
 btleplug = "0.12"
-tokio = { version = "1", features = ["rt"] }
 uuid = "1"
-futures = "0.3"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Android needs the wgpu renderer. native-activity works with the no-Java

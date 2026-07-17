@@ -3,6 +3,8 @@ pub mod ble;
 pub mod config;
 pub mod gps;
 pub mod marker;
+pub mod offline;
+pub mod points;
 
 #[cfg(target_os = "android")]
 mod compass;
