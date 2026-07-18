@@ -187,6 +187,27 @@ enum PointFilter {
     Esp,
 }
 
+/// A map marker the user can double-click/tap to inspect.
+#[derive(Clone, Copy, PartialEq)]
+enum MarkerKind {
+    /// The phone / manual position dot.
+    You,
+    /// The BLE GPS beacon.
+    Beacon,
+}
+
+impl MarkerKind {
+    fn label(self) -> &'static str {
+        match self {
+            MarkerKind::You => "You",
+            MarkerKind::Beacon => "Beacon",
+        }
+    }
+}
+
+/// How close (in points) a double-click must land to a marker to select it.
+const MARKER_HIT_RADIUS: f32 = 24.0;
+
 impl PointFilter {
     fn admits(self, source: PointSource) -> bool {
         match self {
@@ -223,6 +244,8 @@ pub struct MyApp {
     /// physical pixels. `None` on desktop (no system bars to avoid).
     insets: Option<Box<dyn Fn() -> [f32; 4]>>,
     current: Option<Position>,
+    /// When the current position was last updated, for the marker info popup.
+    current_time: Option<SystemTime>,
     /// Course over ground from the GPS fix.
     heading: Option<f32>,
     /// Device-facing heading from the compass sensor.
@@ -236,6 +259,8 @@ pub struct MyApp {
     /// Live position of the BLE beacon; replaces the old fixed reference
     /// point, so the distance line tracks the real device.
     beacon: Option<Position>,
+    /// When the beacon position was last updated, for the marker info popup.
+    beacon_time: Option<SystemTime>,
     /// The last full packet from the beacon (satellites, speed, ...).
     beacon_packet: Option<PositionPacket>,
     /// Every beacon position recorded, for the path drawing and points list.
@@ -278,6 +303,9 @@ pub struct MyApp {
     manual_gps_text: String,
     /// The last manual position entry failed to parse.
     manual_gps_bad: bool,
+    /// Marker whose info popup (name + time since last update) is shown, set by
+    /// double-clicking/tapping a marker on the map.
+    selected_marker: Option<MarkerKind>,
 }
 
 impl MyApp {
@@ -307,12 +335,14 @@ impl MyApp {
             ble,
             insets,
             current: None,
+            current_time: None,
             heading: None,
             compass_heading: None,
             heading_up: false,
             smoothed_heading: None,
             track: Vec::new(),
             beacon: None,
+            beacon_time: None,
             beacon_packet: None,
             beacon_track: Vec::new(),
             show_beacon_path: false,
@@ -334,6 +364,7 @@ impl MyApp {
             points_filter: PointFilter::All,
             manual_gps_text: String::new(),
             manual_gps_bad: false,
+            selected_marker: None,
         };
 
         // Auto-load ./gps-config.toml when present (desktop convenience); the
@@ -417,6 +448,7 @@ impl MyApp {
     fn apply_gps_fix(&mut self, fix: GpsFix) {
         let pos = lat_lon(fix.lat, fix.lon);
         self.current = Some(pos);
+        self.current_time = Some(SystemTime::now());
         self.heading = fix.bearing;
         if far_enough(
             self.track.last().map(|t| &t.pos),
@@ -453,6 +485,7 @@ impl MyApp {
                     if p.has_fix() {
                         let pos = lat_lon(p.lat_deg(), p.lon_deg());
                         self.beacon = Some(pos);
+                        self.beacon_time = Some(SystemTime::now());
                         if far_enough(
                             self.beacon_track.last().map(|t| &t.pos),
                             pos,
@@ -783,6 +816,12 @@ impl MyApp {
                 self.map(ui, map_rect, rotation, screen);
             });
 
+        // Double-click/tap a marker to show its name and time since last update.
+        // Skipped while a region box is being drawn (double-clicks belong to it).
+        if !selecting {
+            self.marker_info(ctx, screen, map_rect, rotation);
+        }
+
         // The box-selection layer sits between the map and the controls.
         self.select_overlay(ctx, screen);
 
@@ -808,6 +847,86 @@ impl MyApp {
 
         // Selection hint / download confirmation, floating over everything.
         self.select_ui(ctx, screen);
+    }
+
+    /// Handle double-click/tap selection of a map marker and draw the info
+    /// popup (name + time since last update) for the selected one.
+    ///
+    /// Marker screen positions are computed the same way the [`GpsLayer`] plugin
+    /// draws them: project with the map's projector, then apply the heading-up
+    /// rotation (about the screen center) when the map is rotated. A double-click
+    /// that misses every marker dismisses the popup.
+    fn marker_info(
+        &mut self,
+        ctx: &egui::Context,
+        screen: egui::Rect,
+        map_rect: egui::Rect,
+        rotation: Option<Rot2>,
+    ) {
+        let my_position = self.current.unwrap_or_else(default_position);
+        let projector = Projector::new(map_rect, &self.map_memory, my_position);
+        let origin = screen.center();
+        let to_screen = |pos: Position| {
+            let p = projector.project(pos).to_pos2();
+            match rotation {
+                Some(rot) => rotate_pos(p, rot, origin),
+                None => p,
+            }
+        };
+
+        // Present markers, nearest-first is resolved below by distance.
+        let markers: [(MarkerKind, Option<Position>); 2] =
+            [(MarkerKind::You, self.current), (MarkerKind::Beacon, self.beacon)];
+
+        // On a double-click, pick the closest marker within the hit radius; a
+        // miss clears the current selection.
+        let double = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+        if double {
+            if let Some(click) = ctx.input(|i| i.pointer.interact_pos()) {
+                self.selected_marker = markers
+                    .iter()
+                    .filter_map(|(kind, pos)| {
+                        pos.as_ref().map(|p| (*kind, to_screen(*p).distance(click)))
+                    })
+                    .filter(|(_, dist)| *dist <= MARKER_HIT_RADIUS)
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(kind, _)| kind);
+            }
+        }
+
+        let Some(kind) = self.selected_marker else { return };
+        let (pos, time) = match kind {
+            MarkerKind::You => (self.current, self.current_time),
+            MarkerKind::Beacon => (self.beacon, self.beacon_time),
+        };
+        // The marker may have vanished (e.g. beacon disconnected) since it was
+        // selected; drop the popup if so.
+        let Some(pos) = pos else {
+            self.selected_marker = None;
+            return;
+        };
+        let anchor = to_screen(pos);
+
+        let now = SystemTime::now();
+        let age = match time {
+            Some(t) => format!("Updated {} ago", age_text(now, t)),
+            None => "No update yet".to_string(),
+        };
+
+        egui::Area::new(egui::Id::new("marker_info"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(anchor.x, anchor.y - 14.0))
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .movable(false)
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new(kind.label()).strong());
+                    ui.label(age);
+                });
+            });
+        // Keep the elapsed-time text live even without new fixes.
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
     }
 
     /// The box-drag layer for the offline region download. It sits between the
