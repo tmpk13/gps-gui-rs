@@ -1,13 +1,18 @@
 //! GPS position source.
 //!
-//! The rest of the app only depends on a `Receiver<GpsFix>`: something produces
-//! fixes on a background thread and sends them over a channel, and the UI drains
-//! that channel each frame. Desktop uses a simulated source; Android reads the
-//! phone's GNSS via LocationManager. A BLE source could slot in the same way.
+//! The rest of the app only depends on an optional `Receiver<GpsFix>`:
+//! something produces fixes on a background thread and sends them over a
+//! channel, and the UI drains that channel each frame. Android reads the
+//! phone's GNSS via LocationManager. Desktop has no built-in source yet, so the
+//! UI shows a manual position entry bar instead (see `app::MyApp`); a real
+//! source can slot in the same way later.
 
+#[cfg(target_os = "android")]
 use std::sync::mpsc::{channel, Receiver};
+#[cfg(target_os = "android")]
 use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(target_os = "android")]
+use std::time::Duration;
 
 /// A single GPS fix in decimal degrees.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -19,52 +24,11 @@ pub struct GpsFix {
     pub bearing: Option<f32>,
 }
 
-/// Spawn a simulated GPS source that emits a fix roughly once per second,
-/// tracing a slow loop around a fixed point. Returns the receiving end of the
-/// channel; when it is dropped the background thread exits.
-pub fn spawn_simulated(ctx: egui::Context) -> Receiver<GpsFix> {
-    let (tx, rx) = channel();
-
-    thread::spawn(move || {
-        // Greenwich observatory, a recognizable starting point.
-        let base_lat = 51.4779;
-        let base_lon = -0.0015;
-        let start = Instant::now();
-
-        let w = 0.12;
-
-        loop {
-            let t = start.elapsed().as_secs_f64();
-            // Velocity direction along the circular path (derivative of the
-            // position below) gives a plausible course over ground.
-            let d_north = (t * w).cos();
-            let d_east = -(t * w).sin();
-            let bearing = d_east.atan2(d_north).to_degrees().rem_euclid(360.0);
-
-            let fix = GpsFix {
-                lat: base_lat + 0.0015 * (t * w).sin(),
-                lon: base_lon + 0.0015 * (t * w).cos(),
-                bearing: Some(bearing as f32),
-            };
-
-            if tx.send(fix).is_err() {
-                break; // UI has gone away.
-            }
-
-            // Wake the UI thread so it drains the channel promptly.
-            ctx.request_repaint();
-            thread::sleep(Duration::from_secs(1));
-        }
-    });
-
-    rx
-}
-
 /// Spawn a GPS source backed by the phone's Android LocationManager.
 ///
 /// Requests the fine-location permission if needed, seeds the map with the
 /// freshest last-known fix, then registers for active location updates and
-/// emits each fresh fix on change. Feeds the same channel as [`spawn_simulated`].
+/// emits each fresh fix on change over the returned channel.
 ///
 /// Active updates matter: `getLastKnownLocation` is passive and never wakes the
 /// GNSS hardware, so on its own it returns a stale fix that never changes. The

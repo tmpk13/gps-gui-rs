@@ -19,6 +19,8 @@ use jni::sys::jint;
 use jni::{JNIEnv, JavaVM, NativeMethod};
 
 use gps_proto::packet::{self, PositionPacket};
+use midair_proto::ble;
+use midair_proto::link::Telemetry;
 
 use super::{BleCommand, BleEvent, BleHandle};
 
@@ -316,6 +318,15 @@ fn session(
         })
         .map_err(|_| "subscribe timed out")?;
     }
+    // Optional board-status subscriptions (esp32c6-gps; absent on the c3
+    // beacon, so a missing characteristic is not an error).
+    for chr in [ble::TELEMETRY_UUID, ble::LOG_UUID] {
+        if bridge.set_notify(packet::SERVICE_UUID, chr, true) {
+            let _ = wait_for(cb_rx, Duration::from_secs(5), |cb| {
+                matches!(cb, Cb::DescriptorWrite { status: 0 })
+            });
+        }
+    }
 
     report.send(BleEvent::Connected(true));
     report.status(format!("connected to {address}"));
@@ -339,6 +350,12 @@ fn session(
                     if let Some(a) = packet::parse_ack(&value) {
                         report.send(BleEvent::Ack(a));
                     }
+                } else if uuid.eq_ignore_ascii_case(ble::TELEMETRY_UUID) {
+                    if let Some(t) = Telemetry::decode(&value) {
+                        report.send(BleEvent::Telemetry(t));
+                    }
+                } else if uuid.eq_ignore_ascii_case(ble::LOG_UUID) {
+                    report.send(BleEvent::Log(String::from_utf8_lossy(&value).into_owned()));
                 }
             }
             Ok(Cb::ConnectionState { new_state: 0 }) => return Err("connection lost".into()),

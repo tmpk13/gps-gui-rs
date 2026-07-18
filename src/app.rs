@@ -12,7 +12,10 @@ use walkers::{
     Position, Projector,
 };
 
-use crate::ble::{BleCommand, BleEvent, BleHandle};
+use crate::ble::{BleCommand, BleEvent, BleHandle, Telemetry};
+use midair_proto::link::{
+    TELEM_FLAG_CFG_LOADED, TELEM_FLAG_GPS_FIX, TELEM_FLAG_SD_OK,
+};
 use crate::config::AppConfig;
 use crate::gps::GpsFix;
 use crate::marker::GpsLayer;
@@ -24,8 +27,20 @@ fn default_position() -> Position {
     lat_lon(54.333, -122.676)
 }
 
-/// Side length of the square button icons, in points.
-const ICON_SIZE: f32 = 22.0;
+/// Icon side length as a fraction of the smaller screen dimension, clamped to
+/// this point range. Keeps the toolbar proportional across phone and desktop.
+const ICON_SIZE_FRAC: f32 = 0.05;
+const ICON_SIZE_MIN: f32 = 20.0;
+const ICON_SIZE_MAX: f32 = 40.0;
+
+/// Inset of the floating corner toggle from the screen edge, as a fraction of
+/// the smaller screen dimension.
+const CORNER_MARGIN_FRAC: f32 = 0.03;
+
+/// Square icon side length in points for the current screen size.
+fn icon_size_for(screen: egui::Rect) -> f32 {
+    (screen.size().min_elem() * ICON_SIZE_FRAC).clamp(ICON_SIZE_MIN, ICON_SIZE_MAX)
+}
 
 /// Great-circle distance between two positions in meters (haversine formula).
 fn haversine_m(a: Position, b: Position) -> f64 {
@@ -60,13 +75,35 @@ fn format_distance(m: f64) -> String {
 
 /// A square icon button. The icons are white SVGs tinted to the current text
 /// color so they follow the theme.
-fn icon_button(ui: &mut egui::Ui, source: egui::ImageSource<'_>) -> egui::Response {
+fn icon_button(ui: &mut egui::Ui, size: f32, source: egui::ImageSource<'_>) -> egui::Response {
+    icon_button_pulse(ui, size, source, false)
+}
+
+/// Same as [`icon_button`], but when `pulse` is set the button background
+/// oscillates red to flag that the action currently has no target (used by the
+/// center button when there is no marker to center on).
+fn icon_button_pulse(
+    ui: &mut egui::Ui,
+    size: f32,
+    source: egui::ImageSource<'_>,
+    pulse: bool,
+) -> egui::Response {
     let tint = ui.visuals().text_color();
-    ui.add(egui::Button::image(
+    let mut button = egui::Button::image(
         egui::Image::new(source)
-            .fit_to_exact_size(egui::vec2(ICON_SIZE, ICON_SIZE))
+            .fit_to_exact_size(egui::vec2(size, size))
             .tint(tint),
-    ))
+    );
+    if pulse {
+        // 0..1 oscillation, one cycle every ~1.6s.
+        let t = ui.input(|i| i.time);
+        let wave = 0.5 + 0.5 * (t * std::f64::consts::PI * 1.25).sin() as f32;
+        let alpha = (60.0 + wave * 150.0) as u8;
+        button = button.fill(egui::Color32::from_rgba_unmultiplied(200, 40, 40, alpha));
+        // Keep the animation running even when nothing else asks for a repaint.
+        ui.ctx().request_repaint();
+    }
+    ui.add(button)
 }
 
 /// Which screen is shown. The corner toggle switches between them.
@@ -78,8 +115,42 @@ enum Page {
     Data,
     /// Searchable list of all recorded GPS points.
     Points,
+    /// Board health for the esp32c6-gps board (ESP/WIO/GPS/LoRa).
+    Status,
     /// Loading the TOML config file (marker colors, BLE beacon).
     Settings,
+}
+
+/// Every page in menu order, each with its label and icon. Drives the page
+/// dropdown menu.
+fn page_items() -> [(Page, &'static str, egui::ImageSource<'static>); 5] {
+    [
+        (
+            Page::Map,
+            "Map",
+            egui::include_image!("../assets/icons/map.svg"),
+        ),
+        (
+            Page::Data,
+            "Data",
+            egui::include_image!("../assets/icons/data.svg"),
+        ),
+        (
+            Page::Points,
+            "Points",
+            egui::include_image!("../assets/icons/points.svg"),
+        ),
+        (
+            Page::Status,
+            "Status",
+            egui::include_image!("../assets/icons/status.svg"),
+        ),
+        (
+            Page::Settings,
+            "Settings",
+            egui::include_image!("../assets/icons/settings.svg"),
+        ),
+    ]
 }
 
 /// Refuse offline downloads bigger than this many tiles (tile-server
@@ -141,7 +212,9 @@ fn http_options(cache_dir: Option<PathBuf>) -> HttpOptions {
 pub struct MyApp {
     tiles: HttpTiles,
     map_memory: MapMemory,
-    gps_rx: Receiver<GpsFix>,
+    /// Live GPS fixes, when a source is wired up (Android GNSS). `None` on
+    /// desktop, where the manual position bar is shown instead.
+    gps_rx: Option<Receiver<GpsFix>>,
     /// Optional device-facing compass heading stream (Android only).
     compass_rx: Option<Receiver<f32>>,
     /// The BLE worker streaming the ESP32-C3 beacon's GPS data.
@@ -179,6 +252,10 @@ pub struct MyApp {
     ble_ack: Option<Result<String, String>>,
     /// A config write is in flight and the ack has not arrived yet.
     ble_ack_pending: bool,
+    /// Latest board telemetry (esp32c6-gps), for the Status page.
+    telemetry: Option<Telemetry>,
+    /// Latest WIO status/log line relayed by the board.
+    board_log: Option<String>,
     /// Which screen is currently shown.
     page: Page,
     /// Loaded configuration (marker colors, BLE settings).
@@ -197,9 +274,15 @@ pub struct MyApp {
     points_search: String,
     /// Source filter on the points page.
     points_filter: PointFilter,
+    /// Text in the manual position bar (shown only when `gps_rx` is `None`).
+    manual_gps_text: String,
+    /// The last manual position entry failed to parse.
+    manual_gps_bad: bool,
 }
 
 impl MyApp {
+    /// `gps_rx` is the live GPS fix stream, or `None` when no source is wired
+    /// up (desktop) - the UI then shows a manual position entry bar instead.
     /// `cache_dir` is where tiles are cached to disk (`None` to disable). Desktop
     /// passes a local `.cache`; Android passes its writable data directory.
     /// `compass_rx` is the device-facing heading stream (`None` on desktop).
@@ -207,7 +290,7 @@ impl MyApp {
     /// `ble` is the worker connected to the ESP32-C3 GPS beacon.
     pub fn new(
         ctx: egui::Context,
-        gps_rx: Receiver<GpsFix>,
+        gps_rx: Option<Receiver<GpsFix>>,
         cache_dir: Option<PathBuf>,
         compass_rx: Option<Receiver<f32>>,
         insets: Option<Box<dyn Fn() -> [f32; 4]>>,
@@ -238,6 +321,8 @@ impl MyApp {
             ble_interval_text: packet::UPDATE_INTERVAL_DEFAULT_MS.to_string(),
             ble_ack: None,
             ble_ack_pending: false,
+            telemetry: None,
+            board_log: None,
             page: Page::Map,
             config: AppConfig::default(),
             config_path: String::new(),
@@ -247,6 +332,8 @@ impl MyApp {
             download: None,
             points_search: String::new(),
             points_filter: PointFilter::All,
+            manual_gps_text: String::new(),
+            manual_gps_bad: false,
         };
 
         // Auto-load ./gps-config.toml when present (desktop convenience); the
@@ -325,24 +412,30 @@ impl MyApp {
         }
     }
 
+    /// Apply one phone/manual GPS fix: move the marker, update the heading, and
+    /// append to the recorded track (decimated by the min-distance setting).
+    fn apply_gps_fix(&mut self, fix: GpsFix) {
+        let pos = lat_lon(fix.lat, fix.lon);
+        self.current = Some(pos);
+        self.heading = fix.bearing;
+        if far_enough(
+            self.track.last().map(|t| &t.pos),
+            pos,
+            self.config.track.min_distance,
+        ) {
+            self.track.push(TrackPoint {
+                pos,
+                source: PointSource::Phone,
+                time: SystemTime::now(),
+            });
+        }
+    }
+
     /// Pull every pending fix out of the channels, updating the current
     /// position, the beacon, and their tracks.
     fn drain_sources(&mut self) {
-        while let Ok(fix) = self.gps_rx.try_recv() {
-            let pos = lat_lon(fix.lat, fix.lon);
-            self.current = Some(pos);
-            self.heading = fix.bearing;
-            if far_enough(
-                self.track.last().map(|t| &t.pos),
-                pos,
-                self.config.track.min_distance,
-            ) {
-                self.track.push(TrackPoint {
-                    pos,
-                    source: PointSource::Phone,
-                    time: SystemTime::now(),
-                });
-            }
+        while let Some(fix) = self.gps_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.apply_gps_fix(fix);
         }
 
         if let Some(rx) = &self.compass_rx {
@@ -386,79 +479,105 @@ impl MyApp {
                         _ => Err("Device rejected: bad value".to_string()),
                     });
                 }
+                BleEvent::Telemetry(t) => self.telemetry = Some(t),
+                BleEvent::Log(s) => self.board_log = Some(s),
             }
         }
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().button_padding = egui::vec2(15.0, 10.0);
-        ui.horizontal(|ui| {
-            if icon_button(ui, egui::include_image!("../assets/icons/center.svg"))
+    fn controls(&mut self, ui: &mut egui::Ui, screen: egui::Rect) {
+        let icon = icon_size_for(screen);
+        ui.spacing_mut().button_padding = egui::vec2(icon * 0.7, icon * 0.45);
+        // Center the row in the full-width bar so the leftover space is even on
+        // both sides.
+        ui.vertical_centered(|ui| {
+            ui.horizontal(|ui| {
+                // Center on the user marker if we have a fix; otherwise fall back
+                // to the next available marker (the beacon). With no marker at
+                // all the button pulses red and does nothing when clicked.
+                let has_marker = self.current.is_some() || self.beacon.is_some();
+                if icon_button_pulse(
+                    ui,
+                    icon,
+                    egui::include_image!("../assets/icons/center.svg"),
+                    !has_marker,
+                )
                 .on_hover_text("Center on position")
                 .clicked()
-            {
-                self.map_memory.follow_my_position();
-            }
+                {
+                    if self.current.is_some() {
+                        self.map_memory.follow_my_position();
+                    } else if let Some(pos) = self.beacon {
+                        self.map_memory.center_at(pos);
+                    }
+                }
 
-            // Shows the mode the button switches TO (like the old label).
-            let (rotate_icon, rotate_hint) = if self.heading_up {
-                (
-                    egui::include_image!("../assets/icons/north.svg"),
-                    "North up",
-                )
-            } else {
-                (
-                    egui::include_image!("../assets/icons/heading.svg"),
-                    "Heading up",
-                )
-            };
-            if icon_button(ui, rotate_icon).on_hover_text(rotate_hint).clicked() {
-                self.heading_up = !self.heading_up;
-            }
-
-            if icon_button(ui, egui::include_image!("../assets/icons/zoom-in.svg"))
-                .on_hover_text("Zoom in")
-                .clicked()
-            {
-                let _ = self.map_memory.zoom_in();
-            }
-            if icon_button(ui, egui::include_image!("../assets/icons/zoom-out.svg"))
-                .on_hover_text("Zoom out")
-                .clicked()
-            {
-                let _ = self.map_memory.zoom_out();
-            }
-            if icon_button(ui, egui::include_image!("../assets/icons/clear.svg"))
-                .on_hover_text("Clear tracks")
-                .clicked()
-            {
-                self.track.clear();
-                self.beacon_track.clear();
-            }
-
-            // Offline region download: only when tiles are cached to disk,
-            // and one download at a time.
-            if self.cache_dir.is_some() && self.download.is_none() {
-                let selecting = !matches!(self.select, RegionSelect::Inactive);
-                let hint = if selecting {
-                    "Cancel region selection"
+                // Shows the mode the button switches TO (like the old label).
+                let (rotate_icon, rotate_hint) = if self.heading_up {
+                    (
+                        egui::include_image!("../assets/icons/north.svg"),
+                        "North up",
+                    )
                 } else {
-                    "Download region"
+                    (
+                        egui::include_image!("../assets/icons/heading.svg"),
+                        "Heading up",
+                    )
                 };
-                if icon_button(ui, egui::include_image!("../assets/icons/download.svg"))
-                    .on_hover_text(hint)
+                if icon_button(ui, icon, rotate_icon)
+                    .on_hover_text(rotate_hint)
                     .clicked()
                 {
-                    self.select = if selecting {
-                        RegionSelect::Inactive
-                    } else {
-                        RegionSelect::Picking {
-                            start: None,
-                            current: None,
-                        }
-                    };
+                    self.heading_up = !self.heading_up;
                 }
-            }
+
+                if icon_button(ui, icon, egui::include_image!("../assets/icons/zoom-in.svg"))
+                    .on_hover_text("Zoom in")
+                    .clicked()
+                {
+                    let _ = self.map_memory.zoom_in();
+                }
+                if icon_button(ui, icon, egui::include_image!("../assets/icons/zoom-out.svg"))
+                    .on_hover_text("Zoom out")
+                    .clicked()
+                {
+                    let _ = self.map_memory.zoom_out();
+                }
+                if icon_button(ui, icon, egui::include_image!("../assets/icons/clear.svg"))
+                    .on_hover_text("Clear tracks")
+                    .clicked()
+                {
+                    self.track.clear();
+                    self.beacon_track.clear();
+                }
+
+                // Offline region download: only when tiles are cached to disk,
+                // and one download at a time.
+                if self.cache_dir.is_some() && self.download.is_none() {
+                    let selecting = !matches!(self.select, RegionSelect::Inactive);
+                    let hint = if selecting {
+                        "Cancel region selection"
+                    } else {
+                        "Download region"
+                    };
+                    if icon_button(ui, icon, egui::include_image!("../assets/icons/download.svg"))
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        self.select = if selecting {
+                            RegionSelect::Inactive
+                        } else {
+                            RegionSelect::Picking {
+                                start: None,
+                                current: None,
+                            }
+                        };
+                    }
+                }
+
+                // The page menu sits inline, right after the other buttons.
+                self.page_menu(ui, icon);
+            });
         });
     }
 
@@ -499,18 +618,37 @@ impl MyApp {
         // the zoom buttons still work. North-up keeps normal pan.
         let locked = rotation.is_some() && android;
 
-        // On Android the map lives in a background Area (for the rotation
-        // overscan), and walkers' pinch-zoom gate does not fire there. Drive zoom
-        // from the multi-touch delta ourselves, mirroring walkers' own
-        // `zoom_by((delta - 1) * zoom_speed)`. Zoom is a scalar, so it is fine in
-        // heading-up too (unlike pan, which stays locked while rotated).
-        let zoom_delta = ui.ctx().input(|i| i.zoom_delta());
-        let pinching = android && (zoom_delta - 1.0).abs() > 0.001;
+        // The map is drawn inside a background Area (rotation overscan on
+        // Android, full-bleed on desktop). walkers' built-in zoom only fires
+        // when the map is the top interactable layer under the pointer, which a
+        // background Area never is, so its scroll/pinch zoom silently no-ops. We
+        // drive zoom ourselves here and turn walkers' own gesture off below.
+        let pinching;
 
         #[cfg(target_os = "android")]
-        if pinching {
-            let zoom = self.map_memory.zoom() + (zoom_delta as f64 - 1.0) * 2.0;
-            let _ = self.map_memory.set_zoom(zoom);
+        {
+            // Pinch: mirror walkers' own `zoom_by((delta - 1) * zoom_speed)`.
+            let zoom_delta = ui.ctx().input(|i| i.zoom_delta());
+            pinching = (zoom_delta - 1.0).abs() > 0.001;
+            if pinching {
+                let zoom = self.map_memory.zoom() + (zoom_delta as f64 - 1.0) * 2.0;
+                let _ = self.map_memory.set_zoom(zoom);
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            pinching = false;
+            // Bare mouse-wheel zoom about the map center (like the +/- buttons),
+            // gated on the pointer being over the map rect rather than walkers'
+            // layer-topmost check (which the background Area fails).
+            let (scroll_y, hover) =
+                ui.ctx().input(|i| (i.smooth_scroll_delta.y, i.pointer.hover_pos()));
+            if scroll_y != 0.0 && hover.is_some_and(|p| clip.contains(p)) {
+                let zoom = self.map_memory.zoom() + scroll_y as f64 * 0.005;
+                let _ = self.map_memory.set_zoom(zoom);
+                ui.ctx().request_repaint();
+            }
         }
 
         // Suppress pan while pinching so the two-finger gesture zooms instead of
@@ -522,13 +660,13 @@ impl MyApp {
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(map_rect));
         let map = Map::new(Some(&mut self.tiles), &mut self.map_memory, my_position)
             .with_plugin(layer)
-            // Walkers' gesture zoom works on desktop; on Android we drive it
-            // manually above, so turn walkers' own gesture off there.
-            .zoom_gesture(!android)
-            // Walkers defaults to ctrl+scroll for zoom; enable bare mouse-wheel
-            // zoom on desktop. We pan by primary-button drag, not scroll, so
-            // losing scroll-to-pan (a side effect of this) does not matter.
-            .zoom_with_ctrl(true)
+            // We drive zoom manually above on both platforms (walkers' own zoom
+            // gate does not fire for a background Area), so turn its gesture off.
+            .zoom_gesture(false)
+            // Keep walkers off bare-scroll entirely: with no ctrl-zoom and no
+            // touches it also stops scroll-panning, so our wheel handler is the
+            // only thing acting on the wheel. We pan by primary-button drag.
+            .zoom_with_ctrl(false)
             .panning(allow_pan)
             .drag_pan_buttons(if allow_pan {
                 egui::DragPanButtons::PRIMARY
@@ -564,13 +702,23 @@ impl eframe::App for MyApp {
             Page::Map => self.map_page(&ctx, screen),
             Page::Data => self.data_page(&ctx, screen),
             Page::Points => self.points_page(&ctx, screen),
+            Page::Status => self.status_page(&ctx, screen),
             Page::Settings => self.settings_page(&ctx, screen),
         }
 
-        // Page toggle floats in the top-right corner, above all pages.
-        self.page_toggle(&ctx, screen);
+        // Every page but the map gets the floating corner toggle; on the map
+        // page the toggle lives at the right end of the controls bar instead.
+        if !matches!(self.page, Page::Map) {
+            self.page_toggle(&ctx, screen);
+        }
         // Offline download progress floats above every page too.
         self.download_ui(&ctx, screen);
+
+        // With no live GPS source (desktop), let a position be typed in. Shown
+        // on the position-facing pages; the bar floats at the bottom.
+        if self.gps_rx.is_none() && matches!(self.page, Page::Map | Page::Data) {
+            self.manual_gps_bar(&ctx, screen);
+        }
     }
 }
 
@@ -654,7 +802,7 @@ impl MyApp {
                     .show(ui, |ui| {
                         ui.set_width(screen.width());
                         ui.add_space(top);
-                        self.controls(ui);
+                        self.controls(ui, screen);
                     });
             });
 
@@ -1033,6 +1181,137 @@ impl MyApp {
             });
     }
 
+    /// Bottom-anchored bar for entering a position by hand when no live GPS
+    /// source is wired up (desktop). Accepts "lat, lon" or "lat lon"; a valid
+    /// entry feeds the same pipeline a real fix would and recenters the map.
+    fn manual_gps_bar(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let bottom = self.bottom_inset(ctx);
+        let margin = screen.size().min_elem() * CORNER_MARGIN_FRAC;
+        egui::Area::new(egui::Id::new("manual_gps"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::new(
+                screen.center().x,
+                screen.bottom() - bottom - margin,
+            ))
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .movable(false)
+            .constrain(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Position:");
+                        let field = egui::TextEdit::singleline(&mut self.manual_gps_text)
+                            .hint_text("lat, lon")
+                            .desired_width((screen.width() * 0.5).clamp(140.0, 320.0));
+                        let resp = ui.add(field);
+                        let entered =
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.button("Set").clicked() || entered {
+                            match parse_lat_lon(&self.manual_gps_text) {
+                                Some((lat, lon)) => {
+                                    self.manual_gps_bad = false;
+                                    self.apply_gps_fix(GpsFix {
+                                        lat,
+                                        lon,
+                                        bearing: None,
+                                    });
+                                    self.map_memory.follow_my_position();
+                                }
+                                None => self.manual_gps_bad = true,
+                            }
+                        }
+                    });
+                    if self.manual_gps_bad {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 80, 60),
+                            "Enter latitude and longitude, e.g. 51.4779, -0.0015",
+                        );
+                    }
+                });
+            });
+    }
+
+    /// The status page: board health for the esp32c6-gps board. The BLE link
+    /// state comes from the connection itself; the WIO/GPS/LoRa figures come
+    /// from the board's telemetry characteristic, and the last line from its
+    /// log characteristic.
+    fn status_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let top = self.top_inset(ctx);
+        egui::Area::new(egui::Id::new("status"))
+            .order(egui::Order::Background)
+            .fixed_pos(egui::Pos2::ZERO)
+            .movable(false)
+            .constrain(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.set_min_size(screen.size());
+                        ui.add_space(top + 8.0);
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.heading("Status");
+                            ui.add_space(12.0);
+
+                            // ESP32-C6 / BLE link.
+                            ui.strong("ESP32-C6 (BLE)");
+                            status_bool(ui, "Link", self.ble_connected);
+                            ui.label(self.ble_status.as_str());
+
+                            let Some(t) = self.telemetry else {
+                                ui.add_space(16.0);
+                                ui.label(
+                                    "No board telemetry yet.\n\
+                                     Waiting for the esp32c6-gps board (an esp32c3 \
+                                     beacon does not report it).",
+                                );
+                                if let Some(line) = &self.board_log {
+                                    ui.add_space(16.0);
+                                    ui.strong("Last message");
+                                    ui.label(egui::RichText::new(line).monospace());
+                                }
+                                return;
+                            };
+
+                            // GPS (via the WIO's MAX-M10).
+                            ui.add_space(16.0);
+                            ui.strong("GPS");
+                            status_bool(ui, "Fix", t.flags & TELEM_FLAG_GPS_FIX != 0);
+                            ui.label(format!("Satellites: {}", t.sats));
+
+                            // LoRa mesh link (WIO-E5 radio).
+                            ui.add_space(16.0);
+                            ui.strong("LoRa");
+                            let last_rx = match t.secs_since_rx {
+                                0xFFFF => "never".to_string(),
+                                s => format!("{s} s ago"),
+                            };
+                            ui.label(format!("Last RX: {last_rx}"));
+                            if t.last_rssi != 0 {
+                                ui.label(format!(
+                                    "RSSI: {} dBm   SNR: {:.2} dB",
+                                    t.last_rssi,
+                                    t.last_snr_cb as f32 / 100.0
+                                ));
+                            }
+                            ui.label(format!("RX: {}   TX: {}", t.rx_count, t.tx_count));
+
+                            // WIO-E5 housekeeping.
+                            ui.add_space(16.0);
+                            ui.strong("WIO-E5");
+                            status_bool(ui, "SD logging", t.flags & TELEM_FLAG_SD_OK != 0);
+                            status_bool(ui, "Radio config", t.flags & TELEM_FLAG_CFG_LOADED != 0);
+
+                            if let Some(line) = &self.board_log {
+                                ui.add_space(16.0);
+                                ui.strong("Last message");
+                                ui.label(egui::RichText::new(line).monospace());
+                            }
+                        });
+                    });
+            });
+    }
+
     /// The settings page: load a TOML config file, and talk to the BLE
     /// beacon (status, notify interval with device ack, path toggle).
     fn settings_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
@@ -1145,49 +1424,104 @@ impl MyApp {
             });
     }
 
-    /// Small icon button in the top-right corner that switches between the
-    /// pages. Shows the page it switches TO.
+    /// Dropdown menu to jump straight to any page. Replaces the old next-page
+    /// cycler; the current page is marked. Rendered inline in the map controls
+    /// bar and in the floating corner toggle on other pages. The trigger glyph
+    /// crossfades from the hamburger to an X while the menu is open.
+    fn page_menu(&mut self, ui: &mut egui::Ui, icon: f32) {
+        let text = ui.visuals().text_color();
+        // Transparent base image: it reserves the icon-sized hit area and owns
+        // the click/menu behavior; the visible glyph is painted on top so it
+        // can crossfade between the hamburger and the X.
+        let base = egui::Image::new(egui::include_image!("../assets/icons/menu.svg"))
+            .fit_to_exact_size(egui::vec2(icon, icon))
+            .tint(egui::Color32::TRANSPARENT);
+        let resp = ui.menu_image_button(base, |ui| {
+            for (page, label, src) in page_items() {
+                let item_icon = egui::Image::new(src)
+                    .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                    .tint(ui.visuals().text_color());
+                let selected = self.page == page;
+                if ui
+                    .add(egui::Button::image_and_text(item_icon, label).selected(selected))
+                    .clicked()
+                {
+                    self.page = page;
+                    ui.close();
+                }
+            }
+        });
+
+        // `inner` is `Some` only while the menu popup is shown, so it drives the
+        // open/close crossfade. `animate_bool_with_time` eases it and keeps
+        // requesting repaints until it settles.
+        let open = resp.inner.is_some();
+        let rect =
+            egui::Rect::from_center_size(resp.response.rect.center(), egui::vec2(icon, icon));
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(egui::Id::new("page_menu_icon_anim"), open, 0.15);
+        egui::Image::new(egui::include_image!("../assets/icons/menu.svg"))
+            .tint(text.gamma_multiply(1.0 - t))
+            .paint_at(ui, rect);
+        egui::Image::new(egui::include_image!("../assets/icons/close.svg"))
+            .tint(text.gamma_multiply(t))
+            .paint_at(ui, rect);
+
+        resp.response.on_hover_text("Pages");
+    }
+
+    /// Floating page menu in the top-right corner. Used on every page but the
+    /// map, where the menu lives at the right end of the controls bar instead.
     fn page_toggle(&mut self, ctx: &egui::Context, screen: egui::Rect) {
-        let (icon, hint, next) = match self.page {
-            Page::Map => (
-                egui::include_image!("../assets/icons/data.svg"),
-                "Data",
-                Page::Data,
-            ),
-            Page::Data => (
-                egui::include_image!("../assets/icons/points.svg"),
-                "Points",
-                Page::Points,
-            ),
-            Page::Points => (
-                egui::include_image!("../assets/icons/settings.svg"),
-                "Settings",
-                Page::Settings,
-            ),
-            Page::Settings => (
-                egui::include_image!("../assets/icons/map.svg"),
-                "Map",
-                Page::Map,
-            ),
-        };
+        let size = icon_size_for(screen);
         let top = self.top_inset(ctx);
+        // Corner inset as a fraction of the screen, so the button stays clear
+        // of the edge on any size (a fixed few points crowds a dense screen).
+        let margin = screen.size().min_elem() * CORNER_MARGIN_FRAC;
         egui::Area::new(egui::Id::new("page_toggle"))
-            // A strictly higher layer than the map-page controls bar (also
-            // Foreground). Same-order areas get reordered by interaction, so
-            // clicking a control button would otherwise raise the opaque
-            // controls frame over this toggle and hide it.
+            // Float above the (Background) page content it sits over.
             .order(egui::Order::Tooltip)
-            .fixed_pos(egui::Pos2::new(screen.right() - 8.0, top + 8.0))
+            .fixed_pos(egui::Pos2::new(screen.right() - margin, top + margin))
             .pivot(egui::Align2::RIGHT_TOP)
             .movable(false)
             .constrain(false)
             .show(ctx, |ui| {
-                ui.spacing_mut().button_padding = egui::vec2(15.0, 10.0);
-                if icon_button(ui, icon).on_hover_text(hint).clicked() {
-                    self.page = next;
-                }
+                ui.spacing_mut().button_padding = egui::vec2(size * 0.7, size * 0.45);
+                self.page_menu(ui, size);
             });
     }
+}
+
+/// Parse "lat, lon" or "lat lon" into decimal degrees. `None` unless it is
+/// exactly two finite numbers within the valid latitude/longitude range.
+fn parse_lat_lon(s: &str) -> Option<(f64, f64)> {
+    let mut parts = s
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|p| !p.is_empty());
+    let lat: f64 = parts.next()?.parse().ok()?;
+    let lon: f64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None; // trailing junk
+    }
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    Some((lat, lon))
+}
+
+/// A labeled boolean status row: the label followed by a green "yes" or a red
+/// "no", for the Status page's health indicators.
+fn status_bool(ui: &mut egui::Ui, label: &str, ok: bool) {
+    ui.horizontal(|ui| {
+        ui.label(format!("{label}:"));
+        let (text, color) = if ok {
+            ("yes", egui::Color32::from_rgb(60, 180, 75))
+        } else {
+            ("no", egui::Color32::from_rgb(220, 80, 60))
+        };
+        ui.colored_label(color, text);
+    });
 }
 
 /// A small filled square in `color` followed by its name and hex value.

@@ -28,6 +28,10 @@ egui_extras = { version = "0.35", features = ["svg"] }
 # Shared BLE protocol with the esp32c3-gps firmware (lives in the same parent
 # directory).
 gps-proto = { path = "../gps-proto" }
+# Board-specific BLE extensions and the ESP<->WIO telemetry format served by
+# the esp32c6-gps board (no_std, cross-compiles unchanged), used by the Status
+# page to decode the telemetry and log characteristics.
+midair-proto = { path = "../esp32c6-gps/proto" }
 # Offline region downloads reuse the exact HTTP-cache stack walkers uses (same
 # crate versions, same cache format), so pre-fetched tiles land in the cache
 # the map already reads from. All already in the dependency tree via walkers.

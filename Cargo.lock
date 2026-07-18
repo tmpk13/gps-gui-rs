@@ -1839,6 +1839,7 @@ dependencies = [
  "http-cache-reqwest",
  "jni 0.21.1",
  "log",
+ "midair-proto",
  "ndk-sys",
  "reqwest",
  "reqwest-middleware",
@@ -2604,6 +2605,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "midair-proto"
+version = "0.1.0"
+dependencies = [
+ "gps-proto",
 ]
 
 [[package]]

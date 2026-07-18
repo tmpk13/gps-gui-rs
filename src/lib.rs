@@ -70,7 +70,7 @@ fn android_main(android_app: egui_winit::winit::platform::android::activity::And
             let ble = ble::spawn(cc.egui_ctx.clone(), vm_ptr, activity_ptr);
             Ok(Box::new(app::MyApp::new(
                 cc.egui_ctx.clone(),
-                gps_rx,
+                Some(gps_rx),
                 cache_dir,
                 compass_rx,
                 insets,

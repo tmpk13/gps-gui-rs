@@ -12,6 +12,8 @@ use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanF
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
 use gps_proto::packet::{self, PositionPacket};
+use midair_proto::ble;
+use midair_proto::link::Telemetry;
 use uuid::Uuid;
 
 use super::{BleCommand, BleEvent, BleHandle};
@@ -20,6 +22,11 @@ const SERVICE_UUID: Uuid = Uuid::from_u128(packet::SERVICE_UUID_U128);
 const POSITION_UUID: Uuid = Uuid::from_u128(packet::POSITION_UUID_U128);
 const CONFIG_UUID: Uuid = Uuid::from_u128(packet::CONFIG_UUID_U128);
 const ACK_UUID: Uuid = Uuid::from_u128(packet::ACK_UUID_U128);
+// Board-status characteristics served by the esp32c6-gps board on top of the
+// shared gps-proto service. Absent on the older esp32c3 beacon, so treated as
+// optional (see `connected`).
+const TELEMETRY_UUID: Uuid = Uuid::from_u128(ble::TELEMETRY_UUID_U128);
+const LOG_UUID: Uuid = Uuid::from_u128(ble::LOG_UUID_U128);
 
 pub fn spawn(ctx: egui::Context) -> BleHandle {
     let (event_tx, event_rx) = channel();
@@ -139,7 +146,8 @@ async fn worker(ctx: egui::Context, tx: Sender<BleEvent>, cmd_rx: Receiver<BleCo
     }
 }
 
-/// Scan for the beacon, connect, subscribe, pump until disconnect/error.
+/// Scan for the beacon, connect, run one connected session, then always
+/// disconnect so the next reconnect starts from clean device state.
 async fn session(
     adapter: &Adapter,
     report: &Reporter,
@@ -172,6 +180,35 @@ async fn session(
     };
     let _ = adapter.stop_scan().await;
 
+    // Clear any half-open connection left from a previous session. bluez keeps
+    // the device object across disconnects; connecting to one it still believes
+    // is connected wedges (the central never completes the link) until the
+    // process restarts, so force a clean slate first.
+    if peripheral.is_connected().await.unwrap_or(false) {
+        let _ = peripheral.disconnect().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // Run the connected session, then unconditionally disconnect. bluez does
+    // not tear the link down for us on error, and a lingering half-open device
+    // is exactly what blocks the next reconnect.
+    let result = connected(&peripheral, report, cmd_rx, wanted, &session_mac, writes).await;
+    let _ = peripheral.disconnect().await;
+    report.send(BleEvent::Connected(false));
+    result
+}
+
+/// Connect to `peripheral`, subscribe, and pump notifications until the UI
+/// disconnects (`Ok`) or the link fails (`Err`). The caller disconnects the
+/// peripheral afterward regardless of the outcome.
+async fn connected(
+    peripheral: &Peripheral,
+    report: &Reporter,
+    cmd_rx: &Receiver<BleCommand>,
+    wanted: &mut Wanted,
+    session_mac: &Option<String>,
+    writes: &mut Vec<u32>,
+) -> Result<(), String> {
     let addr = peripheral.address();
     report.status(format!("connecting to {addr}..."));
     peripheral
@@ -199,6 +236,15 @@ async fn session(
         .find(|c| c.uuid == CONFIG_UUID)
         .cloned()
         .ok_or("config characteristic missing")?;
+    // Optional board-status characteristics (esp32c6-gps only).
+    let telemetry = chars
+        .iter()
+        .find(|c| c.uuid == TELEMETRY_UUID && c.properties.contains(CharPropFlags::NOTIFY))
+        .cloned();
+    let log = chars
+        .iter()
+        .find(|c| c.uuid == LOG_UUID && c.properties.contains(CharPropFlags::NOTIFY))
+        .cloned();
 
     peripheral
         .subscribe(&position)
@@ -208,6 +254,12 @@ async fn session(
         .subscribe(&ack)
         .await
         .map_err(|e| format!("subscribe failed: {e}"))?;
+    if let Some(c) = &telemetry {
+        let _ = peripheral.subscribe(c).await;
+    }
+    if let Some(c) = &log {
+        let _ = peripheral.subscribe(c).await;
+    }
 
     let mut notifications = peripheral
         .notifications()
@@ -241,6 +293,12 @@ async fn session(
                     if let Some(a) = packet::parse_ack(&n.value) {
                         report.send(BleEvent::Ack(a));
                     }
+                } else if n.uuid == TELEMETRY_UUID {
+                    if let Some(t) = Telemetry::decode(&n.value) {
+                        report.send(BleEvent::Telemetry(t));
+                    }
+                } else if n.uuid == LOG_UUID {
+                    report.send(BleEvent::Log(String::from_utf8_lossy(&n.value).into_owned()));
                 }
             }
             Ok(None) => return Err("connection lost".into()),
@@ -258,15 +316,11 @@ async fn session(
         }
 
         if drain_commands(cmd_rx, wanted, writes).is_err() || !wanted.connect {
-            let _ = peripheral.disconnect().await;
-            report.send(BleEvent::Connected(false));
             report.status("disconnected");
             return Ok(());
         }
-        if wanted.mac != session_mac {
+        if wanted.mac != *session_mac {
             // The UI pinned a different device (e.g. a config reload).
-            let _ = peripheral.disconnect().await;
-            report.send(BleEvent::Connected(false));
             return Err("switching device".into());
         }
     }

@@ -3,7 +3,7 @@
 
 #[cfg(not(target_os = "android"))]
 fn main() -> eframe::Result<()> {
-    use gps_gui_rs::{app::MyApp, ble, gps};
+    use gps_gui_rs::{app::MyApp, ble};
 
     env_logger::init();
 
@@ -18,12 +18,13 @@ fn main() -> eframe::Result<()> {
         "gps-gui-rs",
         options,
         Box::new(|cc| {
-            let gps_rx = gps::spawn_simulated(cc.egui_ctx.clone());
+            // No live GPS source on desktop yet: the app shows a manual
+            // position entry bar (passing `None` here).
             let ble = ble::spawn(cc.egui_ctx.clone());
             let cache_dir = Some(std::path::PathBuf::from(".cache"));
             Ok(Box::new(MyApp::new(
                 cc.egui_ctx.clone(),
-                gps_rx,
+                None,
                 cache_dir,
                 None,
                 None,

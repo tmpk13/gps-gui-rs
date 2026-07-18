@@ -12,6 +12,7 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use gps_proto::packet::Ack;
 pub use gps_proto::packet::PositionPacket;
+pub use midair_proto::link::Telemetry;
 
 #[cfg(not(target_os = "android"))]
 mod desktop;
@@ -29,6 +30,10 @@ pub enum BleEvent {
     Fix(PositionPacket),
     /// A config ack: the device confirmed (or rejected) a setting.
     Ack(Ack),
+    /// Board telemetry (LoRa link, GPS, SD) from the esp32c6-gps board.
+    Telemetry(Telemetry),
+    /// The latest WIO status/log line (ASCII) relayed by the board.
+    Log(String),
 }
 
 /// UI -> worker.
