@@ -7,9 +7,11 @@
 //! client pointed at the same cache directory: the map later serves those
 //! areas from disk exactly as if they had been browsed online.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use http_cache_reqwest::{CACacheManager, Cache, CacheMode, HttpCache, HttpCacheOptions};
@@ -24,6 +26,10 @@ pub const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PK
 
 /// Concurrent tile fetches. The OSM tile usage policy allows at most two.
 const PARALLEL: usize = 2;
+
+/// Highest slippy zoom OSM serves; the search for a cached fallback tile spans
+/// levels 0 through this.
+const MAX_ZOOM: u8 = 19;
 
 /// Latitude where the web-mercator projection cuts off.
 const MAX_LAT: f64 = 85.05112877980659;
@@ -72,6 +78,84 @@ pub fn region_tiles(a: Position, b: Position, max_zoom: u8) -> Vec<TileId> {
         }
     }
     tiles
+}
+
+/// The cacache key walkers and the downloader store a tile under: the HTTP
+/// cache keys by `"<METHOD>:<url>"`, and every tile is a plain GET.
+fn tile_cache_key(tile: TileId) -> String {
+    format!("GET:{}", OpenStreetMap.tile_url(tile))
+}
+
+/// Whether the tile covering `pos` at `zoom` is already in the on-disk cache.
+fn tile_cached_at(cache_dir: &Path, pos: Position, zoom: u8) -> bool {
+    let (x, y) = tile_xy(pos.x(), pos.y(), zoom);
+    matches!(
+        cacache::metadata_sync(cache_dir, tile_cache_key(TileId { x, y, zoom })),
+        Ok(Some(_))
+    )
+}
+
+/// The integer zoom nearest to `current` whose tile covering `pos` is present
+/// in the cache. `None` when the current level already has one (no change
+/// needed) or when no level does. Ties prefer the higher (more detailed) zoom.
+pub fn nearest_cached_zoom(cache_dir: &Path, pos: Position, current: u8) -> Option<u8> {
+    if tile_cached_at(cache_dir, pos, current) {
+        return None;
+    }
+    (0..=MAX_ZOOM)
+        .filter(|&z| z != current && tile_cached_at(cache_dir, pos, z))
+        .min_by_key(|&z| (z.abs_diff(current), MAX_ZOOM - z))
+}
+
+/// Quick reachability probe against the tile server. `true` when a response of
+/// any status came back; `false` on a connection error or timeout. Lets us
+/// tell "offline" from "not downloaded yet" before snapping the map zoom.
+async fn tile_server_reachable(client: &reqwest::Client) -> bool {
+    let url = OpenStreetMap.tile_url(TileId { x: 0, y: 0, zoom: 0 });
+    client.head(url).send().await.is_ok()
+}
+
+/// On a background thread: if the tile server is NOT reachable, find the zoom
+/// level nearest `current_zoom` whose tile covering `pos` is cached and send it
+/// over `tx` for the UI to apply. Does nothing when online, when reachability
+/// cannot be determined, or when no cached fallback exists - so it only ever
+/// fires as an offline convenience for the center button.
+pub fn spawn_offline_zoom(
+    cache_dir: PathBuf,
+    pos: Position,
+    current_zoom: u8,
+    tx: Sender<f64>,
+    ctx: egui::Context,
+) {
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                log::error!("offline zoom: failed to start runtime: {e}");
+                return;
+            }
+        };
+        // Only act on a DEFINITE connection failure: a client-build error or a
+        // successful probe both leave the zoom untouched.
+        let offline = runtime.block_on(async {
+            match reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .timeout(Duration::from_secs(3))
+                .build()
+            {
+                Ok(client) => !tile_server_reachable(&client).await,
+                Err(_) => false,
+            }
+        });
+        if !offline {
+            return;
+        }
+        if let Some(zoom) = nearest_cached_zoom(&cache_dir, pos, current_zoom) {
+            if tx.send(f64::from(zoom)).is_ok() {
+                ctx.request_repaint();
+            }
+        }
+    });
 }
 
 /// Shared state between the UI and the download worker.

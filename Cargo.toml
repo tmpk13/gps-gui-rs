@@ -40,6 +40,12 @@ reqwest-middleware = "0.4"
 http-cache-reqwest = "0.16"
 tokio = { version = "1", features = ["rt"] }
 futures = "0.3"
+# Checking whether a specific tile is already in the on-disk HTTP cache (the
+# offline center-button zoom fallback). Same cacache store walkers and the
+# offline downloader write to, keyed by "GET:<tile url>". Already in the tree
+# via http-cache-reqwest; default features off since we only use the sync
+# metadata lookup (the async runtime features come from http-cache-reqwest).
+cacache = { version = "13", default-features = false }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 eframe = "0.35"

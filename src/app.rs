@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -199,6 +199,10 @@ pub struct MyApp {
     /// Marker whose info popup (name + time since last update) is shown, set by
     /// double-clicking/tapping a marker on the map.
     selected_marker: Option<MarkerKind>,
+    /// Offline center-button zoom fallback: the background probe sends the zoom
+    /// level to snap to (nearest cached tile) here when it finds we are offline.
+    zoom_tx: Sender<f64>,
+    zoom_rx: Receiver<f64>,
 }
 
 impl MyApp {
@@ -219,6 +223,8 @@ impl MyApp {
     ) -> Self {
         // SVG loader for the button icons.
         egui_extras::install_image_loaders(&ctx);
+
+        let (zoom_tx, zoom_rx) = std::sync::mpsc::channel();
 
         let mut app = Self {
             tiles: HttpTiles::with_options(OpenStreetMap, http_options(cache_dir.clone()), ctx),
@@ -258,6 +264,8 @@ impl MyApp {
             manual_gps_text: String::new(),
             manual_gps_bad: false,
             selected_marker: None,
+            zoom_tx,
+            zoom_rx,
         };
 
         // Auto-load ./gps-config.toml when present (desktop convenience); the
@@ -408,6 +416,12 @@ impl MyApp {
                 BleEvent::Telemetry(t) => self.telemetry = Some(t),
                 BleEvent::Log(s) => self.board_log = Some(s),
             }
+        }
+
+        // Offline center-button fallback: apply the zoom the probe picked (the
+        // nearest level with a cached tile). Latest wins if several arrived.
+        while let Ok(zoom) = self.zoom_rx.try_recv() {
+            let _ = self.map_memory.set_zoom(zoom);
         }
     }
 }

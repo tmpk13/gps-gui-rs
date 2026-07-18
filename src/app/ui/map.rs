@@ -51,10 +51,31 @@ impl MyApp {
                 .on_hover_text("Center on position")
                 .clicked()
                 {
-                    if self.current.is_some() {
+                    // Center on the marker, and remember which one so the
+                    // offline fallback below can pick a zoom with a cached tile.
+                    let target = if let Some(pos) = self.current {
                         self.map_memory.follow_my_position();
+                        Some(pos)
                     } else if let Some(pos) = self.beacon {
                         self.map_memory.center_at(pos);
+                        Some(pos)
+                    } else {
+                        None
+                    };
+
+                    // When tiles are cached to disk, kick off the offline check:
+                    // if we turn out to be offline and the current zoom has no
+                    // tile for the marker, it snaps to the nearest zoom that does.
+                    if let (Some(pos), Some(dir)) = (target, self.cache_dir.clone()) {
+                        let current_zoom =
+                            self.map_memory.zoom().round().clamp(0.0, 19.0) as u8;
+                        offline::spawn_offline_zoom(
+                            dir,
+                            pos,
+                            current_zoom,
+                            self.zoom_tx.clone(),
+                            ui.ctx().clone(),
+                        );
                     }
                 }
 
