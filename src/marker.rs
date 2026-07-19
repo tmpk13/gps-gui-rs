@@ -1,10 +1,10 @@
 //! Map overlay that draws the current GPS position, heading, the track, and
 //! the BLE beacon (ESP32-C3 GPS) with its optional path.
 
-use egui::{epaint::TextShape, Color32, FontId, Response, Shape, Stroke, Ui, Vec2};
+use egui::{Color32, Response, Shape, Stroke, Ui, Vec2};
 use walkers::{MapMemory, Plugin, Position, Projector};
 
-use crate::config::{DistanceUnits, MarkerColors, MarkerSizes};
+use crate::config::{MarkerColors, MarkerSizes};
 
 /// A walkers [`Plugin`] rendering the live position marker and its trail.
 ///
@@ -27,12 +27,6 @@ pub struct GpsLayer {
     pub sizes: MarkerSizes,
     /// Draw the line to the beacon dotted rather than solid.
     pub distance_dotted: bool,
-    /// Label the line to the beacon with the distance.
-    pub show_distance: bool,
-    /// Unit system for that label.
-    pub distance_units: DistanceUnits,
-    /// Great-circle distance to the beacon in meters, for the label.
-    pub distance_m: Option<f64>,
 }
 
 impl Plugin for GpsLayer {
@@ -43,14 +37,6 @@ impl Plugin for GpsLayer {
         projector: &Projector,
         _map_memory: &MapMemory,
     ) {
-        // The distance label reads in the theme's text color, outlined in the
-        // opposite one, so it stays legible over either base map.
-        let text_color = ui.visuals().text_color();
-        let outline_color = if ui.visuals().dark_mode {
-            Color32::BLACK
-        } else {
-            Color32::WHITE
-        };
         let painter = ui.painter();
         let track_color = self.colors.track;
         let beacon_color = self.colors.fixed;
@@ -99,48 +85,9 @@ impl Plugin for GpsLayer {
                 } else {
                     painter.add(Shape::line_segment([screen, beacon_screen], stroke));
                 }
-
-                // Distance label centered above the midpoint of the line. The
-                // text is laid out once and painted as several offset copies:
-                // the outline ring first, the label itself on top. Placing it by
-                // its own top left corner (rather than an anchor) keeps it put
-                // under the map's rotation pass, which turns each shape about
-                // that same corner, so the label rides the line as the map spins.
-                if self.show_distance {
-                    if let Some(m) = self.distance_m {
-                        let mid = screen + (beacon_screen - screen) * 0.5;
-                        let pad = sizes.distance_text * 0.4 + 4.0;
-                        let galley = painter.layout_no_wrap(
-                            self.distance_units.format(m),
-                            FontId::proportional(sizes.distance_text),
-                            text_color,
-                        );
-                        let size = galley.size();
-                        let top_left = mid - Vec2::new(size.x * 0.5, size.y + pad);
-
-                        // Outline width scales with the font so it stays a hair
-                        // around the glyphs at any size. Diagonals are pulled in
-                        // so the ring is round rather than square-cornered.
-                        let w = (sizes.distance_text * 0.1).max(1.0);
-                        let d = w * std::f32::consts::FRAC_1_SQRT_2;
-                        for off in [
-                            Vec2::new(w, 0.0),
-                            Vec2::new(-w, 0.0),
-                            Vec2::new(0.0, w),
-                            Vec2::new(0.0, -w),
-                            Vec2::new(d, d),
-                            Vec2::new(d, -d),
-                            Vec2::new(-d, d),
-                            Vec2::new(-d, -d),
-                        ] {
-                            painter.add(
-                                TextShape::new(top_left + off, galley.clone(), outline_color)
-                                    .with_override_text_color(outline_color),
-                            );
-                        }
-                        painter.add(TextShape::new(top_left, galley, text_color));
-                    }
-                }
+                // The distance label that goes on this line is painted by the map
+                // page instead (see `MyApp::distance_label`), after the rotation
+                // pass, so its angle can be set outright.
             }
             painter.circle_filled(beacon_screen, sizes.beacon, beacon_color);
             painter.circle_stroke(beacon_screen, sizes.beacon, Stroke::new(2.0, Color32::WHITE));

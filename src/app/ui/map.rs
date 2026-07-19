@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use egui::emath::Rot2;
-use egui::{Pos2, Shape};
+use egui::{epaint::TextShape, Pos2, Shape};
 use walkers::{lat_lon, Map, Position, Projector, Tiles};
 
 use crate::app::{MarkerKind, MyApp, RegionSelect};
@@ -18,7 +18,7 @@ use super::{floating, icon_button, icon_button_pulse, icon_size_for, ERR_RED};
 
 /// Where the map looks before the first GPS fix arrives.
 fn default_position() -> Position {
-    lat_lon(54.333, -122.676)
+    lat_lon(44.5, -123.0)
 }
 
 /// Refuse offline downloads bigger than this many tiles (tile-server
@@ -29,7 +29,7 @@ const MAX_REGION_TILES: u64 = 10_000;
 const TILE_SIZE_ESTIMATE_KB: u64 = 15;
 
 /// How close (in points) a double-click must land to a marker to select it.
-const MARKER_HIT_RADIUS: f32 = 24.0;
+const MARKER_HIT_RADIUS: f32 = 40.0;
 
 impl MyApp {
     fn controls(&mut self, ui: &mut egui::Ui, screen: egui::Rect) {
@@ -63,6 +63,10 @@ impl MyApp {
                 .on_hover_text("Center on position")
                 .clicked()
                 {
+                    // Leave tracking mode: it recomputes the center every frame,
+                    // so it would otherwise immediately override this recenter.
+                    self.tracking_beacon = None;
+
                     // Center on the marker, and remember which one so the
                     // offline fallback below can pick a zoom with a cached tile.
                     let target = if let Some(pos) = self.current {
@@ -92,58 +96,67 @@ impl MyApp {
                     }
                 }
 
-                // Shows the mode the button switches TO (like the old label). In
-                // tracking mode it becomes the way out (the beacon spec: press
-                // the heading button to leave tracking).
-                let (rotate_icon, rotate_hint) = if self.tracking_beacon.is_some() {
-                    (
-                        egui::include_image!("../../../assets/icons/heading.svg"),
-                        "Exit tracking",
-                    )
-                } else if self.heading_up {
-                    (
-                        egui::include_image!("../../../assets/icons/north.svg"),
-                        "North up",
-                    )
-                } else {
-                    (
-                        egui::include_image!("../../../assets/icons/heading.svg"),
-                        "Heading up",
-                    )
-                };
-                if icon_button(ui, icon, rotate_icon)
-                    .on_hover_text(rotate_hint)
-                    .clicked()
-                {
-                    if self.tracking_beacon.is_some() {
-                        self.tracking_beacon = None;
+                // Heading-up button. Heading-up only makes sense with a direction
+                // source (compass, or GPS course over ground); with none the map
+                // stays north-up and the button is hidden. It is hidden while
+                // tracking too, which owns the map's orientation - the track
+                // button below is the way out of that mode.
+                let has_direction = self.effective_heading().is_some();
+                if has_direction && self.tracking_beacon.is_none() {
+                    // Shows the mode the button switches TO (like the old label).
+                    let (rotate_icon, rotate_hint) = if self.heading_up {
+                        (
+                            egui::include_image!("../../../assets/icons/north.svg"),
+                            "North up",
+                        )
                     } else {
+                        (
+                            egui::include_image!("../../../assets/icons/heading.svg"),
+                            "Heading up",
+                        )
+                    };
+                    if icon_button(ui, icon, rotate_icon)
+                        .on_hover_text(rotate_hint)
+                        .clicked()
+                    {
                         self.heading_up = !self.heading_up;
                     }
+                } else if !has_direction {
+                    // No orientation available: nothing to toggle, so stay
+                    // north-up and drop any stale heading-up flag.
+                    self.heading_up = false;
                 }
 
                 // Tracking mode: keep the user and a beacon framed together.
-                // Tapping enters the mode on the first beacon, then cycles to the
-                // next beacon; the heading button above leaves it. Pulses red
-                // when there is no beacon to track.
+                // Tapping enters the mode on the first beacon, then walks along
+                // the beacon list, and the press after the last one leaves the
+                // mode - this button is the only way in and out. It frames the
+                // two together, so it needs BOTH a live user position and at
+                // least one beacon; with either missing the button pulses red and
+                // does nothing (entering with a piece missing would lock the map
+                // on a view it can't frame).
                 let beacons = self.beacon_positions();
-                let tracking_hint = if self.tracking_beacon.is_some() {
-                    "Next beacon"
-                } else {
-                    "Track beacon"
+                let can_track = self.current.is_some() && !beacons.is_empty();
+                let tracking_hint = match self.tracking_beacon {
+                    Some(i) if i + 1 < beacons.len() => "Next beacon",
+                    Some(_) => "Exit tracking",
+                    None => "Track beacon",
                 };
                 if icon_button_pulse(
                     ui,
                     icon,
                     egui::include_image!("../../../assets/icons/track.svg"),
-                    beacons.is_empty(),
+                    !can_track,
                 )
                 .on_hover_text(tracking_hint)
                 .clicked()
-                    && !beacons.is_empty()
+                    && can_track
                 {
                     self.tracking_beacon = match self.tracking_beacon {
-                        Some(i) => Some((i + 1) % beacons.len()),
+                        // Advance to the next beacon; past the last one the
+                        // mode ends, so a single beacon is a plain on/off toggle.
+                        Some(i) if i + 1 < beacons.len() => Some(i + 1),
+                        Some(_) => None,
                         None => {
                             // Tracking and heading-up are mutually exclusive.
                             self.heading_up = false;
@@ -237,9 +250,6 @@ impl MyApp {
             colors: self.config.colors,
             sizes: self.config.sizes,
             distance_dotted: self.config.distance.dotted,
-            show_distance: self.config.distance.show,
-            distance_units: self.config.distance.units,
-            distance_m: self.distance_to_beacon(),
         };
 
         // walkers sizes itself to the child's available space, so give it the
@@ -330,6 +340,102 @@ impl MyApp {
                 }
             });
         }
+
+        // Painted last, so it is outside the rotation pass above and sits over
+        // the markers.
+        self.distance_label(ui, map_rect, rotation, clip);
+    }
+
+    /// Paint the beacon-distance label: the distance to the beacon, centered
+    /// just above the midpoint of the user->beacon line, turning with the map.
+    ///
+    /// The [`GpsLayer`] plugin draws the line but not this label: text needs an
+    /// angle as well as a position, and leaving that to the rotation pass in
+    /// [`Self::map`] left the glyphs level. So the label is placed here, after
+    /// that pass, with both set outright - positions projected exactly as the
+    /// plugin projects them and turned about the same pivot, and the map's angle
+    /// handed straight to the text shapes.
+    fn distance_label(
+        &self,
+        ui: &egui::Ui,
+        map_rect: egui::Rect,
+        rotation: Option<Rot2>,
+        clip: egui::Rect,
+    ) {
+        if !self.config.distance.show {
+            return;
+        }
+        let (Some(user), Some(beacon), Some(meters)) =
+            (self.current, self.beacon, self.distance_to_beacon())
+        else {
+            return;
+        };
+
+        // Same projector the plugin draws with: walkers builds it from the rect
+        // it was given (the overscanned one when the map is rotated).
+        let projector = Projector::new(map_rect, &self.map_memory, user);
+        let user_px = projector.project(user).to_pos2();
+        let beacon_px = projector.project(beacon).to_pos2();
+
+        // Follow the line: turn its midpoint about the pivot the map turned
+        // about, and turn the "above the line" offset with it.
+        let rot = rotation.unwrap_or(Rot2::IDENTITY);
+        let mid = user_px + (beacon_px - user_px) * 0.5;
+        let size = self.config.sizes.distance_text;
+        let pad = size * 0.4 + 4.0;
+        let anchor = rotate_pos(mid, rot, clip.center()) + rot * egui::Vec2::new(0.0, -pad);
+
+        // The label reads in the theme's text color lightened a little (the
+        // outline carries the contrast, so the glyphs need not be full
+        // strength), outlined in the opposite color so it stays legible over
+        // either base map.
+        let text_color = ui
+            .visuals()
+            .text_color()
+            .lerp_to_gamma(egui::Color32::WHITE, 0.35);
+        let outline_color = if ui.visuals().dark_mode {
+            egui::Color32::BLACK
+        } else {
+            egui::Color32::WHITE
+        };
+
+        // Laid out once and shared by every copy below, so the outline costs
+        // nine shapes but only one layout.
+        let painter = ui.painter().with_clip_rect(clip);
+        let galley = painter.layout_no_wrap(
+            self.config.distance.units.format(meters),
+            egui::FontId::proportional(size),
+            text_color,
+        );
+        let top_left = anchor - egui::Vec2::new(galley.size().x * 0.5, galley.size().y);
+        let angle = rot.angle();
+
+        // Outline width scales with the font so it stays a hair around the
+        // glyphs at any size. Diagonals are pulled in so the ring is round
+        // rather than square-cornered. The offsets are applied after rotation,
+        // which a symmetric ring is free to ignore.
+        let w = (size * 0.1).max(1.0);
+        let d = w * std::f32::consts::FRAC_1_SQRT_2;
+        for off in [
+            egui::Vec2::new(w, 0.0),
+            egui::Vec2::new(-w, 0.0),
+            egui::Vec2::new(0.0, w),
+            egui::Vec2::new(0.0, -w),
+            egui::Vec2::new(d, d),
+            egui::Vec2::new(d, -d),
+            egui::Vec2::new(-d, d),
+            egui::Vec2::new(-d, -d),
+        ] {
+            painter.add(
+                TextShape::new(top_left + off, galley.clone(), outline_color)
+                    .with_override_text_color(outline_color)
+                    .with_angle_and_anchor(angle, egui::Align2::CENTER_BOTTOM),
+            );
+        }
+        painter.add(
+            TextShape::new(top_left, galley, text_color)
+                .with_angle_and_anchor(angle, egui::Align2::CENTER_BOTTOM),
+        );
     }
 
     /// The interactive map page: full-bleed map with the floating controls.
