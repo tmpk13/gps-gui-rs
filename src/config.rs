@@ -1,6 +1,11 @@
 //! Loadable TOML configuration: marker colors, overlay sizes, the beacon
 //! distance readout, track recording, and the BLE beacon settings.
 //!
+//! The Settings page edits these live and writes them back with [`AppConfig::save`],
+//! which edits an existing file in place (comments, key order, and keys this app
+//! does not know about all survive) and generates a documented one from
+//! [`AppConfig::to_toml`] when there is nothing there yet.
+//!
 //! Schema (all fields optional; missing ones keep their defaults):
 //!
 //! ```toml
@@ -31,6 +36,7 @@
 
 use egui::Color32;
 use serde::Deserialize;
+use toml_edit::{DocumentMut, Item, Table, Value};
 
 /// Colors used to draw the map markers.
 #[derive(Clone, Copy)]
@@ -108,6 +114,14 @@ impl DistanceUnits {
                     format!("{:.0} ft", meters * FT_PER_M)
                 }
             }
+        }
+    }
+
+    /// The TOML spelling, the one [`Self::parse`] reads back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DistanceUnits::Metric => "metric",
+            DistanceUnits::Imperial => "imperial",
         }
     }
 
@@ -249,6 +263,38 @@ fn parse_hex(s: &str) -> Result<Color32, String> {
     Ok(Color32::from_rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
 }
 
+/// `#rrggbb` for a color: the form [`parse_hex`] reads back.
+fn hex(c: Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
+
+/// A TOML float for an `f32` setting. Widening straight to `f64` exposes the
+/// binary representation (14.4f32 becomes 14.399999618530273 in the file), so go
+/// through the shortest decimal that reads back as the same `f32`.
+fn f32_value(v: f32) -> Value {
+    format!("{v:?}").parse::<f64>().unwrap_or(v as f64).into()
+}
+
+/// Set `[section] key = value`, adding the table or the key when either is
+/// missing. Replacing an existing value keeps its decor, so only the value
+/// itself changes on disk - the surrounding spacing and any trailing comment
+/// stay put.
+fn set(doc: &mut DocumentMut, section: &str, key: &str, value: Value) {
+    let table = doc
+        .entry(section)
+        .or_insert_with(|| Item::Table(Table::new()));
+    let Some(table) = table.as_table_mut() else {
+        return;
+    };
+    let mut value = value;
+    if let Some(old) = table.get(key).and_then(Item::as_value) {
+        *value.decor_mut() = old.decor().clone();
+    } else {
+        *value.decor_mut() = toml_edit::Decor::new(" ", "");
+    }
+    table.insert(key, Item::Value(value));
+}
+
 /// Validate an overlay size: finite and strictly positive.
 fn parse_size(name: &str, v: f32) -> Result<f32, String> {
     if !v.is_finite() || v <= 0.0 {
@@ -264,6 +310,111 @@ impl AppConfig {
     pub fn load(path: &str) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         Self::from_toml(&text)
+    }
+
+    /// Write these settings to the TOML file at `path`, returning `true` when
+    /// the file had to be created.
+    ///
+    /// An existing file is edited in place rather than rewritten: comments, key
+    /// order, and any keys this app knows nothing about all survive, and only
+    /// the values it owns are replaced. With no file there (or an unreadable
+    /// one) it generates a fresh documented one from [`Self::to_toml`].
+    pub fn save(&self, path: &str) -> Result<bool, String> {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            std::fs::write(path, self.to_toml()).map_err(|e| format!("{path}: {e}"))?;
+            return Ok(true);
+        };
+        let mut doc: DocumentMut = text.parse().map_err(|e| format!("{path}: {e}"))?;
+        set(&mut doc, "colors", "track", hex(self.colors.track).into());
+        set(&mut doc, "colors", "fixed", hex(self.colors.fixed).into());
+        set(&mut doc, "sizes", "marker", f32_value(self.sizes.marker));
+        set(&mut doc, "sizes", "beacon", f32_value(self.sizes.beacon));
+        set(&mut doc, "sizes", "track", f32_value(self.sizes.track));
+        set(
+            &mut doc,
+            "sizes",
+            "distance_line",
+            f32_value(self.sizes.distance_line),
+        );
+        set(
+            &mut doc,
+            "sizes",
+            "distance_text",
+            f32_value(self.sizes.distance_text),
+        );
+        set(&mut doc, "distance", "show", self.distance.show.into());
+        set(
+            &mut doc,
+            "distance",
+            "units",
+            self.distance.units.as_str().into(),
+        );
+        set(&mut doc, "distance", "dotted", self.distance.dotted.into());
+        set(&mut doc, "ble", "enabled", self.ble.enabled.into());
+        set(&mut doc, "ble", "show_path", self.ble.show_path.into());
+        // An empty string reads back as "unset", so an unpinned MAC keeps the
+        // key in the file rather than dropping the line.
+        set(
+            &mut doc,
+            "ble",
+            "mac",
+            self.ble.mac.clone().unwrap_or_default().into(),
+        );
+        set(
+            &mut doc,
+            "track",
+            "min_distance",
+            self.track.min_distance.into(),
+        );
+        std::fs::write(path, doc.to_string()).map_err(|e| format!("{path}: {e}"))?;
+        Ok(false)
+    }
+
+    /// These settings as a complete, commented TOML file - what the Settings
+    /// page generates when there is no config file yet.
+    pub fn to_toml(&self) -> String {
+        let s = &self.sizes;
+        format!(
+            "# gps-gui-rs settings. Every key is optional; a missing one keeps its default.\n\
+             \n\
+             [colors]\n\
+             track = \"{track}\"   # phone track, heading arrow, position dot\n\
+             fixed = \"{fixed}\"   # BLE beacon marker, distance line, beacon path\n\
+             \n\
+             [sizes]              # screen points; each overlay is sized independently\n\
+             marker = {marker:?}          # current-position dot radius\n\
+             beacon = {beacon:?}          # beacon dot radius\n\
+             track = {track_w:?}           # track polyline width (phone track and beacon path)\n\
+             distance_line = {dline:?}    # user<->beacon line width\n\
+             distance_text = {dtext:?}   # beacon-distance label font size\n\
+             \n\
+             [distance]\n\
+             show = {show}        # draw the distance label on the line to the beacon\n\
+             units = \"{units}\"    # \"metric\" (km/m) or \"imperial\" (mi/ft)\n\
+             dotted = {dotted}       # draw that line dotted rather than solid\n\
+             \n\
+             [ble]\n\
+             enabled = {enabled}       # master switch for the BLE GPS source\n\
+             show_path = {show_path}    # draw the path of the incoming BLE GPS data\n\
+             mac = \"{mac}\"            # pin a specific device; empty scans by service\n\
+             \n\
+             [track]\n\
+             min_distance = {min_distance:?}   # meters of movement before a new track point\n",
+            track = hex(self.colors.track),
+            fixed = hex(self.colors.fixed),
+            marker = s.marker,
+            beacon = s.beacon,
+            track_w = s.track,
+            dline = s.distance_line,
+            dtext = s.distance_text,
+            show = self.distance.show,
+            units = self.distance.units.as_str(),
+            dotted = self.distance.dotted,
+            enabled = self.ble.enabled,
+            show_path = self.ble.show_path,
+            mac = self.ble.mac.clone().unwrap_or_default(),
+            min_distance = self.track.min_distance,
+        )
     }
 
     fn from_toml(text: &str) -> Result<Self, String> {
@@ -346,6 +497,45 @@ mod tests {
         assert_eq!(DistanceUnits::parse("IMPERIAL").unwrap(), DistanceUnits::Imperial);
         assert_eq!(DistanceUnits::parse("mi/ft").unwrap(), DistanceUnits::Imperial);
         assert!(DistanceUnits::parse("furlongs").is_err());
+    }
+
+    #[test]
+    fn generated_file_reads_back_as_the_same_settings() {
+        let cfg = AppConfig::default();
+        let back = AppConfig::from_toml(&cfg.to_toml()).unwrap();
+        assert_eq!(back.colors.fixed, cfg.colors.fixed);
+        assert_eq!(back.sizes.distance_text, cfg.sizes.distance_text);
+        assert_eq!(back.distance.units, cfg.distance.units);
+        assert_eq!(back.track.min_distance, cfg.track.min_distance);
+        // The generated `mac = ""` means "scan by service", not a pinned MAC.
+        assert_eq!(back.ble.mac, None);
+    }
+
+    #[test]
+    fn save_edits_in_place_and_round_trips() {
+        let path = std::env::temp_dir().join("gps-gui-rs-config-save-test.toml");
+        let path = path.to_str().unwrap();
+        std::fs::write(
+            path,
+            "# keep me\n[sizes]\nmarker = 8.0 # and me\n\n[extra]\nunknown = 1\n",
+        )
+        .unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.sizes.marker = 12.5;
+        cfg.colors.track = Color32::from_rgb(1, 2, 3);
+        // False: the file was already there, so it was edited, not generated.
+        assert!(!cfg.save(path).unwrap());
+
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("# keep me"), "{text}");
+        assert!(text.contains("# and me"), "{text}");
+        assert!(text.contains("unknown = 1"), "{text}");
+
+        let back = AppConfig::load(path).unwrap();
+        assert_eq!(back.sizes.marker, 12.5);
+        assert_eq!(back.colors.track, Color32::from_rgb(1, 2, 3));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

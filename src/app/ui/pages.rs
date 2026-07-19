@@ -15,8 +15,8 @@ use crate::points::{age_text, TrackPoint};
 use crate::radio::{EditVal, FieldType};
 
 use super::{
-    background_area, color_swatch, content_page, feedback_label, floating, icon_button,
-    status_bool, CORNER_MARGIN_FRAC, ERR_RED,
+    background_area, content_page, feedback_label, floating, icon_button, status_bool,
+    CORNER_MARGIN_FRAC, ERR_RED,
 };
 
 /// Render the type-specific input for an unlocked radio field, bound to `val`.
@@ -306,140 +306,203 @@ impl MyApp {
         });
     }
 
-    /// The settings page: load a TOML config file, and talk to the BLE
-    /// beacon (status, notify interval with device ack, path toggle).
+    /// The settings page: edit the app's own TOML settings and write them back
+    /// to the config file, then talk to the BLE beacon (status, notify interval
+    /// with device ack).
+    ///
+    /// Every widget here is bound straight to the live [`crate::config::AppConfig`],
+    /// so a change takes effect on the map immediately; Save is what makes it
+    /// outlast the session.
     pub(crate) fn settings_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
         let top = self.top_inset(ctx);
+        // The field column is the screen less room for its label and buttons.
+        let field_width = (screen.width() - 200.0).clamp(120.0, 360.0);
         content_page(ctx, "settings", screen, top, |ui| {
-            ui.heading("Settings");
-            ui.add_space(12.0);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Settings");
+                ui.add_space(12.0);
 
-            ui.label("Config file (TOML):");
-            ui.horizontal(|ui| {
-                let field = egui::TextEdit::singleline(&mut self.config_path)
-                    .hint_text("/path/to/config.toml")
-                    .desired_width((screen.width() - 120.0).clamp(120.0, 400.0));
-                let resp = ui.add(field);
-                let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button("Load").clicked() || entered {
-                    self.load_config();
+                ui.label("Config file (TOML):");
+                ui.horizontal(|ui| {
+                    let field = egui::TextEdit::singleline(&mut self.config_path)
+                        .hint_text("/path/to/config.toml")
+                        .desired_width(field_width);
+                    let resp = ui.add(field);
+                    let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Load").clicked() || entered {
+                        self.load_config();
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Save")
+                        .on_hover_text(
+                            "Write these settings to the file above, generating it if it is not there",
+                        )
+                        .clicked()
+                    {
+                        self.save_config();
+                    }
+                    if ui
+                        .button("Reset to defaults")
+                        .on_hover_text("Only in the app until you save")
+                        .clicked()
+                    {
+                        self.reset_config();
+                    }
+                });
+
+                ui.add_space(8.0);
+                feedback_label(ui, &self.config_feedback);
+
+                ui.add_space(16.0);
+                ui.strong("Marker colors");
+                egui::Grid::new("cfg_colors").num_columns(2).show(ui, |ui| {
+                    ui.label("track");
+                    ui.color_edit_button_srgba(&mut self.config.colors.track);
+                    ui.end_row();
+                    ui.label("beacon");
+                    ui.color_edit_button_srgba(&mut self.config.colors.fixed);
+                    ui.end_row();
+                });
+
+                ui.add_space(16.0);
+                ui.strong("Overlay sizes (points)");
+                let s = &mut self.config.sizes;
+                egui::Grid::new("cfg_sizes").num_columns(2).show(ui, |ui| {
+                    for (label, value) in [
+                        ("marker", &mut s.marker),
+                        ("beacon", &mut s.beacon),
+                        ("track", &mut s.track),
+                        ("distance line", &mut s.distance_line),
+                        ("distance text", &mut s.distance_text),
+                    ] {
+                        ui.label(label);
+                        // The loader rejects a size of 0 or less, so the drag stops
+                        // short of one rather than writing a file that won't load.
+                        ui.add(egui::DragValue::new(value).speed(0.1).range(0.5..=64.0));
+                        ui.end_row();
+                    }
+                });
+
+                ui.add_space(16.0);
+                ui.strong("Beacon distance");
+                ui.checkbox(
+                    &mut self.config.distance.show,
+                    "Show distance on the line to the beacon",
+                );
+                ui.checkbox(
+                    &mut self.config.distance.dotted,
+                    "Draw that line dotted rather than solid",
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Units:");
+                    ui.selectable_value(
+                        &mut self.config.distance.units,
+                        DistanceUnits::Metric,
+                        "km/m",
+                    );
+                    ui.selectable_value(
+                        &mut self.config.distance.units,
+                        DistanceUnits::Imperial,
+                        "mi/ft",
+                    );
+                });
+
+                ui.add_space(16.0);
+                ui.strong("Track recording");
+                ui.horizontal(|ui| {
+                    ui.label("Minimum move between points (m):");
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.track.min_distance)
+                            .speed(0.1)
+                            .range(0.0..=1000.0),
+                    );
+                });
+
+                // Offline maps: start a region download. Only when tiles are cached
+                // to disk; jumps to the map and begins the box selection there.
+                if self.cache_dir.is_some() {
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.heading("Offline maps");
+                    ui.add_space(8.0);
+                    let downloading = self.download.is_some();
+                    if ui
+                        .add_enabled(!downloading, egui::Button::new("Download region"))
+                        .on_hover_text("Pick a box on the map to cache for offline use")
+                        .clicked()
+                    {
+                        self.page = Page::Map;
+                        self.select = RegionSelect::Picking {
+                            start: None,
+                            current: None,
+                        };
+                    }
+                    if downloading {
+                        ui.label("A download is already in progress.");
+                    }
                 }
-            });
 
-            ui.add_space(8.0);
-            feedback_label(ui, &self.config_feedback);
-
-            ui.add_space(16.0);
-            ui.label("Marker colors:");
-            color_swatch(ui, "track", self.config.colors.track);
-            color_swatch(ui, "beacon", self.config.colors.fixed);
-
-            ui.add_space(16.0);
-            ui.label("Beacon distance:");
-            ui.checkbox(
-                &mut self.config.distance.show,
-                "Show distance on the line to the beacon",
-            );
-            ui.horizontal(|ui| {
-                ui.label("Units:");
-                ui.selectable_value(
-                    &mut self.config.distance.units,
-                    DistanceUnits::Metric,
-                    "km/m",
-                );
-                ui.selectable_value(
-                    &mut self.config.distance.units,
-                    DistanceUnits::Imperial,
-                    "mi/ft",
-                );
-            });
-
-            ui.add_space(16.0);
-            ui.label("Overlay sizes (points, set in the config):");
-            let s = self.config.sizes;
-            ui.label(
-                egui::RichText::new(format!(
-                    "marker {:.0}   beacon {:.0}   track {:.0}   distance line {:.0}   text {:.0}",
-                    s.marker, s.beacon, s.track, s.distance_line, s.distance_text
-                ))
-                .monospace()
-                .size(13.0),
-            );
-
-            // Offline maps: start a region download. Only when tiles are cached
-            // to disk; jumps to the map and begins the box selection there.
-            if self.cache_dir.is_some() {
                 ui.add_space(16.0);
                 ui.separator();
                 ui.add_space(8.0);
-                ui.heading("Offline maps");
+                ui.heading("GPS beacon (BLE)");
                 ui.add_space(8.0);
-                let downloading = self.download.is_some();
-                if ui
-                    .add_enabled(!downloading, egui::Button::new("Download region"))
-                    .on_hover_text("Pick a box on the map to cache for offline use")
-                    .clicked()
-                {
-                    self.page = Page::Map;
-                    self.select = RegionSelect::Picking {
-                        start: None,
-                        current: None,
-                    };
-                }
-                if downloading {
-                    ui.label("A download is already in progress.");
-                }
-            }
+                ui.label(format!("Status: {}", self.ble_status));
 
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(8.0);
-            ui.heading("GPS beacon (BLE)");
-            ui.add_space(8.0);
-            ui.label(format!("Status: {}", self.ble_status));
-            ui.add_space(8.0);
-            ui.checkbox(&mut self.show_beacon_path, "Show beacon path on map");
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label("Notify interval (ms):");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.ble_interval_text).desired_width(80.0),
+                ui.add_space(8.0);
+                ui.checkbox(&mut self.config.ble.enabled, "Connect to the beacon");
+                ui.checkbox(&mut self.config.ble.show_path, "Show beacon path on map");
+                ui.horizontal(|ui| {
+                    ui.label("MAC:");
+                    let field = egui::TextEdit::singleline(&mut self.ble_mac_text)
+                        .hint_text("empty = scan by service")
+                        .desired_width(field_width);
+                    if ui.add(field).changed() {
+                        let mac = self.ble_mac_text.trim();
+                        self.config.ble.mac = (!mac.is_empty()).then(|| mac.to_string());
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("Enabled/MAC changes apply on Reconnect below.").weak(),
                 );
-                let apply = ui.add_enabled(self.ble_connected, egui::Button::new("Apply"));
-                if apply.clicked() {
-                    match self.ble_interval_text.trim().parse::<u32>() {
-                        Ok(ms) => {
-                            let _ = self.ble.commands.send(BleCommand::SetInterval(ms));
-                            self.ble_ack = None;
-                            self.ble_ack_pending = true;
-                        }
-                        Err(_) => {
-                            self.ble_ack =
-                                Some(Err("Enter a whole number of milliseconds.".to_string()));
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Notify interval (ms):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ble_interval_text).desired_width(80.0),
+                    );
+                    let apply = ui.add_enabled(self.ble_connected, egui::Button::new("Apply"));
+                    if apply.clicked() {
+                        match self.ble_interval_text.trim().parse::<u32>() {
+                            Ok(ms) => {
+                                let _ = self.ble.commands.send(BleCommand::SetInterval(ms));
+                                self.ble_ack = None;
+                                self.ble_ack_pending = true;
+                            }
+                            Err(_) => {
+                                self.ble_ack =
+                                    Some(Err("Enter a whole number of milliseconds.".to_string()));
+                            }
                         }
                     }
+                });
+                if self.ble_ack.is_none() && self.ble_ack_pending {
+                    ui.label("waiting for device ack...");
+                } else {
+                    feedback_label(ui, &self.ble_ack);
+                }
+
+                ui.add_space(8.0);
+                if ui.button("Reconnect").clicked() {
+                    self.sync_ble_to_config();
                 }
             });
-            if self.ble_ack.is_none() && self.ble_ack_pending {
-                ui.label("waiting for device ack...");
-            } else {
-                feedback_label(ui, &self.ble_ack);
-            }
-
-            ui.add_space(8.0);
-            if ui.button("Reconnect").clicked() {
-                self.sync_ble_to_config();
-            }
-
-            ui.add_space(16.0);
-            ui.label(
-                egui::RichText::new(
-                    "[colors]\ntrack = \"#0078ff\"\nfixed = \"#ff5028\"\n\n[sizes]\nmarker = 8.0\nbeacon = 6.0\ntrack = 3.0\ndistance_line = 3.0\ndistance_text = 14.0\n\n[distance]\nshow = false\nunits = \"metric\"\ndotted = true\n\n[ble]\nenabled = true\nshow_path = true\n# mac = \"AA:BB:CC:DD:EE:FF\"\n\n[track]\nmin_distance = 3.0",
-                )
-                .monospace()
-                .size(13.0),
-            );
         });
     }
 

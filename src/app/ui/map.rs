@@ -241,12 +241,12 @@ impl MyApp {
             track: self.track.iter().map(|t| t.pos).collect(),
             heading: self.effective_heading(),
             beacon: self.beacon,
-            beacon_track: if self.show_beacon_path {
+            beacon_track: if self.config.ble.show_path {
                 self.beacon_track.iter().map(|t| t.pos).collect()
             } else {
                 Vec::new()
             },
-            show_beacon_path: self.show_beacon_path,
+            show_beacon_path: self.config.ble.show_path,
             colors: self.config.colors,
             sizes: self.config.sizes,
             distance_dotted: self.config.distance.dotted,

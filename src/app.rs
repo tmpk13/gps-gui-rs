@@ -45,6 +45,24 @@ fn bearing_deg(a: Position, b: Position) -> f32 {
     y.atan2(x).to_degrees().rem_euclid(360.0) as f32
 }
 
+/// Config file loaded at startup and written back by the Settings page, unless
+/// another path is typed there.
+const DEFAULT_CONFIG_NAME: &str = "gps-config.toml";
+
+/// Where the config file lives unless the Settings page is pointed elsewhere:
+/// beside the tile cache, which on Android is the app's private data directory
+/// (the working directory there is not writable, so a bare filename could be
+/// read but never saved). On desktop the cache is a relative directory, which
+/// leaves the plain filename in the working directory.
+fn default_config_path(cache_dir: Option<&std::path::Path>) -> String {
+    match cache_dir.and_then(std::path::Path::parent) {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            dir.join(DEFAULT_CONFIG_NAME).display().to_string()
+        }
+        _ => DEFAULT_CONFIG_NAME.to_string(),
+    }
+}
+
 /// Tracking mode: fraction of the screen height kept clear above the beacon and
 /// below the user, so neither marker sits hard against an edge.
 const TRACK_MARGIN_FRAC: f32 = 0.18;
@@ -209,9 +227,6 @@ pub struct MyApp {
     beacon_packet: Option<PositionPacket>,
     /// Every beacon position recorded, for the path drawing and points list.
     beacon_track: Vec<TrackPoint>,
-    /// Draw the beacon path (TOML `[ble] show_path`, also togglable in
-    /// Settings).
-    show_beacon_path: bool,
     /// Last BLE status line, for the Settings page.
     ble_status: String,
     ble_connected: bool,
@@ -231,8 +246,11 @@ pub struct MyApp {
     config: AppConfig,
     /// The config-file path typed on the Settings page.
     config_path: String,
-    /// Result of the last load attempt: `Ok` message (green) or error (red).
+    /// Result of the last load/save: `Ok` message (green) or error (red).
     config_feedback: Option<Result<String, String>>,
+    /// Text buffer behind the `[ble] mac` input. Empty means "scan by service",
+    /// which is what `config.ble.mac == None` says.
+    ble_mac_text: String,
     /// The WIO-E5 RADIO.TOML being edited on the Radio page, once loaded.
     radio: Option<RadioDoc>,
     /// The RADIO.TOML path typed on the Radio page.
@@ -318,7 +336,6 @@ impl MyApp {
             beacon_time: None,
             beacon_packet: None,
             beacon_track: Vec::new(),
-            show_beacon_path: false,
             ble_status: "idle".to_string(),
             ble_connected: false,
             ble_interval_text: packet::UPDATE_INTERVAL_DEFAULT_MS.to_string(),
@@ -328,8 +345,11 @@ impl MyApp {
             board_log: None,
             page: Page::Map,
             config: AppConfig::default(),
-            config_path: String::new(),
+            // The path the auto-load below tries, so Save writes back to the
+            // same file without the user having to type it.
+            config_path: default_config_path(cache_dir.as_deref()),
             config_feedback: None,
+            ble_mac_text: String::new(),
             radio: None,
             radio_path: "RADIO.toml".to_string(),
             radio_feedback: None,
@@ -347,19 +367,20 @@ impl MyApp {
             controls_width: 0.0,
         };
 
-        // Auto-load ./gps-config.toml when present (desktop convenience); the
-        // Settings page can load any path later. With no file the defaults
-        // apply, which include connecting to the beacon.
-        match AppConfig::load("gps-config.toml") {
+        // Auto-load the default config when present; the Settings page can load
+        // any path later, and saves back to whichever one is in the box. With no
+        // file the defaults apply, which include connecting to the beacon.
+        let startup_path = app.config_path.clone();
+        match AppConfig::load(&startup_path) {
             Ok(cfg) => app.apply_config(cfg),
             Err(_) => app.sync_ble_to_config(),
         }
         app
     }
 
-    /// Adopt a loaded config: colors, path toggle, and the BLE connection.
+    /// Adopt a loaded config: colors, the MAC input, and the BLE connection.
     fn apply_config(&mut self, cfg: AppConfig) {
-        self.show_beacon_path = cfg.ble.show_path;
+        self.ble_mac_text = cfg.ble.mac.clone().unwrap_or_default();
         self.config = cfg;
         self.sync_ble_to_config();
     }
@@ -391,6 +412,29 @@ impl MyApp {
             }
             Err(e) => Err(e),
         });
+    }
+
+    /// Write the settings as they stand to `config_path`. An existing file is
+    /// edited in place (comments and unknown keys survive); with no file there
+    /// yet, a documented one is generated.
+    fn save_config(&mut self) {
+        let path = self.config_path.trim().to_string();
+        if path.is_empty() {
+            self.config_feedback = Some(Err("Enter a file path.".to_string()));
+            return;
+        }
+        self.config_feedback = Some(match self.config.save(&path) {
+            Ok(true) => Ok(format!("Created {path}")),
+            Ok(false) => Ok(format!("Saved {path}")),
+            Err(e) => Err(e),
+        });
+    }
+
+    /// Drop every setting back to its built-in default. The file is untouched
+    /// until the next save, so this is undoable by reloading.
+    fn reset_config(&mut self) {
+        self.apply_config(AppConfig::default());
+        self.config_feedback = Some(Ok("Reset to defaults. Not saved yet.".to_string()));
     }
 
     /// Load the RADIO.TOML at `radio_path`, recording a human-readable result

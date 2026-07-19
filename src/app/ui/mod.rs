@@ -160,21 +160,6 @@ fn status_bool(ui: &mut egui::Ui, label: &str, ok: bool) {
     });
 }
 
-/// A small filled square in `color` followed by its name and hex value.
-fn color_swatch(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(18.0), egui::Sense::hover());
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(3), color);
-        ui.label(format!(
-            "{label}  #{:02x}{:02x}{:02x}",
-            color.r(),
-            color.g(),
-            color.b()
-        ));
-    });
-}
-
 /// Every page in menu order, each with its label and icon. Drives the page
 /// dropdown menu.
 fn page_items() -> [(Page, &'static str, egui::ImageSource<'static>); 6] {

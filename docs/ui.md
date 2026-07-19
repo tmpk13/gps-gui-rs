@@ -176,6 +176,30 @@ Confirm`.
 The actual tiling/fetching lives in `src/offline.rs`; the UI only drives the
 selection and shows progress.
 
+## The Settings page (`pages.rs` + `config.rs`)
+
+The app's own TOML settings are edited here, not just loaded. Every widget binds
+straight to the live `AppConfig` on `MyApp`, so a change shows on the map at
+once; the file is only touched by the buttons.
+
+- **Save** (`MyApp::save_config` -> `AppConfig::save`) edits an existing file in
+  place with `toml_edit`: comments, key order, and any keys the app knows nothing
+  about survive, and only the values it owns are replaced (each keeps the decor
+  of the value it replaced). With no file there, it generates a documented one
+  from `AppConfig::to_toml`, which doubles as the "generate a config" action.
+- **Reset to defaults** drops `AppConfig` back to its built-in defaults in memory
+  only; the file is untouched until the next Save, so a Load undoes it.
+- **The default path** (`default_config_path`) is the config file beside the tile
+  cache, which on Android is the app's private data directory - the working
+  directory there can be read but never written, so a bare filename could never
+  be saved. On desktop the cache is relative, leaving the plain filename in the
+  working directory. It is both what starts loaded and what Save writes back to.
+- `[ble] show_path` is the single source of truth for the beacon-path overlay
+  (there is no separate runtime flag), and the `mac` input keeps its own text
+  buffer, `ble_mac_text`, since the setting itself is an `Option<String>` where
+  empty means "scan by service". Changing `enabled`/`mac` takes effect on
+  Reconnect, not per keystroke.
+
 ## The Radio config page (`pages.rs` + `radio.rs`)
 
 The Radio page loads the WIO-E5 `RADIO.TOML` (the firmware's own config, not the
