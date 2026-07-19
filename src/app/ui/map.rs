@@ -31,6 +31,13 @@ const TILE_SIZE_ESTIMATE_KB: u64 = 15;
 /// How close (in points) a double-click must land to a marker to select it.
 const MARKER_HIT_RADIUS: f32 = 40.0;
 
+/// Seconds per beat of the connected-beacon heartbeat, and how often that
+/// animation asks for a repaint. A beat a second reads as a pulse rather than a
+/// flicker, and ~20 fps is smooth enough for one expanding ring while leaving
+/// an otherwise idle map mostly asleep.
+const PULSE_PERIOD: f64 = 1.0;
+const PULSE_FRAME: f32 = 0.05;
+
 impl MyApp {
     fn controls(&mut self, ui: &mut egui::Ui, screen: egui::Rect) {
         let icon = icon_size_for(screen);
@@ -53,47 +60,27 @@ impl MyApp {
                 // Center on the user marker if we have a fix; otherwise fall back
                 // to the next available marker (the beacon). With no marker at
                 // all the button pulses red and does nothing when clicked.
-                let has_marker = self.current.is_some() || self.beacon.is_some();
-                if icon_button_pulse(
+                // Holding it (or right-clicking on desktop) opens the list of
+                // markers instead, so any of them can be picked.
+                let targets = self.center_targets();
+                let center = icon_button_pulse(
                     ui,
                     icon,
                     egui::include_image!("../../../assets/icons/center.svg"),
-                    !has_marker,
+                    targets.is_empty(),
                 )
-                .on_hover_text("Center on position")
-                .clicked()
-                {
-                    // Leave tracking mode: it recomputes the center every frame,
-                    // so it would otherwise immediately override this recenter.
-                    self.tracking_beacon = None;
-
-                    // Center on the marker, and remember which one so the
-                    // offline fallback below can pick a zoom with a cached tile.
-                    let target = if let Some(pos) = self.current {
-                        self.map_memory.follow_my_position();
-                        Some(pos)
-                    } else if let Some(pos) = self.beacon {
-                        self.map_memory.center_at(pos);
-                        Some(pos)
-                    } else {
-                        None
-                    };
-
-                    // When tiles are cached to disk, kick off the offline check:
-                    // if we turn out to be offline and the current zoom has no
-                    // tile for the marker, it snaps to the nearest zoom that does.
-                    if let (Some(pos), Some(dir)) = (target, self.cache_dir.clone()) {
-                        let current_zoom =
-                            self.map_memory.zoom().round().clamp(0.0, 19.0) as u8;
-                        offline::spawn_offline_zoom(
-                            dir,
-                            self.layer,
-                            pos,
-                            current_zoom,
-                            self.zoom_tx.clone(),
-                            ui.ctx().clone(),
-                        );
+                .on_hover_text("Center on position (hold for markers)");
+                if center.clicked() {
+                    // A plain tap always goes to you, falling back to the first
+                    // beacon when there is no fix yet.
+                    if let Some(&(kind, pos)) = targets.first() {
+                        self.center_on(ui.ctx(), pos, kind == MarkerKind::You);
                     }
+                }
+                // A long touch does not also register as a click, so the two
+                // paths cannot both fire from one press.
+                if center.secondary_clicked() && !targets.is_empty() {
+                    self.center_menu = true;
                 }
 
                 // Heading-up button. Heading-up only makes sense with a direction
@@ -101,7 +88,7 @@ impl MyApp {
                 // stays north-up and the button is hidden. It is hidden while
                 // tracking too, which owns the map's orientation - the track
                 // button below is the way out of that mode.
-                let has_direction = self.effective_heading().is_some();
+                let has_direction = self.has_direction();
                 if has_direction && self.tracking_beacon.is_none() {
                     // Shows the mode the button switches TO (like the old label).
                     let (rotate_icon, rotate_hint) = if self.heading_up {
@@ -236,6 +223,15 @@ impl MyApp {
     ) {
         let my_position = self.current.unwrap_or_else(default_position);
 
+        // Heartbeat phase for the beacon marker while the BLE link is up. The
+        // animation is driven by repainting on a timer rather than every frame,
+        // so an idle map costs a handful of frames a second instead of sixty.
+        let beacon_pulse = self.ble_connected.then(|| {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f32(PULSE_FRAME));
+            (ui.input(|i| i.time).rem_euclid(PULSE_PERIOD) / PULSE_PERIOD) as f32
+        });
+
         let layer = GpsLayer {
             current: self.current,
             track: self.track.iter().map(|t| t.pos).collect(),
@@ -247,6 +243,7 @@ impl MyApp {
                 Vec::new()
             },
             show_beacon_path: self.config.ble.show_path,
+            beacon_pulse,
             colors: self.config.colors,
             sizes: self.config.sizes,
             distance_dotted: self.config.distance.dotted,
@@ -547,6 +544,80 @@ impl MyApp {
 
         // Selection hint / download confirmation, floating over everything.
         self.select_ui(ctx, screen);
+
+        // The center button's marker list, when it has been held open.
+        self.center_menu_ui(ctx, screen);
+    }
+
+    /// The center button's marker list, opened by holding the button (or
+    /// right-clicking it on desktop). Picking an entry centers on that marker;
+    /// a plain tap of the button never opens this and just goes to you.
+    fn center_menu_ui(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        if !self.center_menu {
+            return;
+        }
+        let targets = self.center_targets();
+        // Every listed marker had a position when the list was opened; if the
+        // last one has since gone (beacon disconnected), there is nothing left
+        // to offer.
+        if targets.is_empty() {
+            self.center_menu = false;
+            return;
+        }
+
+        let icon = icon_size_for(screen);
+        let top = self.top_inset(ctx);
+        let mut chosen: Option<(MarkerKind, Position)> = None;
+        let mut close = false;
+        floating(
+            ctx,
+            "center_menu",
+            egui::Order::Foreground,
+            // Just under the controls bar the button sits in.
+            egui::Pos2::new(screen.center().x, top + icon * 1.8),
+            egui::Align2::CENTER_TOP,
+            false,
+            |ui| {
+                // Everything here is a fraction of the icon size, which is
+                // itself a fraction of the screen, so the rows stay a touch
+                // target on a phone and don't look lost on a desktop.
+                ui.spacing_mut().button_padding = egui::vec2(icon * 0.35, icon * 0.25);
+                ui.spacing_mut().item_spacing.y = icon * 0.12;
+                ui.set_min_width(icon * 3.5);
+                ui.label(egui::RichText::new("Center on").strong());
+                // Number the beacons only when there is more than one to tell
+                // apart; a single one reads better as just "Beacon".
+                let beacons = targets
+                    .iter()
+                    .filter(|(kind, _)| *kind == MarkerKind::Beacon)
+                    .count();
+                let mut nth = 0;
+                for &(kind, pos) in &targets {
+                    let label = if kind == MarkerKind::Beacon && beacons > 1 {
+                        nth += 1;
+                        format!("{} {nth}", kind.label())
+                    } else {
+                        kind.label().to_string()
+                    };
+                    if ui.button(label).clicked() {
+                        chosen = Some((kind, pos));
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            },
+        );
+
+        if let Some((kind, pos)) = chosen {
+            // Centering on yourself follows the live position; a beacon is a
+            // one-off recenter.
+            self.center_on(ctx, pos, kind == MarkerKind::You);
+            close = true;
+        }
+        if close {
+            self.center_menu = false;
+        }
     }
 
     /// Handle double-click/tap selection of a map marker and draw the info

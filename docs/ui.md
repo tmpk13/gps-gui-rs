@@ -118,6 +118,21 @@ edges. The key wrinkles:
   screen center and clipped back to the screen. The drawn angle eases toward
   the live heading each frame (`smoothed_heading`) so it glides. On mobile,
   heading-up also locks the view centered on you (pan becomes a no-op).
+  Heading-up is also the only thing that powers the compass: the sensor behind
+  `CompassHandle` is off until this button turns it on (see "The compass" below),
+  so the button's visibility is keyed off `MyApp::has_direction` - "a heading
+  exists *or* a compass could supply one" - rather than off a live reading.
+- **The center button.** A plain tap centers on you (falling back to the first
+  beacon with no fix yet); holding it - or right-clicking on desktop, both being
+  `Response::secondary_clicked` - opens `center_menu_ui`, a list of every marker
+  with a known position (`MyApp::center_targets`). Either path goes through
+  `MyApp::center_on`, which leaves tracking mode, centers (following the live
+  position only for you), and kicks off the offline zoom probe.
+- **Beacon heartbeat.** While the BLE link is up, a ring expands out of the
+  beacon marker and fades, one beat per `PULSE_PERIOD`. The phase is computed in
+  `MyApp::map` and handed to `GpsLayer` as `beacon_pulse`; the animation runs on
+  `request_repaint_after(PULSE_FRAME)` rather than a per-frame repaint, so an
+  otherwise idle map is not pinned at full frame rate.
 - **Tracking mode.** The track button (`tracking_beacon: Option<usize>` is the
   active beacon index) frames the user and a beacon together: `tracking_orientation`
   centers the view on their midpoint, picks a zoom that fits the pair inside the
@@ -224,6 +239,12 @@ app's) and edits it in place. The model lives in `src/radio.rs`; the page in
   confirming unlocks the typed input with a check (set, writes the value into the
   document via `RadioDoc::apply`) and an x (cancel). Only one field is in flight
   at a time - the other pencils are disabled while editing.
+- **Generating a default.** With nothing loaded, "Generate default config"
+  (`MyApp::default_radio` -> `RadioDoc::default_at`) fills the editor from the
+  firmware's own `RADIO.example.toml`, `include_str!`d from the sibling
+  esp32c6-gps checkout this crate already builds against - so there is no second
+  copy of the schema to keep in step. It starts dirty and writes nothing until
+  Save, which backs up any existing file first.
 - **Backups.** `Save` copies the previous on-disk file into a `radio-backups`
   directory next to it, under a timestamped name, before overwriting. The
   collapsible "Backups" list shows them newest-first; "Restore" loads one back
@@ -237,6 +258,25 @@ bar lets a position be typed as "lat, lon". A valid entry feeds the same
 `apply_gps_fix` pipeline a real fix would and recenters the map. It is shown on
 the Map and Data pages only.
 
+## The compass (mobile)
+
+`src/compass.rs` reads the NDK rotation-vector sensor on its own thread. The
+handle the app holds (`CompassHandle`) is two halves: the heading channel, and a
+`wanted` flag the UI sets.
+
+The sensor is **off by default and only enabled while heading-up is on**. The
+rotation vector is fused from the accelerometer, gyroscope and magnetometer, so
+leaving it running keeps all three awake for a heading nothing is drawing;
+tracking mode turns the map by the bearing to the beacon instead, and the marker
+arrow falls back to course over ground. `MyApp::sync_compass_power` runs once per
+frame in `MyApp::ui`, pushes `heading_up` into the flag, and clears
+`compass_heading` on the way down so a reading that has stopped updating is not
+left on screen. The sensor thread polls the flag between event reads and
+enables/disables accordingly, dropping any events queued across a disable.
+
+The struct is compiled on every target (the app holds an `Option<CompassHandle>`
+everywhere); only `compass::spawn` and the thread are Android-only.
+
 ## Platform differences at a glance
 
 Mobile vs desktop is gated on `cfg!(target_os = "android")` and on whether the
@@ -245,4 +285,6 @@ live-source channels/insets are present:
 - **Zoom**: desktop = wheel + buttons; mobile = pinch (no buttons).
 - **GPS**: mobile = live GNSS channel; desktop = manual position bar.
 - **Heading-up lock**: mobile locks/centers the view; desktop keeps free pan.
+- **Compass**: mobile only, and powered only while heading-up is on.
+- **Marker list**: opened by a long press on mobile, a right-click on desktop.
 - **Insets**: non-zero on mobile, zero on desktop.

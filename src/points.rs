@@ -15,9 +15,13 @@ pub enum PointSource {
 }
 
 impl PointSource {
+    /// How the source is named in the points list and its filter.
+    ///
+    /// The phone is the BLE central of the link the ESP beacon sits on the far
+    /// end of, which is the name it goes by everywhere else in the system.
     pub fn label(self) -> &'static str {
         match self {
-            PointSource::Phone => "phone",
+            PointSource::Phone => "Central",
             PointSource::Esp => "esp",
         }
     }
@@ -39,9 +43,10 @@ impl TrackPoint {
     }
 
     /// Substring search across the source label and the coordinates. `query`
-    /// must already be lowercase.
+    /// must already be lowercase; the label is folded to match, so searching is
+    /// case-insensitive however the labels are capitalized.
     pub fn matches(&self, query: &str) -> bool {
-        self.source.label().contains(query) || self.coord_text().contains(query)
+        self.source.label().to_lowercase().contains(query) || self.coord_text().contains(query)
     }
 }
 
@@ -80,8 +85,14 @@ mod tests {
         assert!(p.matches("esp"));
         assert!(p.matches("51.477"));
         assert!(p.matches("-0.0015"));
-        assert!(!p.matches("phone"));
+        assert!(!p.matches("central"));
         assert!(!p.matches("52."));
+    }
+
+    #[test]
+    fn source_search_ignores_label_case() {
+        // The query arrives lowercased; a capitalized label still matches.
+        assert!(point(PointSource::Phone).matches("central"));
     }
 
     #[test]

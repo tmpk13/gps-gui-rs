@@ -23,6 +23,10 @@
 //! Saving copies the previous on-disk file into a `radio-backups` directory
 //! (next to the file) under a timestamped name before overwriting, so old
 //! versions are kept and can be restored.
+//!
+//! With no file to load, [`RadioDoc::default_at`] starts one from the
+//! firmware's own reference config, so a board can be set up from the app
+//! alone.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,6 +82,13 @@ pub struct RadioDoc {
     /// A value has been edited since the last load/save.
     pub dirty: bool,
 }
+
+/// A complete RADIO.TOML at the firmware defaults, comments and help strings
+/// included: the reference file the firmware itself ships, baked in at build
+/// time so the app can lay down a config with no file to start from and no
+/// second copy of the schema to keep in step. The board is a sibling checkout
+/// this crate already builds against.
+const DEFAULT_TOML: &str = include_str!("../../esp32c6-gps/RADIO.example.toml");
 
 /// Whether `key` is one of the metadata keys (`<name>_description` /
 /// `<name>_type`) rather than an editable setting.
@@ -169,6 +180,23 @@ impl RadioDoc {
             doc,
             path: PathBuf::from(path),
             dirty: false,
+        })
+    }
+
+    /// A fresh document at the firmware defaults, aimed at `path` but not
+    /// written there: it starts dirty, so the file only appears when the Radio
+    /// page's Save is pressed (which backs up anything already at `path`
+    /// first). This is how a board gets a RADIO.TOML without one being copied
+    /// onto the SD card by hand.
+    pub fn default_at(path: &str) -> Result<Self, String> {
+        let doc: DocumentMut = DEFAULT_TOML
+            .parse()
+            .map_err(|e| format!("built-in default config: {e}"))?;
+        Ok(Self {
+            fields: collect_fields(&doc),
+            doc,
+            path: PathBuf::from(path),
+            dirty: true,
         })
     }
 
@@ -367,6 +395,21 @@ power_mode_type = \"enum:full,psmoo,psmct\"
         let d = doc();
         let f = d.fields.iter().find(|f| f.key == "frequency_hz").unwrap();
         assert_eq!(f.description.as_deref(), Some("RF center frequency."));
+    }
+
+    #[test]
+    fn built_in_default_parses_with_editable_fields() {
+        let d = RadioDoc::default_at("RADIO.toml").unwrap();
+        // The firmware's reference config carries every section the page edits.
+        for key in ["frequency_hz", "address", "interval_s", "meas_rate_ms"] {
+            assert!(d.fields.iter().any(|f| f.key == key), "missing {key}");
+        }
+        // Nothing is on disk yet, so it must read as unsaved.
+        assert!(d.dirty);
+        // The help strings and the enum hints came along with it.
+        let power = d.fields.iter().find(|f| f.key == "power_mode").unwrap();
+        assert!(power.description.is_some());
+        assert!(matches!(power.ty, FieldType::Enum(_)));
     }
 
     #[test]

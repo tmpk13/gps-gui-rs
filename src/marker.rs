@@ -6,6 +6,10 @@ use walkers::{MapMemory, Plugin, Position, Projector};
 
 use crate::config::{MarkerColors, MarkerSizes};
 
+/// How far the connected-beacon heartbeat ring travels, as a multiple of the
+/// beacon marker's own radius. Sized off the marker so it grows with it.
+const PULSE_REACH: f32 = 2.5;
+
 /// A walkers [`Plugin`] rendering the live position marker and its trail.
 ///
 /// It is rebuilt every frame from the app's state, so it just borrows the data
@@ -21,6 +25,10 @@ pub struct GpsLayer {
     /// The beacon's path so far; drawn dashed when `show_beacon_path` is on.
     pub beacon_track: Vec<Position>,
     pub show_beacon_path: bool,
+    /// Heartbeat phase (0..1) for the ring pulsing out of the beacon marker
+    /// while the BLE link is up. `None` leaves the marker still, which is how a
+    /// disconnected beacon reads.
+    pub beacon_pulse: Option<f32>,
     /// Colors for the drawn markers, from the loaded config.
     pub colors: MarkerColors,
     /// Independent sizes (points) for each drawn overlay.
@@ -88,6 +96,20 @@ impl Plugin for GpsLayer {
                 // The distance label that goes on this line is painted by the map
                 // page instead (see `MyApp::distance_label`), after the rotation
                 // pass, so its angle can be set outright.
+            }
+            // Heartbeat: a ring expanding out of the marker and fading as it
+            // goes, drawn under the marker so it reads as coming from it. One
+            // ring per beat says the link is alive without moving the marker.
+            if let Some(phase) = self.beacon_pulse {
+                let radius = sizes.beacon * (1.0 + phase * PULSE_REACH);
+                // Fade out over the beat, and thin the ring as it grows.
+                let fade = 1.0 - phase;
+                let width = sizes.beacon * 0.35 * fade;
+                painter.circle_stroke(
+                    beacon_screen,
+                    radius,
+                    Stroke::new(width, beacon_color.gamma_multiply(fade)),
+                );
             }
             painter.circle_filled(beacon_screen, sizes.beacon, beacon_color);
             painter.circle_stroke(beacon_screen, sizes.beacon, Stroke::new(2.0, Color32::WHITE));

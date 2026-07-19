@@ -1,5 +1,8 @@
 pub mod app;
 pub mod ble;
+// The handle type is cross-platform (the app holds an `Option` of it on every
+// target); only the sensor thread behind it is Android-only.
+pub mod compass;
 pub mod config;
 pub mod gps;
 pub mod marker;
@@ -7,9 +10,6 @@ pub mod offline;
 pub mod points;
 pub mod radio;
 pub mod tiles;
-
-#[cfg(target_os = "android")]
-mod compass;
 
 /// Android entry point.
 ///
@@ -66,7 +66,9 @@ fn android_main(android_app: egui_winit::winit::platform::android::activity::And
         options,
         Box::new(move |cc| {
             let gps_rx = gps::spawn_android_location(cc.egui_ctx.clone(), vm_ptr, activity_ptr);
-            let compass_rx = Some(compass::spawn(cc.egui_ctx.clone()));
+            // Starts with the sensor off; the app powers it up only for
+            // heading-up (see `MyApp::sync_compass_power`).
+            let compass = Some(compass::spawn(cc.egui_ctx.clone()));
             // The BLE worker also loads the dex shim and applies
             // keep-screen-on through it.
             let ble = ble::spawn(cc.egui_ctx.clone(), vm_ptr, activity_ptr);
@@ -74,7 +76,7 @@ fn android_main(android_app: egui_winit::winit::platform::android::activity::And
                 cc.egui_ctx.clone(),
                 Some(gps_rx),
                 cache_dir,
-                compass_rx,
+                compass,
                 insets,
                 ble,
             )))

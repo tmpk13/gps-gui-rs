@@ -11,7 +11,7 @@ use crate::app::{MyApp, Page, PointFilter, RadioEdit, RegionSelect};
 use crate::ble::BleCommand;
 use crate::config::DistanceUnits;
 use crate::gps::GpsFix;
-use crate::points::{age_text, TrackPoint};
+use crate::points::{age_text, PointSource, TrackPoint};
 use crate::radio::{EditVal, FieldType};
 
 use super::{
@@ -81,7 +81,7 @@ impl MyApp {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.points_search)
-                        .hint_text("search (e.g. 51.47 or esp)")
+                        .hint_text("search (e.g. 51.47 or central)")
                         .desired_width((screen.width() - 140.0).clamp(120.0, 320.0)),
                 );
                 if ui.button("Clear").clicked() {
@@ -92,8 +92,18 @@ impl MyApp {
             ui.horizontal(|ui| {
                 ui.label("Source:");
                 ui.selectable_value(&mut self.points_filter, PointFilter::All, "all");
-                ui.selectable_value(&mut self.points_filter, PointFilter::Phone, "phone");
-                ui.selectable_value(&mut self.points_filter, PointFilter::Esp, "esp");
+                // The source names come from `PointSource::label`, so the
+                // filter and the rows below it always read the same.
+                ui.selectable_value(
+                    &mut self.points_filter,
+                    PointFilter::Phone,
+                    PointSource::Phone.label(),
+                );
+                ui.selectable_value(
+                    &mut self.points_filter,
+                    PointFilter::Esp,
+                    PointSource::Esp.label(),
+                );
             });
             ui.add_space(8.0);
 
@@ -122,8 +132,10 @@ impl MyApp {
                 .auto_shrink([false, false])
                 .show_rows(ui, row_height, rows.len(), |ui, range| {
                     for p in &rows[range] {
+                        // The source column is wide enough for the longest
+                        // label, so the coordinates stay in line.
                         let text = format!(
-                            "{:<6} {}  {:>7}",
+                            "{:<8} {}  {:>7}",
                             p.source.label(),
                             p.coord_text(),
                             age_text(now, p.time),
@@ -549,6 +561,20 @@ impl MyApp {
                         "Load a RADIO.TOML to view and edit the radio, mesh, beacon and GPS \
                          settings.",
                     );
+                    ui.add_space(8.0);
+                    // With no file to load (a fresh SD card), start from the
+                    // firmware defaults instead. It fills the editor only; Save
+                    // is what writes the file.
+                    if ui
+                        .button("Generate default config")
+                        .on_hover_text(
+                            "Fill the editor with the firmware defaults, ready to edit and \
+                             save to the file above",
+                        )
+                        .clicked()
+                    {
+                        self.default_radio();
+                    }
                 }
             });
         });

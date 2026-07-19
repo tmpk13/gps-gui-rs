@@ -85,7 +85,7 @@ impl Default for MarkerSizes {
 }
 
 /// Unit system for the beacon-distance label.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DistanceUnits {
     /// Kilometers and meters.
     Metric,

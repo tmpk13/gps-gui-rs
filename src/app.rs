@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -11,6 +12,7 @@ use walkers::{
 };
 
 use crate::ble::{BleCommand, BleEvent, BleHandle, Telemetry};
+use crate::compass::CompassHandle;
 use crate::config::AppConfig;
 use crate::gps::GpsFix;
 use crate::offline::{self, DownloadProgress};
@@ -194,8 +196,9 @@ pub struct MyApp {
     /// Live GPS fixes, when a source is wired up (Android GNSS). `None` on
     /// desktop, where the manual position bar is shown instead.
     gps_rx: Option<Receiver<GpsFix>>,
-    /// Optional device-facing compass heading stream (Android only).
-    compass_rx: Option<Receiver<f32>>,
+    /// Device-facing compass, when the platform has one (Android only). The
+    /// sensor behind it is powered only while heading-up needs it.
+    compass: Option<CompassHandle>,
     /// The BLE worker streaming the ESP32-C3 beacon's GPS data.
     ble: BleHandle,
     /// Returns the current safe-area insets `[top, right, bottom, left]` in
@@ -276,6 +279,9 @@ pub struct MyApp {
     /// Marker whose info popup (name + time since last update) is shown, set by
     /// double-clicking/tapping a marker on the map.
     selected_marker: Option<MarkerKind>,
+    /// The center button's marker list is open (held/right-clicked the button).
+    /// A plain tap centers on you instead, without ever opening this.
+    center_menu: bool,
     /// Offline center-button zoom fallback: the background probe sends the zoom
     /// level to snap to (nearest cached tile) here when it finds we are offline.
     zoom_tx: Sender<f64>,
@@ -291,14 +297,14 @@ impl MyApp {
     /// up (desktop) - the UI then shows a manual position entry bar instead.
     /// `cache_dir` is where tiles are cached to disk (`None` to disable). Desktop
     /// passes a local `.cache`; Android passes its writable data directory.
-    /// `compass_rx` is the device-facing heading stream (`None` on desktop).
+    /// `compass` is the device-facing heading source (`None` on desktop).
     /// `insets` reports the safe-area insets in physical pixels (`None` on desktop).
     /// `ble` is the worker connected to the ESP32-C3 GPS beacon.
     pub fn new(
         ctx: egui::Context,
         gps_rx: Option<Receiver<GpsFix>>,
         cache_dir: Option<PathBuf>,
-        compass_rx: Option<Receiver<f32>>,
+        compass: Option<CompassHandle>,
         insets: Option<Box<dyn Fn() -> [f32; 4]>>,
         ble: BleHandle,
     ) -> Self {
@@ -321,7 +327,7 @@ impl MyApp {
             layer: MapLayer::Standard,
             map_memory: MapMemory::default(),
             gps_rx,
-            compass_rx,
+            compass,
             ble,
             insets,
             current: None,
@@ -362,6 +368,7 @@ impl MyApp {
             manual_gps_text: String::new(),
             manual_gps_bad: false,
             selected_marker: None,
+            center_menu: false,
             zoom_tx,
             zoom_rx,
             controls_width: 0.0,
@@ -455,6 +462,25 @@ impl MyApp {
         });
     }
 
+    /// Start a RADIO.TOML at the firmware defaults, aimed at `radio_path`.
+    /// Nothing is written until Save, which backs up any existing file first,
+    /// so this cannot lose a config by itself.
+    fn default_radio(&mut self) {
+        let path = self.radio_path.trim().to_string();
+        if path.is_empty() {
+            self.radio_feedback = Some(Err("Enter a file path.".to_string()));
+            return;
+        }
+        self.radio_edit = RadioEdit::None;
+        self.radio_feedback = Some(match RadioDoc::default_at(&path) {
+            Ok(doc) => {
+                self.radio = Some(doc);
+                Ok(format!("Default config ready. Press Save to write {path}"))
+            }
+            Err(e) => Err(e),
+        });
+    }
+
     /// Write the edited RADIO.TOML back, backing up the previous file first.
     fn save_radio(&mut self) {
         let Some(doc) = self.radio.as_mut() else {
@@ -493,6 +519,73 @@ impl MyApp {
     /// Device-facing compass heading if available, otherwise course over ground.
     fn effective_heading(&self) -> Option<f32> {
         self.compass_heading.or(self.heading)
+    }
+
+    /// Whether the map can be turned to a heading at all: either a heading is
+    /// already known, or a compass exists that would supply one once powered.
+    /// The heading-up button is shown on this rather than on a live reading,
+    /// since the sensor is off until that button turns it on.
+    fn has_direction(&self) -> bool {
+        self.effective_heading().is_some() || self.compass.is_some()
+    }
+
+    /// Power the compass sensor for heading-up and nothing else.
+    ///
+    /// The rotation-vector sensor is fused from the accelerometer, gyroscope
+    /// and magnetometer, so it keeps all three awake; heading-up is the only
+    /// mode that draws a device heading. Tracking mode turns the map by the
+    /// bearing to the beacon instead, and the marker's heading arrow falls back
+    /// to course over ground.
+    fn sync_compass_power(&mut self) {
+        let Some(compass) = &self.compass else { return };
+        let wanted = self.heading_up;
+        // Switching off drops the last reading: it stops being updated, so
+        // holding on to it would draw a heading that quietly goes stale.
+        if compass.wanted.swap(wanted, Ordering::Relaxed) && !wanted {
+            self.compass_heading = None;
+        }
+    }
+
+    /// Center the map on `target`, leaving tracking mode (which recomputes the
+    /// center every frame and would override this at once). `follow` re-follows
+    /// the live position rather than pinning the map to one point, which is what
+    /// centering on yourself should do.
+    ///
+    /// When tiles are cached to disk this also kicks off the offline check: if
+    /// we turn out to be offline and the current zoom has no tile for `target`,
+    /// the map snaps to the nearest zoom that does.
+    fn center_on(&mut self, ctx: &egui::Context, target: Position, follow: bool) {
+        self.tracking_beacon = None;
+        if follow {
+            self.map_memory.follow_my_position();
+        } else {
+            self.map_memory.center_at(target);
+        }
+        if let Some(dir) = self.cache_dir.clone() {
+            let current_zoom = self.map_memory.zoom().round().clamp(0.0, 19.0) as u8;
+            offline::spawn_offline_zoom(
+                dir,
+                self.layer,
+                target,
+                current_zoom,
+                self.zoom_tx.clone(),
+                ctx.clone(),
+            );
+        }
+    }
+
+    /// The markers the center button can center on, in menu order: you first
+    /// (the plain tap's target), then each beacon. Only markers with a known
+    /// position are listed, so an entry always has somewhere to go.
+    fn center_targets(&self) -> Vec<(MarkerKind, Position)> {
+        let mut targets: Vec<(MarkerKind, Position)> =
+            self.current.map(|p| (MarkerKind::You, p)).into_iter().collect();
+        targets.extend(
+            self.beacon_positions()
+                .into_iter()
+                .map(|p| (MarkerKind::Beacon, p)),
+        );
+        targets
     }
 
     /// Great-circle distance from the current position to the BLE beacon, in
@@ -585,10 +678,25 @@ impl MyApp {
             self.apply_gps_fix(fix);
         }
 
-        if let Some(rx) = &self.compass_rx {
-            while let Ok(heading) = rx.try_recv() {
-                self.compass_heading = Some(heading);
+        // A compass thread that could not start (no rotation-vector sensor on
+        // this device) drops its sender. Forgetting the handle then hides the
+        // heading-up button, which is keyed off the handle existing rather than
+        // off a live reading - the sensor being off is the normal state.
+        let mut compass_gone = false;
+        if let Some(compass) = &self.compass {
+            loop {
+                match compass.headings.try_recv() {
+                    Ok(heading) => self.compass_heading = Some(heading),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        compass_gone = true;
+                        break;
+                    }
+                }
             }
+        }
+        if compass_gone {
+            self.compass = None;
         }
 
         while let Ok(event) = self.ble.events.try_recv() {
@@ -643,6 +751,9 @@ impl MyApp {
 impl eframe::App for MyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_sources();
+        // Heading-up may have been toggled (or dropped for want of a heading)
+        // last frame; the sensor follows it here, once, for every page.
+        self.sync_compass_power();
 
         let ctx = ui.ctx().clone();
         let screen = ctx.input(|i| i.viewport_rect());
