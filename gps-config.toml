@@ -1,14 +1,25 @@
 [colors]
 track = "#0078ff"
-fixed = "#ff9028"
+fixed = "#ff5028"
 
 [ble]
 enabled = true
-show_path = true
+show_path = false
+mac = ""
 # Pin a specific beacon instead of scanning for the GPS service:
 # mac = "AA:BB:CC:DD:EE:FF"
 
 [track]
-# Meters of movement from the last recorded point before a new one is added to
-# a track. Decimates GPS jitter; 0 records every fix.
 min_distance = 3.0
+
+[sizes]
+marker = 8.0
+beacon = 6.0
+track = 3.0
+distance_line = 3.0
+distance_text = 14.0
+
+[distance]
+show = false
+units = "metric"
+dotted = true
