@@ -18,7 +18,7 @@ Add hold to center on different markers
 
 [done] Option in settings to show distance between user and beacons next to line between. Text should be above the line. (mi/ft or km/m; label above the line midpoint)
 
-[done] Tracking mode: Keep user and marker both in frame with some margin. (track bar button; cycles beacons; heading button exits; user near bottom, beacon near top)
+[done] Tracking mode: Keep user and marker both in frame with some margin. (track bar button; cycles beacons then exits; heading button hidden while tracking; user near bottom, beacon near top)
 
 [done] Independent overlay sizes ([sizes] in toml) and dotted user-beacon line ([distance] dotted).
 
@@ -31,4 +31,4 @@ Set font?
 
 Remove toml veiw from settings change this to have a generate file and reset to defaults button.
 
-Make page menu % size.
+[done] Make page menu % size. (rows sized off the trigger icon, itself a fraction of the screen)

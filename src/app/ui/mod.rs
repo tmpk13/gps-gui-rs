@@ -226,13 +226,30 @@ impl MyApp {
             .fit_to_exact_size(egui::vec2(icon, icon))
             .tint(egui::Color32::TRANSPARENT);
         let resp = ui.menu_image_button(base, |ui| {
+            // Every measure in the popup is a fraction of the trigger icon,
+            // which is itself a fraction of the screen (see `icon_size_for`).
+            // A fixed row height reads as a sliver beside a 70pt toolbar on a
+            // desktop and crowds the touch targets on a phone.
+            let text_size = icon * 0.35;
+            // `Button::image_and_text` caps the image at the row height of the
+            // button font, so scaling that font is also what lets the row
+            // glyphs grow with the screen.
+            ui.style_mut().text_styles.insert(
+                egui::TextStyle::Button,
+                egui::FontId::proportional(text_size),
+            );
+            ui.spacing_mut().button_padding = egui::vec2(icon * 0.25, icon * 0.2);
+            ui.spacing_mut().item_spacing.y = icon * 0.12;
+            // Wide enough that the longest label never wraps the rows to
+            // different widths.
+            ui.set_min_width(icon * 4.0);
             for (page, label, src) in page_items() {
-                let item_icon = egui::Image::new(src)
-                    .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                let image = egui::Image::new(src)
+                    .fit_to_exact_size(egui::vec2(text_size, text_size))
                     .tint(ui.visuals().text_color());
                 let selected = self.page == page;
                 if ui
-                    .add(egui::Button::image_and_text(item_icon, label).selected(selected))
+                    .add(egui::Button::image_and_text(image, label).selected(selected))
                     .clicked()
                 {
                     self.page = page;
