@@ -29,6 +29,7 @@
 //! enabled = true      # master switch for the BLE GPS source
 //! show_path = false   # draw the path of the incoming BLE GPS data
 //! mac = "AA:BB:CC:DD:EE:FF"  # pin a specific device; omit to scan by service
+//! stowed_s = 0        # written by the app, not you: see BleSettings::stowed_s
 //!
 //! [track]
 //! min_distance = 3.0  # meters of movement before a new track point is recorded
@@ -167,6 +168,15 @@ pub struct BleSettings {
     pub show_path: bool,
     /// Pin a specific device MAC; `None` scans for the GPS service.
     pub mac: Option<String>,
+    /// The stow interval the board was last put to sleep for, or 0 when it is
+    /// not stowed. Remembered state the app writes itself, not a preference.
+    ///
+    /// While it is set, auto-connect stays off: connecting is exactly what
+    /// disarms a stow on the board, so chasing one we deliberately put to
+    /// sleep would undo it - and it would undo it again after every restart,
+    /// which is why this has to outlive the process. Reconnect on the Settings
+    /// page clears it, being a deliberate request to reach the board.
+    pub stowed_s: u32,
 }
 
 impl Default for BleSettings {
@@ -175,6 +185,7 @@ impl Default for BleSettings {
             enabled: true,
             show_path: false,
             mac: None,
+            stowed_s: 0,
         }
     }
 }
@@ -246,6 +257,7 @@ struct RawBle {
     enabled: Option<bool>,
     show_path: Option<bool>,
     mac: Option<String>,
+    stowed_s: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -362,12 +374,36 @@ impl AppConfig {
         );
         set(
             &mut doc,
+            "ble",
+            "stowed_s",
+            (self.ble.stowed_s as i64).into(),
+        );
+        set(
+            &mut doc,
             "track",
             "min_distance",
             self.track.min_distance.into(),
         );
         std::fs::write(path, doc.to_string()).map_err(|e| format!("{path}: {e}"))?;
         Ok(false)
+    }
+
+    /// Record (or clear) a stow in the file at `path`, touching only that one
+    /// key and leaving the rest of the file exactly as it was. `Ok(false)`
+    /// means there was no file to record it in.
+    ///
+    /// Deliberately not a method: this fires from a BLE event, which can land
+    /// while the Settings page holds edits the user has not saved. Writing the
+    /// whole config the way [`Self::save`] does would commit those behind
+    /// their back, so this cannot be given the live settings to write.
+    pub fn save_stowed(path: &str, secs: u32) -> Result<bool, String> {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Ok(false);
+        };
+        let mut doc: DocumentMut = text.parse().map_err(|e| format!("{path}: {e}"))?;
+        set(&mut doc, "ble", "stowed_s", (secs as i64).into());
+        std::fs::write(path, doc.to_string()).map_err(|e| format!("{path}: {e}"))?;
+        Ok(true)
     }
 
     /// These settings as a complete, commented TOML file - what the Settings
@@ -397,6 +433,7 @@ impl AppConfig {
              enabled = {enabled}       # master switch for the BLE GPS source\n\
              show_path = {show_path}    # draw the path of the incoming BLE GPS data\n\
              mac = \"{mac}\"            # pin a specific device; empty scans by service\n\
+             stowed_s = {stowed_s}         # written by the app: board asleep this long, do not wake it\n\
              \n\
              [track]\n\
              min_distance = {min_distance:?}   # meters of movement before a new track point\n",
@@ -413,6 +450,7 @@ impl AppConfig {
             enabled = self.ble.enabled,
             show_path = self.ble.show_path,
             mac = self.ble.mac.clone().unwrap_or_default(),
+            stowed_s = self.ble.stowed_s,
             min_distance = self.track.min_distance,
         )
     }
@@ -459,6 +497,9 @@ impl AppConfig {
         // Treat an empty string as unset so a template line can stay in the
         // file.
         config.ble.mac = raw.ble.mac.filter(|m| !m.trim().is_empty());
+        if let Some(v) = raw.ble.stowed_s {
+            config.ble.stowed_s = v;
+        }
         if let Some(v) = raw.track.min_distance {
             if !v.is_finite() || v < 0.0 {
                 return Err(format!("track.min_distance must be >= 0, got {v}"));
@@ -536,6 +577,36 @@ mod tests {
         assert_eq!(back.sizes.marker, 12.5);
         assert_eq!(back.colors.track, Color32::from_rgb(1, 2, 3));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A stow lands from a BLE event, possibly while the Settings page holds
+    /// edits the user has not saved. It must record itself without carrying
+    /// any of those into the file.
+    #[test]
+    fn save_stowed_writes_only_that_key() {
+        let path = std::env::temp_dir().join("gps-gui-rs-config-stow-test.toml");
+        let path = path.to_str().unwrap();
+        std::fs::write(path, "# keep me\n[sizes]\nmarker = 8.0\n\n[ble]\nenabled = true\n")
+            .unwrap();
+
+        assert!(AppConfig::save_stowed(path, 43200).unwrap());
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("# keep me"), "{text}");
+        // The unsaved edit below must not have reached the file.
+        assert!(text.contains("marker = 8.0"), "{text}");
+
+        let back = AppConfig::load(path).unwrap();
+        assert_eq!(back.ble.stowed_s, 43200);
+        assert_eq!(back.sizes.marker, 8.0);
+
+        // Reaching the board again clears it.
+        assert!(AppConfig::save_stowed(path, 0).unwrap());
+        assert_eq!(AppConfig::load(path).unwrap().ble.stowed_s, 0);
+
+        // No file: nothing to record it in, and no file conjured up either.
+        let _ = std::fs::remove_file(path);
+        assert!(!AppConfig::save_stowed(path, 900).unwrap());
+        assert!(!std::path::Path::new(path).exists());
     }
 
     #[test]

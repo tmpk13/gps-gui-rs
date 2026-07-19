@@ -553,8 +553,12 @@ impl MyApp {
                 self.board_power_ui(ui);
 
                 ui.add_space(16.0);
-                if ui.button("Reconnect").clicked() {
-                    self.sync_ble_to_config();
+                if ui
+                    .button("Reconnect")
+                    .on_hover_text("Also the way back to a stowed board")
+                    .clicked()
+                {
+                    self.reconnect_ble();
                 }
             });
         });
@@ -578,6 +582,23 @@ impl MyApp {
                  a Reconnect timed to land in one of those windows - which also disarms the \
                  stow.",
             );
+            ui.add_space(6.0);
+            if self.stow_persisted {
+                ui.label(
+                    egui::RichText::new(
+                        "Auto-connect is off while it is stowed, so the app will not wake it \
+                         by accident. Remembered in the config file, so a restart will not \
+                         either.",
+                    )
+                    .weak(),
+                );
+            } else {
+                ui.colored_label(
+                    ERR_RED,
+                    "There is no config file to remember this in, so a restart will \
+                     auto-connect and disarm the stow. Save on this page first to keep it.",
+                );
+            }
             return;
         }
         if !self.ble_connected {

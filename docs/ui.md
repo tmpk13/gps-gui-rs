@@ -244,6 +244,17 @@ these in flash and is the authority on them.
   watch for the ack on `CFG_ESP_STOW_S` and treat the drop that follows as
   `BleEvent::Stowed` rather than a fault, and stop wanting a connection -
   reconnecting would immediately disarm the stow just asked for.
+- **A stow outlives the process** (`[ble] stowed_s`). Suppressing auto-connect
+  only in memory would last until the next launch, when `sync_ble_to_config`
+  would connect, the board would disarm, and the stow would be gone - every
+  restart, silently. So `MyApp::set_stow_memory` records it in the config file
+  and `sync_ble_to_config` refuses to connect while it is set. It clears on a
+  successful connect (the board has disarmed by then anyway) or on Reconnect,
+  which is the deliberate override. The write goes through
+  `AppConfig::save_stowed`, which edits that one key: a stow arrives on a BLE
+  event that can land while the Settings page holds unsaved edits, and a full
+  `save` would commit those behind the user's back. With no config file to
+  write to, the page says so in red rather than pretending it was remembered.
 
 ## The Radio config page (`pages.rs` + `radio.rs`)
 

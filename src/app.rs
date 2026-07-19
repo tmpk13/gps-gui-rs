@@ -319,8 +319,12 @@ pub struct MyApp {
     /// board out of reach for hours, so they are confirmed before writing.
     stow_confirm: Option<u32>,
     /// The stow interval the board last went to sleep for, once it has acked
-    /// an arm and dropped the link on purpose.
+    /// an arm and dropped the link on purpose. Mirrors `config.ble.stowed_s`,
+    /// which is what carries it across a restart.
     stowed: Option<u32>,
+    /// The current stow was written to the config file, so it will still be
+    /// known after a restart. False when there was no file to write it to.
+    stow_persisted: bool,
     /// When the current connection came up. The GPS/LoRa rail only powers on
     /// once a central connects, so telemetry is legitimately empty for the
     /// first seconds and the Status page says warming up, not broken.
@@ -438,6 +442,7 @@ impl MyApp {
             settings_unsupported: false,
             stow_confirm: None,
             stowed: None,
+            stow_persisted: false,
             connected_at: None,
             // Both start at the low end of their clamp range, so a stray press
             // arms the shortest sleep rather than the longest.
@@ -482,13 +487,21 @@ impl MyApp {
     /// Adopt a loaded config: colors, the MAC input, and the BLE connection.
     fn apply_config(&mut self, cfg: AppConfig) {
         self.ble_mac_text = cfg.ble.mac.clone().unwrap_or_default();
+        // A stow recorded in the file is one this app armed in an earlier run.
+        self.stowed = (cfg.ble.stowed_s > 0).then_some(cfg.ble.stowed_s);
+        self.stow_persisted = self.stowed.is_some();
         self.config = cfg;
         self.sync_ble_to_config();
     }
 
     /// Tell the BLE worker what the config wants (connect or stay away).
+    ///
+    /// A remembered stow keeps us away regardless of `enabled`: connecting is
+    /// what disarms a stow on the board, so auto-connecting to one we put to
+    /// sleep on purpose would undo it - every launch, until the battery went.
+    /// Reconnect is the way back in.
     fn sync_ble_to_config(&mut self) {
-        let cmd = if self.config.ble.enabled {
+        let cmd = if self.config.ble.enabled && self.config.ble.stowed_s == 0 {
             BleCommand::Connect {
                 mac: self.config.ble.mac.clone(),
             }
@@ -496,6 +509,27 @@ impl MyApp {
             BleCommand::Disconnect
         };
         let _ = self.ble.commands.send(cmd);
+    }
+
+    /// Remember that the board stowed itself, or - with 0 - that it is awake
+    /// and reachable again. Records it in the config file too, so a restart
+    /// does not walk straight back into disarming the stow, writing only that
+    /// one key so unsaved Settings-page edits are left alone.
+    fn set_stow_memory(&mut self, secs: u32) {
+        self.stowed = (secs > 0).then_some(secs);
+        if self.config.ble.stowed_s == secs {
+            return;
+        }
+        self.config.ble.stowed_s = secs;
+        self.stow_persisted =
+            AppConfig::save_stowed(&self.config_path, secs).unwrap_or(false);
+    }
+
+    /// The Settings page's Reconnect: a deliberate attempt to reach the board,
+    /// which is also the one thing that overrides a remembered stow.
+    pub(crate) fn reconnect_ble(&mut self) {
+        self.set_stow_memory(0);
+        self.sync_ble_to_config();
     }
 
     /// Queue one config write to the board and wait for its ack. The controls
@@ -802,6 +836,10 @@ impl MyApp {
             self.compass = None;
         }
 
+        // Set inside the drain loop, applied after it: remembering a stow
+        // writes the config file, which needs all of `self` rather than the
+        // disjoint field borrows the loop body can take.
+        let mut stow_memory: Option<u32> = None;
         while let Ok(event) = self.ble.events.try_recv() {
             match event {
                 BleEvent::Status(s) => self.ble_status = s,
@@ -810,8 +848,10 @@ impl MyApp {
                     self.connected_at = c.then(Instant::now);
                     if c {
                         // A fresh link re-reads everything below; nothing from
-                        // the last session still describes the board.
-                        self.stowed = None;
+                        // the last session still describes the board. Reaching
+                        // it also means the board has disarmed any stow, so
+                        // the memory of one goes with it.
+                        stow_memory = Some(0);
                         self.board_settings = None;
                         self.settings_unsupported = false;
                         self.telemetry = None;
@@ -862,10 +902,13 @@ impl MyApp {
                     self.settings_unsupported = true;
                 }
                 BleEvent::Stowed { secs } => {
-                    self.stowed = Some(secs);
+                    stow_memory = Some(secs);
                     self.ble_ack_pending = false;
                 }
             }
+        }
+        if let Some(secs) = stow_memory {
+            self.set_stow_memory(secs);
         }
 
         // Offline center-button fallback: apply the zoom the probe picked (the
