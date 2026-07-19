@@ -142,6 +142,27 @@ public final class BleBridge {
                     nativeOnNotify(ch.getUuid().toString(), value);
                 }
 
+                // Read results go out through the notify callback: a read and
+                // a change carry the same characteristic value, so the Rust
+                // side decodes both on one path.
+                @Override
+                public void onCharacteristicRead(BluetoothGatt g,
+                        BluetoothGattCharacteristic ch, int status) {
+                    if (Build.VERSION.SDK_INT < 33 && status == BluetoothGatt.GATT_SUCCESS) {
+                        byte[] v = ch.getValue();
+                        nativeOnNotify(ch.getUuid().toString(), v == null ? new byte[0] : v);
+                    }
+                }
+
+                // Fires on Android 13+.
+                @Override
+                public void onCharacteristicRead(BluetoothGatt g,
+                        BluetoothGattCharacteristic ch, byte[] value, int status) {
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        nativeOnNotify(ch.getUuid().toString(), value);
+                    }
+                }
+
                 @Override
                 public void onCharacteristicWrite(BluetoothGatt g,
                         BluetoothGattCharacteristic ch, int status) {
@@ -194,6 +215,16 @@ public final class BleBridge {
                     ? BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                     : BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE);
             return gatt.writeDescriptor(d);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Read; the value arrives on the notify callback (see onCharacteristicRead). */
+    public static boolean readCharacteristic(String service, String chr) {
+        try {
+            BluetoothGattCharacteristic c = findChar(service, chr);
+            return c != null && gatt.readCharacteristic(c);
         } catch (Throwable t) {
             return false;
         }

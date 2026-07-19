@@ -215,6 +215,36 @@ once; the file is only touched by the buttons.
   empty means "scan by service". Changing `enabled`/`mac` takes effect on
   Reconnect, not per keystroke.
 
+### Board power and sleep (`board_power_ui`)
+
+The bottom section of the page drives the ESP32-C6's own power rail and deep
+sleep. Unlike everything above it, **none of it is app state**: the board holds
+these in flash and is the authority on them.
+
+- **The board tells us, we do not tell the board.** The worker reads
+  `ble::SETTINGS_UUID` on connect and subscribes to it; each blob decodes into
+  `BleEvent::Settings` and lands in `MyApp::board_settings`. Every checkbox
+  binds to a copy of that blob, so a click sends a write and the checkbox only
+  moves once the board reports it moved. This matters because the board changes
+  these by itself: it clamps an out-of-range interval, and it disarms stow the
+  moment a central connects.
+- **One write in flight.** `MyApp::send_config` sets `ble_ack_pending`, which
+  disables the controls until the ack arrives. The text inputs are seeded from
+  the first settings blob of a session only, so a later notification cannot
+  overwrite something half-typed.
+- **A newer firmware is said out loud.** `Settings::decode` returning `None` is
+  a layout-version mismatch, which becomes `BleEvent::SettingsUnsupported` and
+  hides the controls behind an explanation - never a fall back to defaults the
+  board never reported.
+- **Arming stow is confirmed** (`stow_confirm_popup`, drawn at the top level
+  like the radio page's popup). A stow can put the board out of reach for
+  hours, and each wake advertises for only about 15 s, so the confirmation
+  names the interval the board will actually use after clamping.
+- **The disconnect after a stow arm is the success path.** Both transports
+  watch for the ack on `CFG_ESP_STOW_S` and treat the drop that follows as
+  `BleEvent::Stowed` rather than a fault, and stop wanting a connection -
+  reconnecting would immediately disarm the stow just asked for.
+
 ## The Radio config page (`pages.rs` + `radio.rs`)
 
 The Radio page loads the WIO-E5 `RADIO.TOML` (the firmware's own config, not the

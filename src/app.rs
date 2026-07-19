@@ -2,16 +2,17 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use egui::Pos2;
-use gps_proto::packet::{self, PositionPacket};
+use gps_proto::packet::{self, Ack, PositionPacket};
+use midair_proto::ble;
 use walkers::{
     lat_lon, sources::OpenStreetMap, HeaderValue, HttpOptions, HttpTiles, MapMemory, Position,
     Projector,
 };
 
-use crate::ble::{BleCommand, BleEvent, BleHandle, Telemetry};
+use crate::ble::{BleCommand, BleEvent, BleHandle, ConfigWrite, Settings, Telemetry};
 use crate::compass::CompassHandle;
 use crate::config::AppConfig;
 use crate::gps::GpsFix;
@@ -24,6 +25,70 @@ use crate::tiles::{MapLayer, OpenTopoMap};
 /// submodule so this file holds only state and the core update logic; the
 /// `impl MyApp` blocks there render each page.
 mod ui;
+
+/// The name of a config setting, for the ack line.
+fn setting_name(id: u8) -> &'static str {
+    match id {
+        packet::CFG_UPDATE_INTERVAL_MS => "notify interval",
+        ble::CFG_PWR_EN => "GPS/LoRa power",
+        ble::CFG_WIO_SLEEP => "WIO-E5 sleep",
+        ble::CFG_GPS_SLEEP => "GPS backup mode",
+        ble::CFG_ESP_SLEEP_S => "wake-check interval",
+        ble::CFG_ESP_STOW_S => "stow",
+        _ => "setting",
+    }
+}
+
+/// What the board said about the last config write. On success this reports
+/// the value it actually applied, which for the intervals may be a clamped
+/// version of what was asked for. The on/off settings ack without a value;
+/// their new state arrives in the settings blob instead.
+fn ack_message(ack: &Ack) -> Result<String, String> {
+    let name = setting_name(ack.id);
+    let applied = ack.value_u32.unwrap_or(0);
+    match ack.status {
+        packet::ACK_OK => Ok(match ack.id {
+            packet::CFG_UPDATE_INTERVAL_MS => {
+                format!("Board applied: notify interval {applied} ms")
+            }
+            ble::CFG_ESP_SLEEP_S if applied == 0 => "Board applied: sleep disabled".to_string(),
+            ble::CFG_ESP_SLEEP_S => {
+                format!("Board applied: wake check every {}", secs_text(applied))
+            }
+            ble::CFG_ESP_STOW_S if applied == 0 => "Board applied: stow disarmed".to_string(),
+            ble::CFG_ESP_STOW_S => format!("Board applied: stow for {}", secs_text(applied)),
+            _ => format!("Board applied: {name}"),
+        }),
+        packet::ACK_UNKNOWN_ID => Err(format!(
+            "Board rejected: it does not know the {name} setting"
+        )),
+        packet::ACK_BAD_VALUE => Err(format!("Board rejected: bad value for {name}")),
+        // Not a rejected value: the ESP could not reach the WIO-E5 over the
+        // UART link between them, so the setting never got there.
+        ble::ACK_WIO_ERROR => Err(format!(
+            "The board could not reach the WIO-E5 to set {name} (link error)."
+        )),
+        ble::ACK_WIO_TIMEOUT => Err(format!(
+            "The board could not reach the WIO-E5 to set {name} (no reply)."
+        )),
+        ble::ACK_BAD_STATE => Err(format!(
+            "Board rejected {name}: not valid in its current state"
+        )),
+        s => Err(format!("Board rejected {name}: status {s:#04x}")),
+    }
+}
+
+/// A duration in seconds as a short human phrase ("45 s", "5 min", "12 h").
+/// Used wherever a sleep interval is shown or confirmed.
+pub(crate) fn secs_text(s: u32) -> String {
+    match s {
+        0 => "off".to_string(),
+        s if s < 60 => format!("{s} s"),
+        s if s < 3600 => format!("{:.0} min", s as f32 / 60.0),
+        s if s % 3600 == 0 => format!("{} h", s / 3600),
+        s => format!("{:.1} h", s as f32 / 3600.0),
+    }
+}
 
 /// Great-circle distance between two positions in meters (haversine formula).
 fn haversine_m(a: Position, b: Position) -> f64 {
@@ -243,6 +308,26 @@ pub struct MyApp {
     telemetry: Option<Telemetry>,
     /// Latest WIO status/log line relayed by the board.
     board_log: Option<String>,
+    /// The board's own power and sleep settings, as it last reported them.
+    /// The controls read this rather than any local copy: the board is the
+    /// authority and changes these by itself (clamping, disarming stow).
+    board_settings: Option<Settings>,
+    /// The board's settings layout is newer than this build can decode, so
+    /// its settings are unknown rather than defaulted.
+    settings_unsupported: bool,
+    /// A stow arm waiting on confirmation, in seconds. Long stows put the
+    /// board out of reach for hours, so they are confirmed before writing.
+    stow_confirm: Option<u32>,
+    /// The stow interval the board last went to sleep for, once it has acked
+    /// an arm and dropped the link on purpose.
+    stowed: Option<u32>,
+    /// When the current connection came up. The GPS/LoRa rail only powers on
+    /// once a central connects, so telemetry is legitimately empty for the
+    /// first seconds and the Status page says warming up, not broken.
+    connected_at: Option<Instant>,
+    /// Wake-check and stow interval inputs (seconds) on the Settings page.
+    sleep_interval_text: String,
+    stow_interval_text: String,
     /// Which screen is currently shown.
     page: Page,
     /// Loaded configuration (marker colors, BLE settings).
@@ -349,6 +434,15 @@ impl MyApp {
             ble_ack_pending: false,
             telemetry: None,
             board_log: None,
+            board_settings: None,
+            settings_unsupported: false,
+            stow_confirm: None,
+            stowed: None,
+            connected_at: None,
+            // Both start at the low end of their clamp range, so a stray press
+            // arms the shortest sleep rather than the longest.
+            sleep_interval_text: ble::ESP_SLEEP_MIN_S.to_string(),
+            stow_interval_text: ble::ESP_STOW_MIN_S.to_string(),
             page: Page::Map,
             config: AppConfig::default(),
             // The path the auto-load below tries, so Save writes back to the
@@ -402,6 +496,15 @@ impl MyApp {
             BleCommand::Disconnect
         };
         let _ = self.ble.commands.send(cmd);
+    }
+
+    /// Queue one config write to the board and wait for its ack. The controls
+    /// stay disabled until the ack lands, so only one write is ever in flight
+    /// and the state shown is always one the board has confirmed.
+    pub(crate) fn send_config(&mut self, write: ConfigWrite) {
+        let _ = self.ble.commands.send(BleCommand::Config(write));
+        self.ble_ack = None;
+        self.ble_ack_pending = true;
     }
 
     /// Load the config file at `config_path`, recording a human-readable
@@ -702,7 +805,18 @@ impl MyApp {
         while let Ok(event) = self.ble.events.try_recv() {
             match event {
                 BleEvent::Status(s) => self.ble_status = s,
-                BleEvent::Connected(c) => self.ble_connected = c,
+                BleEvent::Connected(c) => {
+                    self.ble_connected = c;
+                    self.connected_at = c.then(Instant::now);
+                    if c {
+                        // A fresh link re-reads everything below; nothing from
+                        // the last session still describes the board.
+                        self.stowed = None;
+                        self.board_settings = None;
+                        self.settings_unsupported = false;
+                        self.telemetry = None;
+                    }
+                }
                 BleEvent::Fix(p) => {
                     self.beacon_packet = Some(p);
                     if p.has_fix() {
@@ -724,19 +838,33 @@ impl MyApp {
                 }
                 BleEvent::Ack(ack) => {
                     self.ble_ack_pending = false;
-                    self.ble_ack = Some(match ack.status {
-                        packet::ACK_OK => Ok(format!(
-                            "Device applied: interval {} ms",
-                            ack.value_u32.unwrap_or(0)
-                        )),
-                        packet::ACK_UNKNOWN_ID => {
-                            Err("Device rejected: unknown setting".to_string())
-                        }
-                        _ => Err("Device rejected: bad value".to_string()),
-                    });
+                    self.ble_ack = Some(ack_message(&ack));
                 }
                 BleEvent::Telemetry(t) => self.telemetry = Some(t),
                 BleEvent::Log(s) => self.board_log = Some(s),
+                BleEvent::Settings(s) => {
+                    // Seed the inputs from the board's own values the first
+                    // time it reports them, so the boxes open on what it is
+                    // actually set to. Later reports only move the controls
+                    // that mirror the board (the checkboxes and the "Board:"
+                    // lines), leaving anything half-typed alone.
+                    if self.board_settings.is_none() {
+                        self.ble_interval_text = s.notify_interval_ms.to_string();
+                        if s.sleep_interval_s > 0 {
+                            self.sleep_interval_text = s.sleep_interval_s.to_string();
+                        }
+                    }
+                    self.board_settings = Some(s);
+                    self.settings_unsupported = false;
+                }
+                BleEvent::SettingsUnsupported => {
+                    self.board_settings = None;
+                    self.settings_unsupported = true;
+                }
+                BleEvent::Stowed { secs } => {
+                    self.stowed = Some(secs);
+                    self.ble_ack_pending = false;
+                }
             }
         }
 

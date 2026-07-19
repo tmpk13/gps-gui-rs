@@ -1,14 +1,15 @@
 //! The non-map pages: the plain Data read-out, the searchable Points list, the
 //! board Status page, the Settings page, and the desktop manual-position bar.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use walkers::Position;
 
+use midair_proto::ble;
 use midair_proto::link::{TELEM_FLAG_CFG_LOADED, TELEM_FLAG_GPS_FIX, TELEM_FLAG_SD_OK};
 
-use crate::app::{MyApp, Page, PointFilter, RadioEdit, RegionSelect};
-use crate::ble::BleCommand;
+use crate::app::{secs_text, MyApp, Page, PointFilter, RadioEdit, RegionSelect};
+use crate::ble::ConfigWrite;
 use crate::config::DistanceUnits;
 use crate::gps::GpsFix;
 use crate::points::{age_text, PointSource, TrackPoint};
@@ -16,8 +17,14 @@ use crate::radio::{EditVal, FieldType};
 
 use super::{
     background_area, content_page, feedback_label, floating, icon_button, status_bool,
-    CORNER_MARGIN_FRAC, ERR_RED,
+    CORNER_MARGIN_FRAC, ERR_RED, OK_GREEN,
 };
+
+/// How long after connecting the board counts as warming up. The GPS/LoRa
+/// rail is off through sleep and through each wake window, and comes up only
+/// once a central connects, so the WIO has to boot and the GPS has to make a
+/// cold fix before there is anything to report.
+const BOARD_WARMUP: Duration = Duration::from_secs(45);
 
 /// Render the type-specific input for an unlocked radio field, bound to `val`.
 /// The kind of widget follows the field's type: a draggable number, a checkbox,
@@ -265,13 +272,36 @@ impl MyApp {
                 status_bool(ui, "Link", self.ble_connected);
                 ui.label(self.ble_status.as_str());
 
+                // The rail powering the WIO-E5 and the GPS comes up only once
+                // a central connects, so an empty read-out just after
+                // connecting is the board waking, not a fault.
+                let warming = self
+                    .connected_at
+                    .is_some_and(|t| t.elapsed() < BOARD_WARMUP);
+                let rail_off = self.board_settings.is_some_and(|s| !s.pwr_en);
+                if rail_off {
+                    ui.add_space(8.0);
+                    ui.label(
+                        "The GPS/LoRa power rail is switched off, so the WIO-E5 and the GPS \
+                         are unpowered and report nothing. Turn it on under Settings.",
+                    );
+                } else if warming {
+                    ui.add_space(8.0);
+                    ui.label(
+                        "Warming up: the rail powers on at connect, so the WIO-E5 is still \
+                         booting and the GPS is working on a cold fix.",
+                    );
+                }
+
                 let Some(t) = self.telemetry else {
                     ui.add_space(16.0);
-                    ui.label(
-                        "No board telemetry yet.\n\
-                         Waiting for the esp32c6-gps board (an esp32c3 \
-                         beacon does not report it).",
-                    );
+                    if !warming && !rail_off {
+                        ui.label(
+                            "No board telemetry yet.\n\
+                             Waiting for the esp32c6-gps board (an esp32c3 \
+                             beacon does not report it).",
+                        );
+                    }
                     if let Some(line) = &self.board_log {
                         ui.add_space(16.0);
                         ui.strong("Last message");
@@ -489,14 +519,11 @@ impl MyApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.ble_interval_text).desired_width(80.0),
                     );
-                    let apply = ui.add_enabled(self.ble_connected, egui::Button::new("Apply"));
+                    let ready = self.ble_connected && !self.ble_ack_pending;
+                    let apply = ui.add_enabled(ready, egui::Button::new("Apply"));
                     if apply.clicked() {
                         match self.ble_interval_text.trim().parse::<u32>() {
-                            Ok(ms) => {
-                                let _ = self.ble.commands.send(BleCommand::SetInterval(ms));
-                                self.ble_ack = None;
-                                self.ble_ack_pending = true;
-                            }
+                            Ok(ms) => self.send_config(ConfigWrite::Interval(ms)),
                             Err(_) => {
                                 self.ble_ack =
                                     Some(Err("Enter a whole number of milliseconds.".to_string()));
@@ -510,12 +537,242 @@ impl MyApp {
                     feedback_label(ui, &self.ble_ack);
                 }
 
+                ui.add_space(16.0);
+                ui.separator();
                 ui.add_space(8.0);
+                ui.heading("Board power and sleep");
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "ESP32-C6 settings. The board keeps these in flash, so they outlast a \
+                         power cycle.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(8.0);
+                self.board_power_ui(ui);
+
+                ui.add_space(16.0);
                 if ui.button("Reconnect").clicked() {
                     self.sync_ble_to_config();
                 }
             });
         });
+
+        // Same as the radio page: a nested Area inside the page's own Area
+        // misbehaves, so the confirmation is drawn at the top level.
+        self.stow_confirm_popup(ctx, screen);
+    }
+
+    /// The board's power rail, sleep switches and the two deep-sleep
+    /// intervals. Every control reads the board's own settings blob rather
+    /// than a local copy: the board is the authority, and it changes these by
+    /// itself (clamping an interval, disarming stow when you connect). A
+    /// control therefore only moves once the board reports that it moved.
+    fn board_power_ui(&mut self, ui: &mut egui::Ui) {
+        if let Some(secs) = self.stowed {
+            ui.colored_label(OK_GREEN, format!("Stowed for {}.", secs_text(secs)));
+            ui.label(
+                "The board acked and dropped the link on purpose; it is asleep now. It \
+                 advertises only briefly (about 15 s) on each wake, so reaching it again takes \
+                 a Reconnect timed to land in one of those windows - which also disarms the \
+                 stow.",
+            );
+            return;
+        }
+        if !self.ble_connected {
+            ui.label("Connect to the board to see and change these.");
+            return;
+        }
+        if self.settings_unsupported {
+            ui.colored_label(ERR_RED, "This board's firmware is newer than the app.");
+            ui.label(
+                "Its settings use a layout this build cannot decode, so what the board is set \
+                 to is unknown and these controls stay hidden rather than show defaults it \
+                 never reported. Update the app to change them.",
+            );
+            return;
+        }
+        let Some(s) = self.board_settings else {
+            ui.label("Reading the board's settings...");
+            return;
+        };
+
+        // One write at a time: while an ack is outstanding the board has not
+        // yet said what it applied, and these controls show only what it has.
+        let busy = self.ble_ack_pending;
+        ui.add_enabled_ui(!busy, |ui| {
+            let mut pwr = s.pwr_en;
+            if ui
+                .checkbox(&mut pwr, "GPS/LoRa power rail")
+                .on_hover_text("The LDO feeding both the WIO-E5 and the GPS")
+                .changed()
+            {
+                self.send_config(ConfigWrite::Flag {
+                    id: ble::CFG_PWR_EN,
+                    on: pwr,
+                });
+            }
+            let mut wio = s.wio_sleep;
+            if ui
+                .checkbox(&mut wio, "WIO-E5 asleep")
+                .on_hover_text("Soft sleep over the UART link, radio and GPS logging stop")
+                .changed()
+            {
+                self.send_config(ConfigWrite::Flag {
+                    id: ble::CFG_WIO_SLEEP,
+                    on: wio,
+                });
+            }
+            let mut gps = s.gps_sleep;
+            if ui
+                .checkbox(&mut gps, "GPS in backup mode")
+                .on_hover_text("The next fix after waking is a cold one")
+                .changed()
+            {
+                self.send_config(ConfigWrite::Flag {
+                    id: ble::CFG_GPS_SLEEP,
+                    on: gps,
+                });
+            }
+        });
+
+        ui.add_space(12.0);
+        ui.strong("Wake check");
+        ui.label(
+            egui::RichText::new(format!(
+                "While this is set the board deep-sleeps whenever nothing is connected and \
+                 wakes every interval to advertise briefly. The GPS/LoRa rail stays off \
+                 throughout. Clamped to {} - {}.",
+                secs_text(ble::ESP_SLEEP_MIN_S),
+                secs_text(ble::ESP_SLEEP_MAX_S),
+            ))
+            .weak(),
+        );
+        let width = ui.text_style_height(&egui::TextStyle::Body) * 5.0;
+        ui.horizontal(|ui| {
+            ui.label("Every (s):");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sleep_interval_text).desired_width(width),
+            );
+            if ui.add_enabled(!busy, egui::Button::new("Apply")).clicked() {
+                match self.sleep_interval_text.trim().parse::<u32>() {
+                    Ok(secs) => self.send_config(ConfigWrite::Seconds {
+                        id: ble::CFG_ESP_SLEEP_S,
+                        secs,
+                    }),
+                    Err(_) => {
+                        self.ble_ack = Some(Err("Enter a whole number of seconds.".to_string()));
+                    }
+                }
+            }
+            let can_disable = !busy && s.sleep_interval_s > 0;
+            if ui
+                .add_enabled(can_disable, egui::Button::new("Disable"))
+                .on_hover_text("Stop the board sleeping at all")
+                .clicked()
+            {
+                self.send_config(ConfigWrite::Seconds {
+                    id: ble::CFG_ESP_SLEEP_S,
+                    secs: 0,
+                });
+            }
+        });
+        ui.label(match s.sleep_interval_s {
+            0 => "Board: sleep disabled.".to_string(),
+            secs => format!("Board: waking every {}.", secs_text(secs)),
+        });
+
+        ui.add_space(12.0);
+        ui.strong("Stow");
+        ui.label(
+            egui::RichText::new(format!(
+                "One long sleep for storage or transport. The board acks, drops the link and \
+                 sleeps at once; connecting again disarms it, so it reads as off while you are \
+                 linked. Clamped to {} - {}.",
+                secs_text(ble::ESP_STOW_MIN_S),
+                secs_text(ble::ESP_STOW_MAX_S),
+            ))
+            .weak(),
+        );
+        ui.horizontal(|ui| {
+            ui.label("For (s):");
+            ui.add(egui::TextEdit::singleline(&mut self.stow_interval_text).desired_width(width));
+            if ui
+                .add_enabled(!busy, egui::Button::new("Arm"))
+                .on_hover_text("Asks for confirmation: this puts the board out of reach")
+                .clicked()
+            {
+                match self.stow_interval_text.trim().parse::<u32>() {
+                    Ok(secs) if secs > 0 => self.stow_confirm = Some(secs),
+                    Ok(_) => {
+                        self.ble_ack =
+                            Some(Err("Zero would disarm stow, not arm it.".to_string()));
+                    }
+                    Err(_) => {
+                        self.ble_ack = Some(Err("Enter a whole number of seconds.".to_string()));
+                    }
+                }
+            }
+        });
+        if s.stow_interval_s > 0 {
+            ui.label(format!(
+                "Board: armed for {}.",
+                secs_text(s.stow_interval_s)
+            ));
+        }
+    }
+
+    /// Arming a stow is confirmed first: it disconnects immediately and leaves
+    /// the board unreachable except during its brief wake windows, which for a
+    /// multi-hour interval is a long time to be locked out.
+    fn stow_confirm_popup(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let Some(secs) = self.stow_confirm else {
+            return;
+        };
+        // The board clamps what it is given, so confirm against the interval
+        // it will really use rather than the one that was typed.
+        let applied = secs.clamp(ble::ESP_STOW_MIN_S, ble::ESP_STOW_MAX_S);
+        floating(
+            ctx,
+            "stow_confirm",
+            egui::Order::Foreground,
+            screen.center(),
+            egui::Align2::CENTER_CENTER,
+            false,
+            |ui| {
+                ui.strong(format!("Stow the board for {}?", secs_text(applied)));
+                ui.add_space(8.0);
+                ui.label(format!(
+                    "It disconnects straight away, and you will not be able to reach it for up \
+                     to {}. Each wake advertises for only about 15 s, so getting back in takes \
+                     a well-timed Reconnect.",
+                    secs_text(applied)
+                ));
+                if applied != secs {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{secs} s is outside the board's range, so it will use {applied} s."
+                        ))
+                        .weak(),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Stow").clicked() {
+                        self.send_config(ConfigWrite::Seconds {
+                            id: ble::CFG_ESP_STOW_S,
+                            secs,
+                        });
+                        self.stow_confirm = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.stow_confirm = None;
+                    }
+                });
+            },
+        );
     }
 
     /// The radio page: load the WIO-E5 RADIO.TOML, edit each setting with a

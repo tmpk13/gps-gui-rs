@@ -22,7 +22,7 @@ use gps_proto::packet::{self, PositionPacket};
 use midair_proto::ble;
 use midair_proto::link::Telemetry;
 
-use super::{BleCommand, BleEvent, BleHandle};
+use super::{settings_event, stow_armed, BleCommand, BleEvent, BleHandle, ConfigWrite};
 
 /// The compiled dex with rs.gps.gui.BleBridge (see android/build-dex.sh).
 const BRIDGE_DEX: &[u8] = include_bytes!("../../assets/ble-bridge.dex");
@@ -186,7 +186,7 @@ fn worker(
 
     let mut wanted_connect = false;
     let mut mac: Option<String> = None;
-    let mut writes: Vec<u32> = Vec::new();
+    let mut writes: Vec<ConfigWrite> = Vec::new();
     let mut permissions_done = false;
 
     loop {
@@ -228,7 +228,7 @@ fn drain_commands(
     cmd_rx: &Receiver<BleCommand>,
     wanted_connect: &mut bool,
     mac: &mut Option<String>,
-    writes: &mut Vec<u32>,
+    writes: &mut Vec<ConfigWrite>,
 ) -> Result<(), ()> {
     loop {
         match cmd_rx.try_recv() {
@@ -237,7 +237,7 @@ fn drain_commands(
                 *mac = m;
             }
             Ok(BleCommand::Disconnect) => *wanted_connect = false,
-            Ok(BleCommand::SetInterval(ms)) => writes.push(ms),
+            Ok(BleCommand::Config(w)) => writes.push(w),
             Err(TryRecvError::Empty) => return Ok(()),
             Err(TryRecvError::Disconnected) => return Err(()),
         }
@@ -254,7 +254,7 @@ fn session(
     cmd_rx: &Receiver<BleCommand>,
     wanted_connect: &mut bool,
     mac: &mut Option<String>,
-    writes: &mut Vec<u32>,
+    writes: &mut Vec<ConfigWrite>,
 ) -> Result<(), String> {
     let session_mac = mac.clone();
 
@@ -319,8 +319,10 @@ fn session(
         .map_err(|_| "subscribe timed out")?;
     }
     // Optional board-status subscriptions (esp32c6-gps; absent on the c3
-    // beacon, so a missing characteristic is not an error).
-    for chr in [ble::TELEMETRY_UUID, ble::LOG_UUID] {
+    // beacon, so a missing characteristic is not an error). Settings is
+    // subscribed before it is read below, so a change the board makes between
+    // the two (it disarms stow on connect) still reaches us.
+    for chr in [ble::TELEMETRY_UUID, ble::LOG_UUID, ble::SETTINGS_UUID] {
         if bridge.set_notify(packet::SERVICE_UUID, chr, true) {
             let _ = wait_for(cb_rx, Duration::from_secs(5), |cb| {
                 matches!(cb, Cb::DescriptorWrite { status: 0 })
@@ -331,10 +333,20 @@ fn session(
     report.send(BleEvent::Connected(true));
     report.status(format!("connected to {address}"));
 
+    // Populate the board controls from the board itself rather than assuming
+    // defaults for settings it holds in flash across power cycles. The shim
+    // routes the read value through the notify callback, so the pump below
+    // decodes it on the same path a change notification takes.
+    bridge.read_characteristic(packet::SERVICE_UUID, ble::SETTINGS_UUID);
+
+    // Set once the board acks a stow arm: the disconnect that follows is the
+    // board sleeping as asked, not a fault.
+    let mut stow: Option<u32> = None;
+
     // Pump: notifications out, commands in, until disconnect.
     loop {
-        for ms in writes.drain(..) {
-            let (buf, n) = packet::encode_config(packet::ConfigCommand::UpdateIntervalMs(ms));
+        for w in writes.drain(..) {
+            let (buf, n) = w.encode();
             if !bridge.write_characteristic(packet::SERVICE_UUID, packet::CONFIG_UUID, &buf[..n]) {
                 report.status("config write failed");
             }
@@ -348,6 +360,7 @@ fn session(
                     }
                 } else if uuid.eq_ignore_ascii_case(packet::ACK_UUID) {
                     if let Some(a) = packet::parse_ack(&value) {
+                        stow = stow.or(stow_armed(&a));
                         report.send(BleEvent::Ack(a));
                     }
                 } else if uuid.eq_ignore_ascii_case(ble::TELEMETRY_UUID) {
@@ -356,9 +369,23 @@ fn session(
                     }
                 } else if uuid.eq_ignore_ascii_case(ble::LOG_UUID) {
                     report.send(BleEvent::Log(String::from_utf8_lossy(&value).into_owned()));
+                } else if uuid.eq_ignore_ascii_case(ble::SETTINGS_UUID) {
+                    report.send(settings_event(&value));
                 }
             }
-            Ok(Cb::ConnectionState { new_state: 0 }) => return Err("connection lost".into()),
+            // After the board acks a stow arm it drops the link on purpose, so
+            // report the sleep and stop connecting: reconnecting would only
+            // disarm the stow that was just asked for.
+            Ok(Cb::ConnectionState { new_state: 0 }) => {
+                let Some(secs) = stow else {
+                    return Err("connection lost".into());
+                };
+                bridge.disconnect();
+                *wanted_connect = false;
+                report.send(BleEvent::Stowed { secs });
+                report.send(BleEvent::Connected(false));
+                return Ok(());
+            }
             Ok(Cb::WriteDone { status }) if status != 0 => {
                 report.status(format!("config write rejected (status {status})"));
             }
@@ -590,6 +617,22 @@ impl Bridge<'_> {
                     JValue::Object(&chr),
                     JValue::Bool(enable as u8),
                 ],
+            )?
+            .z()
+        })
+        .unwrap_or(false)
+    }
+
+    /// The value comes back through the notify callback, not a return value.
+    fn read_characteristic(&mut self, service: &str, chr: &str) -> bool {
+        self.scoped(8, |env, class| {
+            let service = env.new_string(service)?;
+            let chr = env.new_string(chr)?;
+            env.call_static_method(
+                class,
+                "readCharacteristic",
+                "(Ljava/lang/String;Ljava/lang/String;)Z",
+                &[JValue::Object(&service), JValue::Object(&chr)],
             )?
             .z()
         })
