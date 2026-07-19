@@ -15,8 +15,12 @@ The UI is [egui](https://docs.rs/egui) in immediate mode, driven each frame by
     layout constants, the page-menu dropdown, and the floating corner toggle.
   - `map.rs` - the interactive map page: the map itself, the controls bar,
     marker info popups, and the offline region-download selection/progress.
-  - `pages.rs` - the non-map pages: Data, Points, Status, Settings, and the
-    desktop manual-position bar.
+  - `pages.rs` - the non-map pages: Data, Points, Status, Settings, Radio, and
+    the desktop manual-position bar.
+
+The page renderers read state that lives outside the UI too: `src/config.rs`
+holds the app's own TOML settings, and `src/radio.rs` holds the WIO-E5
+RADIO.TOML model the Radio page edits (see below).
 
 The split is deliberate: `app.rs` reads as state + logic, the `ui` modules read
 as "how each page is drawn". Add new state to `MyApp`; add new drawing to a
@@ -122,8 +126,10 @@ edges. The key wrinkles:
   beacon rides near the top and the user near the bottom. It reuses
   `smoothed_heading` (tracking bearing and heading-up are mutually exclusive) and
   locks pan/zoom on every platform (the center and zoom are recomputed each
-  frame). Tapping the track button enters the mode and then cycles beacons; the
-  heading button exits it.
+  frame). The track button is the only way in and out: tapping it enters the
+  mode, walks along the beacon list, and leaves the mode on the press after the
+  last beacon. The heading button is hidden while tracking (which owns the map's
+  orientation), as it is whenever no heading source is available at all.
 - **Zoom is driven manually.** The map lives in a `Background` area, and
   walkers' built-in zoom only fires when the map is the top interactable layer
   under the pointer - which a background area never is. So walkers' zoom gesture
@@ -138,9 +144,16 @@ edges. The key wrinkles:
   closest one within a hit radius; a miss dismisses the popup.
 - **Overlay drawing (`marker.rs`).** `GpsLayer` draws the track, beacon, and the
   line between them. Sizes come from the config `[sizes]` table (each overlay is
-  independent). The user->beacon line is dotted when `[distance] dotted`, and
-  labelled with the distance (units from `[distance]`, drawn above the line's
-  midpoint) when `[distance] show` - both toggleable on the Settings page.
+  independent). The user->beacon line is dotted when `[distance] dotted` - both
+  it and the distance label below are toggleable on the Settings page.
+- **The distance label** (`MyApp::distance_label`, units from `[distance]`, shown
+  when `[distance] show`) is the one overlay NOT drawn by the plugin. Text needs
+  an angle as well as a position, and leaving that to the rotation pass left the
+  glyphs level, so the label is painted after the pass with both set outright: it
+  projects the user and beacon the same way the plugin does, turns the midpoint
+  about the same pivot, and hands the map's angle to the text. It is painted as
+  eight offset copies in the contrasting theme color (the outline) under the
+  label itself, all sharing one laid-out galley.
 
 ## Offline region download flow
 
@@ -162,6 +175,36 @@ Confirm`.
 
 The actual tiling/fetching lives in `src/offline.rs`; the UI only drives the
 selection and shows progress.
+
+## The Radio config page (`pages.rs` + `radio.rs`)
+
+The Radio page loads the WIO-E5 `RADIO.TOML` (the firmware's own config, not the
+app's) and edits it in place. The model lives in `src/radio.rs`; the page in
+`radio_page`.
+
+- **Model (`radio.rs`).** `RadioDoc` wraps a `toml_edit::DocumentMut` (the source
+  of truth for values) plus an ordered `Vec<RadioField>` of the editable
+  settings. `toml_edit` is used precisely so a load/edit/save round-trip keeps
+  the file's comments and its `<key>_description` help strings; only the edited
+  value's text changes (its surrounding whitespace/decor is preserved).
+- **Types.** Each field renders with an input matched to its type
+  (`FieldType`): a `DragValue` for int/float, a checkbox for bool, a text field
+  for a string, and a dropdown for an `Enum`. The type is inferred from the TOML
+  value, but a sibling `<key>_type` string overrides it -
+  `"int"`/`"float"`/`"bool"`/`"string"`, or `"enum:a,b,c"` for a dropdown. The
+  `<key>_description` and `<key>_type` keys are treated as metadata and never
+  shown as their own rows.
+- **Per-field edit lock.** State is `RadioEdit` (in `app.rs`): `None ->
+  Confirm -> Active`. A field is read-only with a pencil button; pressing it
+  opens the floating Edit/Cancel confirm popup (`radio_confirm_popup`);
+  confirming unlocks the typed input with a check (set, writes the value into the
+  document via `RadioDoc::apply`) and an x (cancel). Only one field is in flight
+  at a time - the other pencils are disabled while editing.
+- **Backups.** `Save` copies the previous on-disk file into a `radio-backups`
+  directory next to it, under a timestamped name, before overwriting. The
+  collapsible "Backups" list shows them newest-first; "Restore" loads one back
+  into the editor (unsaved until the next Save). The document tracks a `dirty`
+  flag, surfaced as `Save *`.
 
 ## Manual position bar (desktop)
 

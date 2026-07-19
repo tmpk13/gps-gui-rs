@@ -23,6 +23,10 @@ log = "0.4"
 # they cross-compile to Android unchanged.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Editing the WIO-E5 RADIO.TOML in place: a load/edit/save round-trip that keeps
+# the file's comments and `<key>_description` help strings. Already in the tree
+# via `toml`, and pure Rust so it cross-compiles to Android unchanged.
+toml_edit = "0.22"
 # SVG button icons (resvg is pure Rust, so it cross-compiles to Android).
 egui_extras = { version = "0.35", features = ["svg"] }
 # Shared BLE protocol with the esp32c3-gps firmware (lives in the same parent

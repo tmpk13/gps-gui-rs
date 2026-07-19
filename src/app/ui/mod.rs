@@ -177,7 +177,7 @@ fn color_swatch(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
 
 /// Every page in menu order, each with its label and icon. Drives the page
 /// dropdown menu.
-fn page_items() -> [(Page, &'static str, egui::ImageSource<'static>); 5] {
+fn page_items() -> [(Page, &'static str, egui::ImageSource<'static>); 6] {
     [
         (
             Page::Map,
@@ -203,6 +203,11 @@ fn page_items() -> [(Page, &'static str, egui::ImageSource<'static>); 5] {
             Page::Settings,
             "Settings",
             egui::include_image!("../../../assets/icons/settings.svg"),
+        ),
+        (
+            Page::Radio,
+            "Radio",
+            egui::include_image!("../../../assets/icons/radio.svg"),
         ),
     ]
 }

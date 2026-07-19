@@ -28,3 +28,7 @@ Look into lowering power useage for BLE. Minimum req.
 Make sure accelerometer is only on/used when in heading mode.
 
 Set font?
+
+Remove toml veiw from settings change this to have a generate file and reset to defaults button.
+
+Make page menu % size.

@@ -15,6 +15,7 @@ use crate::config::AppConfig;
 use crate::gps::GpsFix;
 use crate::offline::{self, DownloadProgress};
 use crate::points::{PointSource, TrackPoint};
+use crate::radio::{EditVal, RadioDoc};
 use crate::tiles::{MapLayer, OpenTopoMap};
 
 /// The view layer (page rendering + shared egui scaffolding). Kept in a
@@ -74,6 +75,26 @@ pub enum Page {
     Status,
     /// Loading the TOML config file (marker colors, BLE beacon).
     Settings,
+    /// Viewing and editing the WIO-E5 RADIO.TOML (radio, mesh, beacon, GPS).
+    Radio,
+}
+
+/// Per-field edit flow on the Radio page. Only one field is in flight at a time:
+/// the pencil opens the confirm popup, confirming unlocks the typed input, and
+/// the check/x commit or discard.
+#[derive(Clone, Default)]
+pub enum RadioEdit {
+    /// No field is being edited.
+    #[default]
+    None,
+    /// The confirm popup is open for this field (Edit / Cancel).
+    Confirm { section: String, key: String },
+    /// The field is unlocked with a typed input plus a check and an x.
+    Active {
+        section: String,
+        key: String,
+        val: EditVal,
+    },
 }
 
 /// Box-selection state for the offline region download on the map page.
@@ -212,6 +233,14 @@ pub struct MyApp {
     config_path: String,
     /// Result of the last load attempt: `Ok` message (green) or error (red).
     config_feedback: Option<Result<String, String>>,
+    /// The WIO-E5 RADIO.TOML being edited on the Radio page, once loaded.
+    radio: Option<RadioDoc>,
+    /// The RADIO.TOML path typed on the Radio page.
+    radio_path: String,
+    /// Result of the last radio load/save: `Ok` message (green) or error (red).
+    radio_feedback: Option<Result<String, String>>,
+    /// Per-field edit flow on the Radio page.
+    radio_edit: RadioEdit,
     /// Tile cache directory; also the target of offline region downloads.
     cache_dir: Option<PathBuf>,
     /// Box-selection state for the offline region download.
@@ -301,6 +330,10 @@ impl MyApp {
             config: AppConfig::default(),
             config_path: String::new(),
             config_feedback: None,
+            radio: None,
+            radio_path: "RADIO.toml".to_string(),
+            radio_feedback: None,
+            radio_edit: RadioEdit::None,
             cache_dir,
             select: RegionSelect::Inactive,
             download: None,
@@ -360,6 +393,43 @@ impl MyApp {
         });
     }
 
+    /// Load the RADIO.TOML at `radio_path`, recording a human-readable result
+    /// for the Radio page to show and clearing any in-flight edit.
+    fn load_radio(&mut self) {
+        let path = self.radio_path.trim().to_string();
+        if path.is_empty() {
+            self.radio_feedback = Some(Err("Enter a file path.".to_string()));
+            return;
+        }
+        self.radio_edit = RadioEdit::None;
+        self.radio_feedback = Some(match RadioDoc::load(&path) {
+            Ok(doc) => {
+                self.radio = Some(doc);
+                Ok(format!("Loaded {path}"))
+            }
+            Err(e) => Err(e),
+        });
+    }
+
+    /// Write the edited RADIO.TOML back, backing up the previous file first.
+    fn save_radio(&mut self) {
+        let Some(doc) = self.radio.as_mut() else {
+            return;
+        };
+        self.radio_feedback = Some(match doc.save() {
+            Ok(Some(backup)) => {
+                let name = backup
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(format!("Saved. Backed up previous version as {name}"))
+            }
+            Ok(None) => Ok("Saved.".to_string()),
+            Err(e) => Err(e),
+        });
+    }
+
     /// Safe-area inset at the top (status bar) in egui points.
     fn top_inset(&self, ctx: &egui::Context) -> f32 {
         match &self.insets {
@@ -403,9 +473,15 @@ impl MyApp {
     /// or a position is missing.
     fn tracking_orientation(&mut self, ctx: &egui::Context, screen: egui::Rect) -> Option<f32> {
         let idx = self.tracking_beacon?;
-        let user = self.current?;
         let beacons = self.beacon_positions();
-        let &beacon = beacons.get(idx)?;
+        // Tracking needs both the user position and the chosen beacon. If either
+        // is gone (no fix yet, beacon disconnected, index now out of range),
+        // leave tracking mode and return `None` so the map unlocks instead of
+        // freezing on a view it can no longer manage.
+        let (Some(user), Some(&beacon)) = (self.current, beacons.get(idx)) else {
+            self.tracking_beacon = None;
+            return None;
+        };
 
         // Center between the two so, once the map is turned to put the beacon
         // straight up, they sit symmetrically about the middle of the screen.
@@ -427,7 +503,7 @@ impl MyApp {
         if have > 1.0 && want > 1.0 {
             let current = self.map_memory.zoom();
             let target = (current + (want / have).log2()).clamp(TRACK_ZOOM_MIN, TRACK_ZOOM_MAX);
-            let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+            let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1) as f64;
             let alpha = 1.0 - (-dt / 0.12).exp();
             let _ = self.map_memory.set_zoom(current + (target - current) * alpha);
             if (target - current).abs() > 0.01 {
@@ -533,6 +609,7 @@ impl eframe::App for MyApp {
             Page::Points => self.points_page(&ctx, screen),
             Page::Status => self.status_page(&ctx, screen),
             Page::Settings => self.settings_page(&ctx, screen),
+            Page::Radio => self.radio_page(&ctx, screen),
         }
 
         // Every page but the map gets the floating corner toggle; on the map

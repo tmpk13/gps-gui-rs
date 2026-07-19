@@ -5,6 +5,7 @@ pub mod gps;
 pub mod marker;
 pub mod offline;
 pub mod points;
+pub mod radio;
 pub mod tiles;
 
 #[cfg(target_os = "android")]
