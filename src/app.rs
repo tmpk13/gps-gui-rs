@@ -14,6 +14,7 @@ use crate::config::AppConfig;
 use crate::gps::GpsFix;
 use crate::offline::{self, DownloadProgress};
 use crate::points::{PointSource, TrackPoint};
+use crate::tiles::{MapLayer, OpenTopoMap};
 
 /// The view layer (page rendering + shared egui scaffolding). Kept in a
 /// submodule so this file holds only state and the core update logic; the
@@ -124,7 +125,13 @@ fn http_options(cache_dir: Option<PathBuf>) -> HttpOptions {
 }
 
 pub struct MyApp {
+    /// Standard OpenStreetMap tiles.
     tiles: HttpTiles,
+    /// OpenTopoMap topographic tiles, shown when `layer` is `Topo`. Both share
+    /// the same on-disk cache (keyed by URL) and the same `map_memory`.
+    topo_tiles: HttpTiles,
+    /// Which tile layer is currently drawn.
+    layer: MapLayer,
     map_memory: MapMemory,
     /// Live GPS fixes, when a source is wired up (Android GNSS). `None` on
     /// desktop, where the manual position bar is shown instead.
@@ -203,6 +210,10 @@ pub struct MyApp {
     /// level to snap to (nearest cached tile) here when it finds we are offline.
     zoom_tx: Sender<f64>,
     zoom_rx: Receiver<f64>,
+    /// Width the map controls row took last frame, used to center it (egui
+    /// can't center a horizontal row in a single layout pass). `0.0` until the
+    /// first frame has measured it.
+    controls_width: f32,
 }
 
 impl MyApp {
@@ -227,7 +238,17 @@ impl MyApp {
         let (zoom_tx, zoom_rx) = std::sync::mpsc::channel();
 
         let mut app = Self {
-            tiles: HttpTiles::with_options(OpenStreetMap, http_options(cache_dir.clone()), ctx),
+            tiles: HttpTiles::with_options(
+                OpenStreetMap,
+                http_options(cache_dir.clone()),
+                ctx.clone(),
+            ),
+            topo_tiles: HttpTiles::with_options(
+                OpenTopoMap,
+                http_options(cache_dir.clone()),
+                ctx,
+            ),
+            layer: MapLayer::Standard,
             map_memory: MapMemory::default(),
             gps_rx,
             compass_rx,
@@ -266,6 +287,7 @@ impl MyApp {
             selected_marker: None,
             zoom_tx,
             zoom_rx,
+            controls_width: 0.0,
         };
 
         // Auto-load ./gps-config.toml when present (desktop convenience); the

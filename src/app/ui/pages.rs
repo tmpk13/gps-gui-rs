@@ -7,7 +7,7 @@ use walkers::Position;
 
 use midair_proto::link::{TELEM_FLAG_CFG_LOADED, TELEM_FLAG_GPS_FIX, TELEM_FLAG_SD_OK};
 
-use crate::app::{MyApp, Page, PointFilter};
+use crate::app::{MyApp, Page, PointFilter, RegionSelect};
 use crate::ble::BleCommand;
 use crate::gps::GpsFix;
 use crate::points::{age_text, TrackPoint};
@@ -306,6 +306,31 @@ impl MyApp {
             ui.label("Marker colors:");
             color_swatch(ui, "track", self.config.colors.track);
             color_swatch(ui, "beacon", self.config.colors.fixed);
+
+            // Offline maps: start a region download. Only when tiles are cached
+            // to disk; jumps to the map and begins the box selection there.
+            if self.cache_dir.is_some() {
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.heading("Offline maps");
+                ui.add_space(8.0);
+                let downloading = self.download.is_some();
+                if ui
+                    .add_enabled(!downloading, egui::Button::new("Download region"))
+                    .on_hover_text("Pick a box on the map to cache for offline use")
+                    .clicked()
+                {
+                    self.page = Page::Map;
+                    self.select = RegionSelect::Picking {
+                        start: None,
+                        current: None,
+                    };
+                }
+                if downloading {
+                    ui.label("A download is already in progress.");
+                }
+            }
 
             ui.add_space(16.0);
             ui.separator();

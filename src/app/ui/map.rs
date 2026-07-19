@@ -6,12 +6,13 @@ use std::time::SystemTime;
 
 use egui::emath::Rot2;
 use egui::{Pos2, Shape};
-use walkers::{lat_lon, Map, Position, Projector};
+use walkers::{lat_lon, Map, Position, Projector, Tiles};
 
 use crate::app::{MarkerKind, MyApp, RegionSelect};
 use crate::marker::GpsLayer;
 use crate::offline;
 use crate::points::age_text;
+use crate::tiles::MapLayer;
 
 use super::{floating, icon_button, icon_button_pulse, icon_size_for, ERR_RED};
 
@@ -34,10 +35,21 @@ impl MyApp {
     fn controls(&mut self, ui: &mut egui::Ui, screen: egui::Rect) {
         let icon = icon_size_for(screen);
         ui.spacing_mut().button_padding = egui::vec2(icon * 0.7, icon * 0.45);
-        // Center the row in the full-width bar so the leftover space is even on
-        // both sides.
-        ui.vertical_centered(|ui| {
-            ui.horizontal(|ui| {
+        // egui lays a horizontal row out left-to-right and can't center it in a
+        // single pass: its `main_align` is ignored and the row just fills the
+        // width of any centering parent. So pad the left by half the leftover
+        // space, using the row width measured last frame (it stays constant once
+        // the button set is fixed). `add_space` counts as an item, so drop one
+        // item spacing to keep the gap even on both sides.
+        let spacing = ui.spacing().item_spacing.x;
+        let pad = if self.controls_width > 0.0 {
+            ((ui.available_width() - self.controls_width) * 0.5 - spacing).max(0.0)
+        } else {
+            0.0
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(pad);
+            let row = ui.horizontal(|ui| {
                 // Center on the user marker if we have a fix; otherwise fall back
                 // to the next available marker (the beacon). With no marker at
                 // all the button pulses red and does nothing when clicked.
@@ -71,6 +83,7 @@ impl MyApp {
                             self.map_memory.zoom().round().clamp(0.0, 19.0) as u8;
                         offline::spawn_offline_zoom(
                             dir,
+                            self.layer,
                             pos,
                             current_zoom,
                             self.zoom_tx.clone(),
@@ -98,17 +111,43 @@ impl MyApp {
                     self.heading_up = !self.heading_up;
                 }
 
-                if icon_button(ui, icon, egui::include_image!("../../../assets/icons/zoom-in.svg"))
-                    .on_hover_text("Zoom in")
+                // Base-layer toggle: like the rotate button, the glyph shows the
+                // layer it switches TO (a mountain for topo, the map for OSM).
+                let (layer_icon, layer_hint) = match self.layer {
+                    MapLayer::Standard => (
+                        egui::include_image!("../../../assets/icons/topo.svg"),
+                        "Topographic map",
+                    ),
+                    MapLayer::Topo => (
+                        egui::include_image!("../../../assets/icons/map.svg"),
+                        "Standard map",
+                    ),
+                };
+                if icon_button(ui, icon, layer_icon)
+                    .on_hover_text(layer_hint)
                     .clicked()
                 {
-                    let _ = self.map_memory.zoom_in();
+                    self.layer = match self.layer {
+                        MapLayer::Standard => MapLayer::Topo,
+                        MapLayer::Topo => MapLayer::Standard,
+                    };
                 }
-                if icon_button(ui, icon, egui::include_image!("../../../assets/icons/zoom-out.svg"))
-                    .on_hover_text("Zoom out")
-                    .clicked()
-                {
-                    let _ = self.map_memory.zoom_out();
+
+                // Zoom buttons are desktop-only; on mobile pinch-zoom handles
+                // it, so the buttons would only crowd the small toolbar.
+                if !cfg!(target_os = "android") {
+                    if icon_button(ui, icon, egui::include_image!("../../../assets/icons/zoom-in.svg"))
+                        .on_hover_text("Zoom in")
+                        .clicked()
+                    {
+                        let _ = self.map_memory.zoom_in();
+                    }
+                    if icon_button(ui, icon, egui::include_image!("../../../assets/icons/zoom-out.svg"))
+                        .on_hover_text("Zoom out")
+                        .clicked()
+                    {
+                        let _ = self.map_memory.zoom_out();
+                    }
                 }
                 if icon_button(ui, icon, egui::include_image!("../../../assets/icons/clear.svg"))
                     .on_hover_text("Clear tracks")
@@ -118,33 +157,15 @@ impl MyApp {
                     self.beacon_track.clear();
                 }
 
-                // Offline region download: only when tiles are cached to disk,
-                // and one download at a time.
-                if self.cache_dir.is_some() && self.download.is_none() {
-                    let selecting = !matches!(self.select, RegionSelect::Inactive);
-                    let hint = if selecting {
-                        "Cancel region selection"
-                    } else {
-                        "Download region"
-                    };
-                    if icon_button(ui, icon, egui::include_image!("../../../assets/icons/download.svg"))
-                        .on_hover_text(hint)
-                        .clicked()
-                    {
-                        self.select = if selecting {
-                            RegionSelect::Inactive
-                        } else {
-                            RegionSelect::Picking {
-                                start: None,
-                                current: None,
-                            }
-                        };
-                    }
-                }
+                // The region download is started from the Settings page, which
+                // jumps back here with the box selection already active.
 
                 // The page menu sits inline, right after the other buttons.
                 self.page_menu(ui, icon);
             });
+            // Remember the row's own width (the inner group, excluding the pad)
+            // so the next frame can center it.
+            self.controls_width = row.response.rect.width();
         });
     }
 
@@ -225,7 +246,13 @@ impl MyApp {
         let allow_pan = !locked && !pinching && !picking;
 
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(map_rect));
-        let map = Map::new(Some(&mut self.tiles), &mut self.map_memory, my_position)
+        // Draw whichever base layer is selected; both share `map_memory` (so the
+        // view is unchanged by the switch) and the on-disk cache.
+        let tiles: &mut dyn Tiles = match self.layer {
+            MapLayer::Standard => &mut self.tiles,
+            MapLayer::Topo => &mut self.topo_tiles,
+        };
+        let map = Map::new(Some(tiles), &mut self.map_memory, my_position)
             .with_plugin(layer)
             // We drive zoom manually above on both platforms (walkers' own zoom
             // gate does not fire for a background Area), so turn its gesture off.
@@ -518,6 +545,7 @@ impl MyApp {
         match self.select {
             RegionSelect::Inactive => {}
             RegionSelect::Picking { .. } => {
+                let mut cancel = false;
                 floating(
                     ctx,
                     "select_hint",
@@ -526,12 +554,22 @@ impl MyApp {
                     egui::Align2::CENTER_TOP,
                     false,
                     |ui| {
-                        ui.label("Drag a box over the region to download");
+                        ui.horizontal(|ui| {
+                            ui.label("Drag a box over the region to download");
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
                     },
                 );
+                if cancel {
+                    self.select = RegionSelect::Inactive;
+                }
             }
             RegionSelect::Confirm { a, b, mut max_zoom } => {
                 let mut close = false;
+                // Topo tiles stop at zoom 17; don't offer levels the server 404s.
+                let layer_max = self.layer.max_zoom();
                 floating(
                     ctx,
                     "select_confirm",
@@ -549,7 +587,7 @@ impl MyApp {
                                 max_zoom -= 1;
                             }
                             ui.label(format!("{max_zoom}"));
-                            if ui.add_enabled(max_zoom < 19, egui::Button::new("+")).clicked() {
+                            if ui.add_enabled(max_zoom < layer_max, egui::Button::new("+")).clicked() {
                                 max_zoom += 1;
                             }
                         });
@@ -575,6 +613,7 @@ impl MyApp {
                                 if let Some(dir) = &self.cache_dir {
                                     self.download = Some(offline::spawn_download(
                                         dir.clone(),
+                                        self.layer,
                                         offline::region_tiles(a, b, max_zoom),
                                         ctx.clone(),
                                     ));

@@ -16,8 +16,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use http_cache_reqwest::{CACacheManager, Cache, CacheMode, HttpCache, HttpCacheOptions};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
-use walkers::sources::{OpenStreetMap, TileSource};
 use walkers::{Position, TileId};
+
+use crate::tiles::MapLayer;
 
 /// One user agent for both the map widget and this downloader, so every cache
 /// entry is written and read with identical headers (and the tile server sees
@@ -81,37 +82,46 @@ pub fn region_tiles(a: Position, b: Position, max_zoom: u8) -> Vec<TileId> {
 }
 
 /// The cacache key walkers and the downloader store a tile under: the HTTP
-/// cache keys by `"<METHOD>:<url>"`, and every tile is a plain GET.
-fn tile_cache_key(tile: TileId) -> String {
-    format!("GET:{}", OpenStreetMap.tile_url(tile))
+/// cache keys by `"<METHOD>:<url>"`, and every tile is a plain GET. The URL
+/// (hence the key) differs per layer, so each layer has its own cache entries.
+fn tile_cache_key(layer: MapLayer, tile: TileId) -> String {
+    format!("GET:{}", layer.tile_url(tile))
 }
 
-/// Whether the tile covering `pos` at `zoom` is already in the on-disk cache.
-fn tile_cached_at(cache_dir: &Path, pos: Position, zoom: u8) -> bool {
+/// Whether the `layer` tile covering `pos` at `zoom` is already in the on-disk
+/// cache.
+fn tile_cached_at(cache_dir: &Path, layer: MapLayer, pos: Position, zoom: u8) -> bool {
     let (x, y) = tile_xy(pos.x(), pos.y(), zoom);
     matches!(
-        cacache::metadata_sync(cache_dir, tile_cache_key(TileId { x, y, zoom })),
+        cacache::metadata_sync(cache_dir, tile_cache_key(layer, TileId { x, y, zoom })),
         Ok(Some(_))
     )
 }
 
-/// The integer zoom nearest to `current` whose tile covering `pos` is present
-/// in the cache. `None` when the current level already has one (no change
-/// needed) or when no level does. Ties prefer the higher (more detailed) zoom.
-pub fn nearest_cached_zoom(cache_dir: &Path, pos: Position, current: u8) -> Option<u8> {
-    if tile_cached_at(cache_dir, pos, current) {
+/// The integer zoom nearest to `current` whose `layer` tile covering `pos` is
+/// present in the cache. `None` when the current level already has one (no
+/// change needed) or when no level does. Ties prefer the higher (more
+/// detailed) zoom.
+pub fn nearest_cached_zoom(
+    cache_dir: &Path,
+    layer: MapLayer,
+    pos: Position,
+    current: u8,
+) -> Option<u8> {
+    if tile_cached_at(cache_dir, layer, pos, current) {
         return None;
     }
     (0..=MAX_ZOOM)
-        .filter(|&z| z != current && tile_cached_at(cache_dir, pos, z))
+        .filter(|&z| z != current && tile_cached_at(cache_dir, layer, pos, z))
         .min_by_key(|&z| (z.abs_diff(current), MAX_ZOOM - z))
 }
 
-/// Quick reachability probe against the tile server. `true` when a response of
-/// any status came back; `false` on a connection error or timeout. Lets us
-/// tell "offline" from "not downloaded yet" before snapping the map zoom.
-async fn tile_server_reachable(client: &reqwest::Client) -> bool {
-    let url = OpenStreetMap.tile_url(TileId { x: 0, y: 0, zoom: 0 });
+/// Quick reachability probe against the layer's tile server. `true` when a
+/// response of any status came back; `false` on a connection error or timeout.
+/// Lets us tell "offline" from "not downloaded yet" before snapping the map
+/// zoom.
+async fn tile_server_reachable(client: &reqwest::Client, layer: MapLayer) -> bool {
+    let url = layer.tile_url(TileId { x: 0, y: 0, zoom: 0 });
     client.head(url).send().await.is_ok()
 }
 
@@ -122,6 +132,7 @@ async fn tile_server_reachable(client: &reqwest::Client) -> bool {
 /// fires as an offline convenience for the center button.
 pub fn spawn_offline_zoom(
     cache_dir: PathBuf,
+    layer: MapLayer,
     pos: Position,
     current_zoom: u8,
     tx: Sender<f64>,
@@ -143,14 +154,14 @@ pub fn spawn_offline_zoom(
                 .timeout(Duration::from_secs(3))
                 .build()
             {
-                Ok(client) => !tile_server_reachable(&client).await,
+                Ok(client) => !tile_server_reachable(&client, layer).await,
                 Err(_) => false,
             }
         });
         if !offline {
             return;
         }
-        if let Some(zoom) = nearest_cached_zoom(&cache_dir, pos, current_zoom) {
+        if let Some(zoom) = nearest_cached_zoom(&cache_dir, layer, pos, current_zoom) {
             if tx.send(f64::from(zoom)).is_ok() {
                 ctx.request_repaint();
             }
@@ -190,6 +201,7 @@ impl DownloadProgress {
 /// UI is woken through `ctx` as tiles complete.
 pub fn spawn_download(
     cache_dir: PathBuf,
+    layer: MapLayer,
     tiles: Vec<TileId>,
     ctx: egui::Context,
 ) -> Arc<DownloadProgress> {
@@ -198,7 +210,7 @@ pub fn spawn_download(
 
     std::thread::spawn(move || {
         match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(runtime) => runtime.block_on(download_all(cache_dir, tiles, &worker, &ctx)),
+            Ok(runtime) => runtime.block_on(download_all(cache_dir, layer, tiles, &worker, &ctx)),
             Err(e) => {
                 log::error!("offline download: failed to start runtime: {e}");
                 worker.failed.store(worker.total, Ordering::Relaxed);
@@ -229,6 +241,7 @@ fn cached_client(cache_dir: PathBuf) -> Result<ClientWithMiddleware, reqwest::Er
 
 async fn download_all(
     cache_dir: PathBuf,
+    layer: MapLayer,
     tiles: Vec<TileId>,
     progress: &DownloadProgress,
     ctx: &egui::Context,
@@ -249,7 +262,7 @@ async fn download_all(
             if progress.cancel.load(Ordering::Relaxed) {
                 return;
             }
-            if !fetch_tile(client, &OpenStreetMap.tile_url(tile)).await {
+            if !fetch_tile(client, &layer.tile_url(tile)).await {
                 progress.failed.fetch_add(1, Ordering::Relaxed);
             }
             progress.done.fetch_add(1, Ordering::Relaxed);
