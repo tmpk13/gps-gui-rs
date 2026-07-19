@@ -13,8 +13,8 @@ use crate::app::{MyApp, Page};
 /// Icon side length as a fraction of the smaller screen dimension, clamped to
 /// this point range. Keeps the toolbar proportional across phone and desktop.
 const ICON_SIZE_FRAC: f32 = 0.05;
-const ICON_SIZE_MIN: f32 = 20.0;
-const ICON_SIZE_MAX: f32 = 40.0;
+const ICON_SIZE_MIN: f32 = 40.0;
+const ICON_SIZE_MAX: f32 = 70.0;
 
 /// Inset of the floating corner toggle from the screen edge, as a fraction of
 /// the smaller screen dimension.

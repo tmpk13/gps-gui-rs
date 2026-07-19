@@ -16,5 +16,6 @@ Heart Beat on marker for esp? Or number of seconds since last message.
 Add hold to center on different markers
 
 
+Option in settings to show distance between user and beacons next to line between.
 
-
+Tracking mode
