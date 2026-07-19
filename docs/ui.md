@@ -114,6 +114,16 @@ edges. The key wrinkles:
   screen center and clipped back to the screen. The drawn angle eases toward
   the live heading each frame (`smoothed_heading`) so it glides. On mobile,
   heading-up also locks the view centered on you (pan becomes a no-op).
+- **Tracking mode.** The track button (`tracking_beacon: Option<usize>` is the
+  active beacon index) frames the user and a beacon together: `tracking_orientation`
+  centers the view on their midpoint, picks a zoom that fits the pair inside the
+  screen height less a top/bottom margin (`TRACK_MARGIN_FRAC`), and returns the
+  user->beacon bearing that feeds the same rotation easing as heading-up - so the
+  beacon rides near the top and the user near the bottom. It reuses
+  `smoothed_heading` (tracking bearing and heading-up are mutually exclusive) and
+  locks pan/zoom on every platform (the center and zoom are recomputed each
+  frame). Tapping the track button enters the mode and then cycles beacons; the
+  heading button exits it.
 - **Zoom is driven manually.** The map lives in a `Background` area, and
   walkers' built-in zoom only fires when the map is the top interactable layer
   under the pointer - which a background area never is. So walkers' zoom gesture
@@ -126,6 +136,11 @@ edges. The key wrinkles:
 - **Marker info.** A double-click/tap projects each marker to screen space (the
   same projection + rotation the marker layer draws with) and selects the
   closest one within a hit radius; a miss dismisses the popup.
+- **Overlay drawing (`marker.rs`).** `GpsLayer` draws the track, beacon, and the
+  line between them. Sizes come from the config `[sizes]` table (each overlay is
+  independent). The user->beacon line is dotted when `[distance] dotted`, and
+  labelled with the distance (units from `[distance]`, drawn above the line's
+  midpoint) when `[distance] show` - both toggleable on the Settings page.
 
 ## Offline region download flow
 

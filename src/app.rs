@@ -7,6 +7,7 @@ use egui::Pos2;
 use gps_proto::packet::{self, PositionPacket};
 use walkers::{
     lat_lon, sources::OpenStreetMap, HeaderValue, HttpOptions, HttpTiles, MapMemory, Position,
+    Projector,
 };
 
 use crate::ble::{BleCommand, BleEvent, BleHandle, Telemetry};
@@ -31,6 +32,24 @@ fn haversine_m(a: Position, b: Position) -> f64 {
     let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
     2.0 * EARTH_RADIUS_M * h.sqrt().asin()
 }
+
+/// Initial great-circle bearing from `a` to `b`, in degrees clockwise from
+/// north. Tracking mode turns the map by this so the beacon points up.
+fn bearing_deg(a: Position, b: Position) -> f32 {
+    let lat1 = a.y().to_radians();
+    let lat2 = b.y().to_radians();
+    let dlon = (b.x() - a.x()).to_radians();
+    let y = dlon.sin() * lat2.cos();
+    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
+    y.atan2(x).to_degrees().rem_euclid(360.0) as f32
+}
+
+/// Tracking mode: fraction of the screen height kept clear above the beacon and
+/// below the user, so neither marker sits hard against an edge.
+const TRACK_MARGIN_FRAC: f32 = 0.18;
+/// Zoom range the tracking auto-fit is clamped to.
+const TRACK_ZOOM_MIN: f64 = 2.0;
+const TRACK_ZOOM_MAX: f64 = 19.0;
 
 /// Whether `pos` is far enough from the last recorded track point to append it.
 /// Always true for the first point; otherwise the move must be at least
@@ -152,6 +171,10 @@ pub struct MyApp {
     compass_heading: Option<f32>,
     /// When set, the map is rotated so the current heading points up.
     heading_up: bool,
+    /// Tracking mode: index into the available beacons of the one being kept in
+    /// frame (user near the bottom, beacon near the top). `None` is off. The
+    /// track button cycles it; the heading button exits.
+    tracking_beacon: Option<usize>,
     /// Rotation angle actually drawn, eased toward the live heading each frame so
     /// the map turns smoothly instead of snapping between sensor readings.
     smoothed_heading: Option<f32>,
@@ -259,6 +282,7 @@ impl MyApp {
             heading: None,
             compass_heading: None,
             heading_up: false,
+            tracking_beacon: None,
             smoothed_heading: None,
             track: Vec::new(),
             beacon: None,
@@ -364,6 +388,54 @@ impl MyApp {
             (Some(cur), Some(beacon)) => Some(haversine_m(cur, beacon)),
             _ => None,
         }
+    }
+
+    /// The beacons that tracking mode can cycle through. One entry today (the
+    /// single BLE beacon); the list keeps the cycling logic ready for more.
+    fn beacon_positions(&self) -> Vec<Position> {
+        self.beacon.into_iter().collect()
+    }
+
+    /// While tracking a beacon, recenter the map between the user and that
+    /// beacon and pick a zoom that keeps both on screen with a margin. Returns
+    /// the bearing (degrees) the map should be turned to so the beacon rides
+    /// near the top and the user near the bottom, or `None` when not tracking
+    /// or a position is missing.
+    fn tracking_orientation(&mut self, ctx: &egui::Context, screen: egui::Rect) -> Option<f32> {
+        let idx = self.tracking_beacon?;
+        let user = self.current?;
+        let beacons = self.beacon_positions();
+        let &beacon = beacons.get(idx)?;
+
+        // Center between the two so, once the map is turned to put the beacon
+        // straight up, they sit symmetrically about the middle of the screen.
+        let mid = lat_lon(
+            (user.y() + beacon.y()) / 2.0,
+            (user.x() + beacon.x()) / 2.0,
+        );
+        self.map_memory.center_at(mid);
+
+        // Fit: scale the zoom so the on-screen separation fills the vertical
+        // span left after the top/bottom margins. Mercator pixels double per
+        // zoom step, so the needed change is log2(want / have). Eased toward the
+        // target so entering the mode glides rather than snaps.
+        let projector = Projector::new(screen, &self.map_memory, mid);
+        let user_px = projector.project(user).to_pos2();
+        let beacon_px = projector.project(beacon).to_pos2();
+        let have = (beacon_px - user_px).length() as f64;
+        let want = (screen.height() * (1.0 - 2.0 * TRACK_MARGIN_FRAC)) as f64;
+        if have > 1.0 && want > 1.0 {
+            let current = self.map_memory.zoom();
+            let target = (current + (want / have).log2()).clamp(TRACK_ZOOM_MIN, TRACK_ZOOM_MAX);
+            let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+            let alpha = 1.0 - (-dt / 0.12).exp();
+            let _ = self.map_memory.set_zoom(current + (target - current) * alpha);
+            if (target - current).abs() > 0.01 {
+                ctx.request_repaint();
+            }
+        }
+
+        Some(bearing_deg(user, beacon))
     }
 
     /// Apply one phone/manual GPS fix: move the marker, update the heading, and

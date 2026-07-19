@@ -9,6 +9,7 @@ use midair_proto::link::{TELEM_FLAG_CFG_LOADED, TELEM_FLAG_GPS_FIX, TELEM_FLAG_S
 
 use crate::app::{MyApp, Page, PointFilter, RegionSelect};
 use crate::ble::BleCommand;
+use crate::config::DistanceUnits;
 use crate::gps::GpsFix;
 use crate::points::{age_text, TrackPoint};
 
@@ -16,16 +17,6 @@ use super::{
     background_area, color_swatch, content_page, feedback_label, floating, status_bool,
     CORNER_MARGIN_FRAC, ERR_RED,
 };
-
-/// Format a distance given in meters: kilometers once it is at least 1 km,
-/// otherwise whole meters.
-fn format_distance(m: f64) -> String {
-    if m >= 1000.0 {
-        format!("{:.2} km", m / 1000.0)
-    } else {
-        format!("{m:.0} m")
-    }
-}
 
 /// Parse "lat, lon" or "lat lon" into decimal degrees. `None` unless it is
 /// exactly two finite numbers within the valid latitude/longitude range.
@@ -134,8 +125,11 @@ impl MyApp {
                         if let Some(m) = self.distance_to_beacon() {
                             ui.add_space(24.0);
                             ui.label(
-                                egui::RichText::new(format!("dist {}", format_distance(m)))
-                                    .size(40.0),
+                                egui::RichText::new(format!(
+                                    "dist {}",
+                                    self.config.distance.units.format(m)
+                                ))
+                                .size(40.0),
                             );
                         }
                     }
@@ -307,6 +301,38 @@ impl MyApp {
             color_swatch(ui, "track", self.config.colors.track);
             color_swatch(ui, "beacon", self.config.colors.fixed);
 
+            ui.add_space(16.0);
+            ui.label("Beacon distance:");
+            ui.checkbox(
+                &mut self.config.distance.show,
+                "Show distance on the line to the beacon",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Units:");
+                ui.selectable_value(
+                    &mut self.config.distance.units,
+                    DistanceUnits::Metric,
+                    "km/m",
+                );
+                ui.selectable_value(
+                    &mut self.config.distance.units,
+                    DistanceUnits::Imperial,
+                    "mi/ft",
+                );
+            });
+
+            ui.add_space(16.0);
+            ui.label("Overlay sizes (points, set in the config):");
+            let s = self.config.sizes;
+            ui.label(
+                egui::RichText::new(format!(
+                    "marker {:.0}   beacon {:.0}   track {:.0}   distance line {:.0}   text {:.0}",
+                    s.marker, s.beacon, s.track, s.distance_line, s.distance_text
+                ))
+                .monospace()
+                .size(13.0),
+            );
+
             // Offline maps: start a region download. Only when tiles are cached
             // to disk; jumps to the map and begins the box selection there.
             if self.cache_dir.is_some() {
@@ -376,7 +402,7 @@ impl MyApp {
             ui.add_space(16.0);
             ui.label(
                 egui::RichText::new(
-                    "[colors]\ntrack = \"#0078ff\"\nfixed = \"#ff5028\"\n\n[ble]\nenabled = true\nshow_path = true\n# mac = \"AA:BB:CC:DD:EE:FF\"\n\n[track]\nmin_distance = 3.0",
+                    "[colors]\ntrack = \"#0078ff\"\nfixed = \"#ff5028\"\n\n[sizes]\nmarker = 8.0\nbeacon = 6.0\ntrack = 3.0\ndistance_line = 3.0\ndistance_text = 14.0\n\n[distance]\nshow = false\nunits = \"metric\"\ndotted = true\n\n[ble]\nenabled = true\nshow_path = true\n# mac = \"AA:BB:CC:DD:EE:FF\"\n\n[track]\nmin_distance = 3.0",
                 )
                 .monospace()
                 .size(13.0),

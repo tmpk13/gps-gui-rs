@@ -16,6 +16,15 @@ Heart Beat on marker for esp? Or number of seconds since last message.
 Add hold to center on different markers
 
 
-Option in settings to show distance between user and beacons next to line between.
+[done] Option in settings to show distance between user and beacons next to line between. Text should be above the line. (mi/ft or km/m; label above the line midpoint)
 
-Tracking mode
+[done] Tracking mode: Keep user and marker both in frame with some margin. (track bar button; cycles beacons; heading button exits; user near bottom, beacon near top)
+
+[done] Independent overlay sizes ([sizes] in toml) and dotted user-beacon line ([distance] dotted).
+
+Set interval for accelerometer, gps, BLE updates. 
+Look into lowering power useage for BLE. Minimum req.
+
+Make sure accelerometer is only on/used when in heading mode.
+
+Set font?

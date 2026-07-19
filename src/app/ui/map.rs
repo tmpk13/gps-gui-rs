@@ -92,8 +92,15 @@ impl MyApp {
                     }
                 }
 
-                // Shows the mode the button switches TO (like the old label).
-                let (rotate_icon, rotate_hint) = if self.heading_up {
+                // Shows the mode the button switches TO (like the old label). In
+                // tracking mode it becomes the way out (the beacon spec: press
+                // the heading button to leave tracking).
+                let (rotate_icon, rotate_hint) = if self.tracking_beacon.is_some() {
+                    (
+                        egui::include_image!("../../../assets/icons/heading.svg"),
+                        "Exit tracking",
+                    )
+                } else if self.heading_up {
                     (
                         egui::include_image!("../../../assets/icons/north.svg"),
                         "North up",
@@ -108,7 +115,41 @@ impl MyApp {
                     .on_hover_text(rotate_hint)
                     .clicked()
                 {
-                    self.heading_up = !self.heading_up;
+                    if self.tracking_beacon.is_some() {
+                        self.tracking_beacon = None;
+                    } else {
+                        self.heading_up = !self.heading_up;
+                    }
+                }
+
+                // Tracking mode: keep the user and a beacon framed together.
+                // Tapping enters the mode on the first beacon, then cycles to the
+                // next beacon; the heading button above leaves it. Pulses red
+                // when there is no beacon to track.
+                let beacons = self.beacon_positions();
+                let tracking_hint = if self.tracking_beacon.is_some() {
+                    "Next beacon"
+                } else {
+                    "Track beacon"
+                };
+                if icon_button_pulse(
+                    ui,
+                    icon,
+                    egui::include_image!("../../../assets/icons/track.svg"),
+                    beacons.is_empty(),
+                )
+                .on_hover_text(tracking_hint)
+                .clicked()
+                    && !beacons.is_empty()
+                {
+                    self.tracking_beacon = match self.tracking_beacon {
+                        Some(i) => Some((i + 1) % beacons.len()),
+                        None => {
+                            // Tracking and heading-up are mutually exclusive.
+                            self.heading_up = false;
+                            Some(0)
+                        }
+                    };
                 }
 
                 // Base-layer toggle: like the rotate button, the glyph shows the
@@ -194,6 +235,11 @@ impl MyApp {
             },
             show_beacon_path: self.show_beacon_path,
             colors: self.config.colors,
+            sizes: self.config.sizes,
+            distance_dotted: self.config.distance.dotted,
+            show_distance: self.config.distance.show,
+            distance_units: self.config.distance.units,
+            distance_m: self.distance_to_beacon(),
         };
 
         // walkers sizes itself to the child's available space, so give it the
@@ -202,9 +248,11 @@ impl MyApp {
         let start = ui.ctx().graphics_mut(|g| g.entry(layer_id).next_idx());
 
         let android = cfg!(target_os = "android");
-        // Heading-up on mobile locks the view (centered, no pan/zoom gesture);
-        // the zoom buttons still work. North-up keeps normal pan.
-        let locked = rotation.is_some() && android;
+        // Tracking mode owns the center and zoom (recomputed each frame), so it
+        // locks out manual pan and zoom on every platform. Heading-up on mobile
+        // also locks the view. North-up keeps normal pan.
+        let tracking = self.tracking_beacon.is_some();
+        let locked = tracking || (rotation.is_some() && android);
 
         // The map is drawn inside a background Area (rotation overscan on
         // Android, full-bleed on desktop). walkers' built-in zoom only fires
@@ -218,7 +266,7 @@ impl MyApp {
             // Pinch: mirror walkers' own `zoom_by((delta - 1) * zoom_speed)`.
             let zoom_delta = ui.ctx().input(|i| i.zoom_delta());
             pinching = (zoom_delta - 1.0).abs() > 0.001;
-            if pinching {
+            if pinching && !tracking {
                 let zoom = self.map_memory.zoom() + (zoom_delta as f64 - 1.0) * 2.0;
                 let _ = self.map_memory.set_zoom(zoom);
             }
@@ -232,7 +280,7 @@ impl MyApp {
             // layer-topmost check (which the background Area fails).
             let (scroll_y, hover) =
                 ui.ctx().input(|i| (i.smooth_scroll_delta.y, i.pointer.hover_pos()));
-            if scroll_y != 0.0 && hover.is_some_and(|p| clip.contains(p)) {
+            if scroll_y != 0.0 && !tracking && hover.is_some_and(|p| clip.contains(p)) {
                 let zoom = self.map_memory.zoom() + scroll_y as f64 * 0.005;
                 let _ = self.map_memory.set_zoom(zoom);
                 ui.ctx().request_repaint();
@@ -291,12 +339,29 @@ impl MyApp {
         // heading-up rotation pauses while a region is being selected.
         let selecting = !matches!(self.select, RegionSelect::Inactive);
 
-        // Rotate the map so the heading points up, when enabled and known. The
-        // drawn angle eases toward the live heading each frame (shortest way
-        // round the circle), so the map glides rather than stepping between
-        // sensor updates. We keep requesting repaints until it settles.
-        let rotation = match (self.heading_up && !selecting, self.effective_heading()) {
-            (true, Some(target)) => {
+        // Tracking mode reframes the view between the user and the beacon and
+        // returns the bearing to turn the map to (beacon up). It centers and
+        // zooms as a side effect. Paused while a region box is being drawn.
+        let track_bearing = if selecting {
+            None
+        } else {
+            self.tracking_orientation(ctx, screen)
+        };
+
+        // The angle the map should be turned to: the tracking bearing wins;
+        // otherwise heading-up uses the live heading. Anything else leaves the
+        // map north-up.
+        let target_heading = track_bearing.or(if self.heading_up && !selecting {
+            self.effective_heading()
+        } else {
+            None
+        });
+
+        // Ease the drawn angle toward the target each frame (shortest way round
+        // the circle), so the map glides rather than stepping between updates. We
+        // keep requesting repaints until it settles.
+        let rotation = match target_heading {
+            Some(target) => {
                 let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
                 let current = self.smoothed_heading.unwrap_or(target);
                 // Signed shortest angular distance to the target, in (-180, 180].
@@ -310,16 +375,17 @@ impl MyApp {
                 }
                 Some(Rot2::from_angle(-next.to_radians()))
             }
-            _ => {
+            None => {
                 self.smoothed_heading = None;
                 None
             }
         };
 
-        // Heading-up locks the map to the current position: it stays centered on
-        // you (re-following each frame), which also makes dragging a no-op so the
+        // Heading-up (without tracking, which already centered on the midpoint)
+        // locks the map to the current position: it stays centered on you
+        // (re-following each frame), which also makes dragging a no-op so the
         // rotated view can't be panned off. Zoom (buttons) still works.
-        if self.heading_up && self.current.is_some() {
+        if track_bearing.is_none() && self.heading_up && self.current.is_some() {
             self.map_memory.follow_my_position();
         }
 
