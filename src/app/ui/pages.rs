@@ -607,8 +607,7 @@ impl MyApp {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "ESP32-C6 settings. The board keeps these in flash, so they outlast a \
-                         power cycle.",
+                        "ESP32-C6 settings. The board keeps these in flash, so they outlast a power cycle.",
                     )
                     .weak(),
                 );
@@ -772,9 +771,7 @@ impl MyApp {
             egui::RichText::new(format!(
                 "While this is set the board deep-sleeps whenever nothing is connected and \
                  wakes every interval to advertise for the window below. The GPS/LoRa rail \
-                 stays off throughout, and the interval survives a connect. Clamped to {} - {}: \
-                 deep sleep has no wake source but the timer, so the ceiling is the longest \
-                 the board can ever be out of reach.",
+                 stays off throughout. the interval survives a connect. Clamped to {} - {}.",
                 secs_text(ble::ESP_SLEEP_MIN_S),
                 secs_text(ble::ESP_SLEEP_MAX_S),
             ))
