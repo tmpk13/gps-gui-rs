@@ -538,8 +538,7 @@ impl MyApp {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "The BLE link to the GPS beacon, and the settings the board keeps for \
-                         itself. What the app draws for it is on the Settings page.",
+                        "The BLE link to the GPS beacon.",
                     )
                     .weak(),
                 );
