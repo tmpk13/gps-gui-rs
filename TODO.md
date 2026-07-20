@@ -45,3 +45,7 @@ Text goes behind the page menu dropdown button.
 One at a time, picked from a scanned list, named in the app config (`[ble.names]`).
 
 Change `gps-config.toml` name.
+
+Beacon track is shared across boards, so the drawn path can span two of them after switching. Split it per board? (Points model change.)
+
+Optimize.
