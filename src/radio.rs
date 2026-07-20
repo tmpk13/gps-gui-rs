@@ -410,6 +410,13 @@ power_mode_type = \"enum:full,psmoo,psmct\"
         let power = d.fields.iter().find(|f| f.key == "power_mode").unwrap();
         assert!(power.description.is_some());
         assert!(matches!(power.ty, FieldType::Enum(_)));
+        // A plain bool key needs no page code to become a checkbox - it is
+        // picked up from the file. Asserting one keeps that path covered, so a
+        // firmware key added to the reference config cannot silently stop
+        // reaching the editor.
+        let rx_boost = d.fields.iter().find(|f| f.key == "rx_boost").unwrap();
+        assert_eq!(rx_boost.ty, FieldType::Bool);
+        assert!(rx_boost.description.is_some());
     }
 
     #[test]

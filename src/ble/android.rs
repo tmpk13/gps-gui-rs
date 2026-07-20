@@ -278,8 +278,8 @@ fn session(
     // Resolve the target address. A pinned MAC normally connects straight
     // off, which is cheaper than scanning. That is the wrong primitive for a
     // board that may be asleep: `connect` is a bounded attempt, and retrying
-    // it on a fixed cycle can stay out of phase with a 15 s advertising
-    // window for a long time. Chasing therefore scans instead - always
+    // it on a fixed cycle can stay out of phase with a seconds-long
+    // advertising window for a long time. Chasing therefore scans instead - always
     // listening, so any window is caught the moment it opens - and matches
     // the pinned address among the hits, exactly as the desktop worker does.
     let address = match session_mac.clone() {

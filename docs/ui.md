@@ -275,6 +275,20 @@ holds these in flash and is the authority on them.
   wake source but the timer, so the ceiling is the longest the board can be out
   of reach, and a wait that long needs no confirmation, no persisted state and
   no way back in beyond waiting.
+- **The advertising window has no Disable, unlike the interval next to it.**
+  `CFG_ESP_ADV_WINDOW_S` sets how long each wake advertises, clamped to
+  3 s - 60 s. The wake-check interval takes 0 to mean "never sleep", which is
+  the safe direction; a 0-length window is the opposite, leaving a sleeping
+  board unreachable by anything but a physical reset, so the board clamps 0 up
+  to the floor and the page offers no button that asks for it. The two controls
+  sit together because they are the same decision - the interval and the window
+  are the duty cycle, and so the battery life - but only one of them can be
+  turned off.
+- **Text that quotes a board value reads it from the board.** The window used
+  to be a fixed 15 s and several strings said so; now that it is configurable
+  only the strings shown while connected quote `adv_window_s`, and the ones
+  shown while trying to connect describe the window without a number, because
+  at that point the app has no live value to quote.
 - **The link is three explicit buttons, not a toggle** (`ble_link_ui`,
   `MyApp::ble_intent`). Connect / Connect to sleeping / Disconnect map one to
   one onto `BleIntent::{Connect, ConnectSleeping, Idle}`, and each button sends

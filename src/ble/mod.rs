@@ -12,7 +12,6 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use gps_proto::packet::{self, Ack};
 pub use gps_proto::packet::PositionPacket;
-use midair_proto::ble;
 pub use midair_proto::ble::Settings;
 pub use midair_proto::link::Telemetry;
 
@@ -51,8 +50,9 @@ pub enum BleCommand {
     /// Start (or restart) connecting. `mac` pins a specific device; `None`
     /// scans for the first device advertising the GPS service.
     ///
-    /// `chase` says the board may be asleep, advertising for only about 15 s
-    /// per wake. That rules out bounded connect attempts, which can keep
+    /// `chase` says the board may be asleep, advertising for only a short
+    /// window per wake (configurable on the board, seconds rather than
+    /// minutes). That rules out bounded connect attempts, which can keep
     /// missing a window they are out of phase with, so a chasing transport
     /// scans continuously instead - always listening, whenever the window
     /// happens to open.
@@ -135,6 +135,7 @@ pub fn spawn(ctx: egui::Context, vm: usize, activity: usize) -> BleHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use midair_proto::ble;
 
     /// The board parses `[id, len, value...]`, so the framing is what has to
     /// be right - a wrong length byte is read as a different value entirely.

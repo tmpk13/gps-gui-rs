@@ -344,6 +344,8 @@ pub struct MyApp {
     connected_at: Option<Instant>,
     /// Wake-check interval input (seconds) on the Beacon page.
     sleep_interval_text: String,
+    /// Advertising-window input (seconds) on the Beacon page.
+    adv_window_text: String,
     /// Which screen is currently shown.
     page: Page,
     /// Loaded configuration (marker colors, BLE settings).
@@ -460,6 +462,11 @@ impl MyApp {
             // The low end of the clamp range, so a stray press arms the
             // shortest sleep rather than the longest.
             sleep_interval_text: ble::ESP_SLEEP_MIN_S.to_string(),
+            // The firmware's own default, not the low end: a short window is
+            // the hazardous direction here (it is what makes a sleeping board
+            // hard to catch), so a stray press should ask for what an
+            // unconfigured board already does.
+            adv_window_text: ble::ESP_ADV_DEFAULT_S.to_string(),
             page: Page::Map,
             config: AppConfig::default(),
             // The path the auto-load below tries, so Save writes back to the
@@ -913,6 +920,12 @@ impl MyApp {
                         self.ble_interval_text = s.notify_interval_ms.to_string();
                         if s.sleep_interval_s > 0 {
                             self.sleep_interval_text = s.sleep_interval_s.to_string();
+                        }
+                        // The board reports the window it resolved, so a 0 here
+                        // would be a board that does not know its own effective
+                        // value; keep the default rather than show it.
+                        if s.adv_window_s > 0 {
+                            self.adv_window_text = s.adv_window_s.to_string();
                         }
                     }
                     self.board_settings = Some(s);

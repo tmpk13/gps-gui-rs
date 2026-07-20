@@ -649,8 +649,8 @@ impl MyApp {
             if ui
                 .add_enabled(!connected, egui::Button::new("Connect to sleeping"))
                 .on_hover_text(
-                    "Scan without stopping. A sleeping board advertises for only about 15 s \
-                     per wake, which a plain connect can keep missing.",
+                    "Scan without stopping. A sleeping board advertises for only a short \
+                     window per wake, which a plain connect can keep missing.",
                 )
                 .clicked()
             {
@@ -681,17 +681,17 @@ impl MyApp {
         // connected board never sleeps, so a sleep interval that "does
         // nothing" is usually just the app holding the link open.
         if connected {
-            if let Some(secs) = self.board_settings.map(|s| s.sleep_interval_s) {
+            if let Some(s) = self.board_settings {
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(match secs {
+                    egui::RichText::new(match s.sleep_interval_s {
                         0 => "Sleep is disabled on the board, so it stays awake after you \
                               disconnect too."
                             .to_string(),
                         secs => format!(
-                            "On disconnect it will sleep, waking every {} to advertise for \
-                             about 15 s.",
-                            secs_text(secs)
+                            "On disconnect it will sleep, waking every {} to advertise for {}.",
+                            secs_text(secs),
+                            secs_text(s.adv_window_s)
                         ),
                     })
                     .weak(),
@@ -702,8 +702,8 @@ impl MyApp {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
-                    "If the board is on a sleep interval it is only reachable during those \
-                     15 s windows, so this can take up to one full interval.",
+                    "If the board is on a sleep interval it is only reachable during its \
+                     advertising windows, so this can take up to one full interval.",
                 )
                 .weak(),
             );
@@ -781,8 +781,8 @@ impl MyApp {
         ui.label(
             egui::RichText::new(format!(
                 "While this is set the board deep-sleeps whenever nothing is connected and \
-                 wakes every interval to advertise for about 15 s. The GPS/LoRa rail stays \
-                 off throughout, and the interval survives a connect. Clamped to {} - {}: \
+                 wakes every interval to advertise for the window below. The GPS/LoRa rail \
+                 stays off throughout, and the interval survives a connect. Clamped to {} - {}: \
                  deep sleep has no wake source but the timer, so the ceiling is the longest \
                  the board can ever be out of reach.",
                 secs_text(ble::ESP_SLEEP_MIN_S),
@@ -823,6 +823,44 @@ impl MyApp {
             0 => "Board: sleep disabled.".to_string(),
             secs => format!("Board: waking every {}.", secs_text(secs)),
         });
+
+        ui.add_space(12.0);
+        ui.strong("Advertising window");
+        ui.label(
+            egui::RichText::new(format!(
+                "How long each wake advertises before going back to sleep. This is the duty \
+                 cycle, and so the battery life: advertising costs far more than deep sleep, \
+                 so at a fixed interval the draw follows the window. Shortening it asks more \
+                 of whoever is connecting, because the window has to overlap a phone's scan. \
+                 Clamped to {} - {}, and it only applies from the next wake. Only meaningful \
+                 while a wake check is set; a board that never sleeps advertises continuously.",
+                secs_text(ble::ESP_ADV_MIN_S),
+                secs_text(ble::ESP_ADV_MAX_S),
+            ))
+            .weak(),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Window (s):");
+            ui.add(egui::TextEdit::singleline(&mut self.adv_window_text).desired_width(width));
+            if ui.add_enabled(!busy, egui::Button::new("Apply")).clicked() {
+                match self.adv_window_text.trim().parse::<u32>() {
+                    Ok(secs) => self.send_config(ConfigWrite::Seconds {
+                        id: ble::CFG_ESP_ADV_WINDOW_S,
+                        secs,
+                    }),
+                    Err(_) => {
+                        self.ble_ack = Some(Err("Enter a whole number of seconds.".to_string()));
+                    }
+                }
+            }
+        });
+        // No Disable here, unlike the wake check: a zero-length window would
+        // leave a sleeping board unreachable by anything short of a physical
+        // reset, so the board clamps 0 up to the floor rather than storing it.
+        ui.label(format!(
+            "Board: advertising {} per wake.",
+            secs_text(s.adv_window_s)
+        ));
     }
 
 
