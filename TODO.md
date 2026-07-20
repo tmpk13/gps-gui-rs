@@ -12,7 +12,10 @@ User stories
 
 Toggle button to continually attempt to wake.
 
-Tracking mode and north up mode should use the accelerometer as well but at a lower hz make this a setting. Pointing the arrow on the maker like north up mode.
+~~Tracking mode and north up mode should use the accelerometer as well but at a lower hz make this a setting. Pointing the arrow on the maker like north up mode.~~
+Compass now runs in every mode: full rate for heading-up, `compass.arrow_hz`
+(default 4) for the marker arrow in north-up and tracking. `compass.marker_arrow`
+turns the latter off.
 
 Should be a force reconnect from scratch button.
 
@@ -58,7 +61,7 @@ GPS BLE mesh?
 
 Edit dialog is too small.
 
-Better color theme. Something visable in poor conditions.
+Better color theme. Something visible in poor conditions.
 
 Clean up the pages.
 

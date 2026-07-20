@@ -35,6 +35,10 @@
 //!
 //! [track]
 //! min_distance = 3.0  # meters of movement before a new track point is recorded
+//!
+//! [compass]
+//! marker_arrow = true # point the marker arrow with the compass outside heading-up
+//! arrow_hz = 4.0      # compass rate while only that arrow needs it
 //! ```
 
 use std::collections::BTreeMap;
@@ -251,6 +255,31 @@ impl Default for TrackSettings {
     }
 }
 
+/// Compass (rotation-vector sensor) settings.
+///
+/// Heading-up turns the whole map and always runs the sensor at its full rate.
+/// These control the other modes - north-up and tracking - where the sensor is
+/// only pointing the marker's heading arrow and can run far slower. The sensor
+/// is fused from the accelerometer, gyroscope and magnetometer, so the rate is
+/// what the arrow costs in battery.
+#[derive(Clone, Copy)]
+pub struct CompassSettings {
+    /// Point the marker's heading arrow with the compass in north-up and
+    /// tracking modes, rather than falling back to GPS course over ground.
+    pub marker_arrow: bool,
+    /// Sensor rate, in Hz, while only that arrow needs it.
+    pub arrow_hz: f32,
+}
+
+impl Default for CompassSettings {
+    fn default() -> Self {
+        Self {
+            marker_arrow: true,
+            arrow_hz: 4.0,
+        }
+    }
+}
+
 /// Everything a config file can carry.
 #[derive(Clone, Default)]
 pub struct AppConfig {
@@ -259,6 +288,7 @@ pub struct AppConfig {
     pub distance: DistanceSettings,
     pub ble: BleSettings,
     pub track: TrackSettings,
+    pub compass: CompassSettings,
 }
 
 /// Mirrors the TOML shape; every field optional so a partial file keeps the
@@ -275,6 +305,8 @@ struct RawConfig {
     ble: RawBle,
     #[serde(default)]
     track: RawTrack,
+    #[serde(default)]
+    compass: RawCompass,
 }
 
 #[derive(Deserialize, Default)]
@@ -311,6 +343,12 @@ struct RawBle {
 #[derive(Deserialize, Default)]
 struct RawTrack {
     min_distance: Option<f64>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawCompass {
+    marker_arrow: Option<bool>,
+    arrow_hz: Option<f32>,
 }
 
 /// Parse a `#rrggbb` (or bare `rrggbb`) hex string into a color.
@@ -390,6 +428,12 @@ fn set_names(doc: &mut DocumentMut, names: &BTreeMap<String, String>) {
     }
 }
 
+/// Range the marker-arrow compass rate is accepted (and edited) in. The floor
+/// keeps the arrow from lagging behind a turn; the ceiling is about where the
+/// sensor stops being the cheap background reader this rate is meant to be.
+pub const COMPASS_HZ_MIN: f32 = 0.5;
+pub const COMPASS_HZ_MAX: f32 = 30.0;
+
 /// Validate an overlay size: finite and strictly positive.
 fn parse_size(name: &str, v: f32) -> Result<f32, String> {
     if !v.is_finite() || v <= 0.0 {
@@ -461,6 +505,18 @@ impl AppConfig {
             "min_distance",
             self.track.min_distance.into(),
         );
+        set(
+            &mut doc,
+            "compass",
+            "marker_arrow",
+            self.compass.marker_arrow.into(),
+        );
+        set(
+            &mut doc,
+            "compass",
+            "arrow_hz",
+            f32_value(self.compass.arrow_hz),
+        );
         set_names(&mut doc, &self.ble.names);
         std::fs::write(path, doc.to_string()).map_err(|e| format!("{path}: {e}"))?;
         Ok(false)
@@ -510,7 +566,11 @@ impl AppConfig {
              {names}\
              \n\
              [track]\n\
-             min_distance = {min_distance:?}   # meters of movement before a new track point\n",
+             min_distance = {min_distance:?}   # meters of movement before a new track point\n\
+             \n\
+             [compass]            # heading-up always runs the sensor at full rate\n\
+             marker_arrow = {marker_arrow}  # point the marker arrow with the compass in north-up and tracking\n\
+             arrow_hz = {arrow_hz:?}       # sensor rate while only that arrow needs it\n",
             track = hex(self.colors.track),
             fixed = hex(self.colors.fixed),
             marker = s.marker,
@@ -526,6 +586,8 @@ impl AppConfig {
             mac = self.ble.mac.clone().unwrap_or_default(),
             names = names,
             min_distance = self.track.min_distance,
+            marker_arrow = self.compass.marker_arrow,
+            arrow_hz = self.compass.arrow_hz,
         )
     }
 
@@ -586,6 +648,17 @@ impl AppConfig {
             }
             config.track.min_distance = v;
         }
+        if let Some(v) = raw.compass.marker_arrow {
+            config.compass.marker_arrow = v;
+        }
+        if let Some(v) = raw.compass.arrow_hz {
+            if !v.is_finite() || !(COMPASS_HZ_MIN..=COMPASS_HZ_MAX).contains(&v) {
+                return Err(format!(
+                    "compass.arrow_hz must be between {COMPASS_HZ_MIN} and {COMPASS_HZ_MAX}, got {v}"
+                ));
+            }
+            config.compass.arrow_hz = v;
+        }
         Ok(config)
     }
 }
@@ -628,6 +701,8 @@ mod tests {
         assert_eq!(back.sizes.distance_text, cfg.sizes.distance_text);
         assert_eq!(back.distance.units, cfg.distance.units);
         assert_eq!(back.track.min_distance, cfg.track.min_distance);
+        assert_eq!(back.compass.marker_arrow, cfg.compass.marker_arrow);
+        assert_eq!(back.compass.arrow_hz, cfg.compass.arrow_hz);
         // The generated `mac = ""` means "scan by service", not a pinned MAC.
         assert_eq!(back.ble.mac, None);
     }
@@ -724,6 +799,15 @@ mod tests {
         assert_eq!(back.ble.name_of("AA:BB:CC:DD:EE:FF"), Some("Truck"));
         assert_eq!(back.ble.name_of("11:22:33:44:55:66"), None);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compass_rate_is_range_checked() {
+        assert!(AppConfig::from_toml("[compass]\narrow_hz = 0.0").is_err());
+        assert!(AppConfig::from_toml("[compass]\narrow_hz = 1000.0").is_err());
+        let cfg = AppConfig::from_toml("[compass]\nmarker_arrow = false\narrow_hz = 2.0").unwrap();
+        assert!(!cfg.compass.marker_arrow);
+        assert_eq!(cfg.compass.arrow_hz, 2.0);
     }
 
     #[test]

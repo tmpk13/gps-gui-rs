@@ -159,10 +159,14 @@ edges. The key wrinkles:
   screen center and clipped back to the screen. The drawn angle eases toward
   the live heading each frame (`smoothed_heading`) so it glides. On mobile,
   heading-up also locks the view centered on you (pan becomes a no-op).
-  Heading-up is also the only thing that powers the compass: the sensor behind
-  `CompassHandle` is off until this button turns it on (see "The compass" below),
-  so the button's visibility is keyed off `MyApp::has_direction` - "a heading
+  Heading-up is what runs the compass at full rate (see "The compass" below),
+  and the button's visibility is keyed off `MyApp::has_direction` - "a heading
   exists *or* a compass could supply one" - rather than off a live reading.
+- **The marker heading arrow.** Drawn by `GpsLayer` in every mode, from the same
+  `effective_heading` the rotation uses, and eased on its own state
+  (`smoothed_arrow`, a longer time constant than the map's) - outside heading-up
+  the compass runs at a few Hz, so the raw readings would step it round in
+  visible jumps. Both easings share `app::ease_heading`.
 - **The center button.** A plain tap centers on you (falling back to the first
   beacon with no fix yet); holding it - or right-clicking on desktop, both being
   `Response::secondary_clicked` - opens `center_menu_ui`, a list of every marker
@@ -241,7 +245,8 @@ once; the file is only touched by the buttons.
 **The split with the Beacon page is by who owns the setting**, not by subject.
 Settings holds what the app owns and can save: the config file itself, the
 marker colors and overlay sizes, what the map draws (including the beacon path
-and the distance read-out), track recording, and the offline-map download.
+and the distance read-out), the compass rate behind the marker arrow, track
+recording, and the offline-map download.
 Everything the *board* owns, plus the link that reaches it, is on the Beacon
 page below. The beacon-related app settings (`[ble] enabled`, `mac` and the
 `[ble.names]` nicknames) live there anyway, because they decide how the link is
@@ -425,18 +430,28 @@ the Map page only.
 ## The compass (mobile)
 
 `src/compass.rs` reads the NDK rotation-vector sensor on its own thread. The
-handle the app holds (`CompassHandle`) is two halves: the heading channel, and a
-`wanted` flag the UI sets.
+handle the app holds (`CompassHandle`) is three parts: the heading channel, a
+`wanted` flag, and an `interval_us` rate, both of the latter set by the UI.
 
-The sensor is **off by default and only enabled while heading-up is on**. The
-rotation vector is fused from the accelerometer, gyroscope and magnetometer, so
-leaving it running keeps all three awake for a heading nothing is drawing;
-tracking mode turns the map by the bearing to the beacon instead, and the marker
-arrow falls back to course over ground. `MyApp::sync_compass_power` runs once per
-frame in `MyApp::ui`, pushes `heading_up` into the flag, and clears
-`compass_heading` on the way down so a reading that has stopped updating is not
-left on screen. The sensor thread polls the flag between event reads and
-enables/disables accordingly, dropping any events queued across a disable.
+The rotation vector is fused from the accelerometer, gyroscope and magnetometer,
+so running it keeps all three awake - **the rate is what a heading costs in
+battery**, and it is set to what is actually being drawn:
+
+- **Heading-up** turns the whole map, and gets the full `HEADING_UP_HZ` rate.
+- **North-up and tracking** only point the marker's heading arrow, so they run
+  the sensor at `compass.arrow_hz` from the config (default 4 Hz) - and only on
+  the map page, where that arrow is drawn. Clearing `compass.marker_arrow` in
+  the config turns this off entirely, leaving the arrow on GPS course over
+  ground, which is how it behaved before the setting existed.
+
+`MyApp::sync_compass_power` runs once per frame in `MyApp::ui`, pushes both the
+flag and the rate, and clears `compass_heading` on the way down so a reading that
+has stopped updating is not left on screen. The sensor thread polls the flag
+between event reads, enables/disables accordingly (dropping any events queued
+across a disable), and applies a rate change to the running sensor - so moving
+between heading-up and the arrow rate does not interrupt the readings. Every
+requested interval is floored at `ASensor_getMinDelay`, since asking for faster
+than the hardware delivers is an error.
 
 The struct is compiled on every target (the app holds an `Option<CompassHandle>`
 everywhere); only `compass::spawn` and the thread are Android-only.

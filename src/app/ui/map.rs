@@ -8,7 +8,7 @@ use egui::emath::Rot2;
 use egui::{epaint::TextShape, Pos2, Shape};
 use walkers::{lat_lon, Map, Position, Projector, Tiles};
 
-use crate::app::{MarkerKind, MyApp, RegionSelect};
+use crate::app::{ease_heading, MarkerKind, MyApp, RegionSelect, ARROW_TAU, ROTATE_TAU};
 use crate::marker::GpsLayer;
 use crate::offline;
 use crate::points::age_text;
@@ -272,10 +272,27 @@ impl MyApp {
             (ui.input(|i| i.time).rem_euclid(PULSE_PERIOD) / PULSE_PERIOD) as f32
         });
 
+        // The arrow is eased toward the live heading rather than snapping to it:
+        // outside heading-up the compass runs at a few Hz, so the raw readings
+        // would step the arrow round in visible jumps.
+        let arrow = self.effective_heading().map(|target| {
+            let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1);
+            let current = self.smoothed_arrow.unwrap_or(target);
+            let (next, remaining) = ease_heading(current, target, dt, ARROW_TAU);
+            self.smoothed_arrow = Some(next);
+            if remaining > 0.05 {
+                ui.ctx().request_repaint();
+            }
+            next
+        });
+        if arrow.is_none() {
+            self.smoothed_arrow = None;
+        }
+
         let layer = GpsLayer {
             current: self.current,
             track: self.track.iter().map(|t| t.pos).collect(),
-            heading: self.effective_heading(),
+            heading: arrow,
             beacon: self.beacon,
             beacon_track: if self.config.ble.show_path {
                 self.beacon_track.iter().map(|t| t.pos).collect()
@@ -509,13 +526,9 @@ impl MyApp {
             Some(target) => {
                 let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
                 let current = self.smoothed_heading.unwrap_or(target);
-                // Signed shortest angular distance to the target, in (-180, 180].
-                let delta = (target - current + 540.0).rem_euclid(360.0) - 180.0;
-                // Time-constant easing so the feel is frame-rate independent.
-                let alpha = 1.0 - (-dt / 0.12).exp();
-                let next = (current + delta * alpha).rem_euclid(360.0);
+                let (next, remaining) = ease_heading(current, target, dt, ROTATE_TAU);
                 self.smoothed_heading = Some(next);
-                if delta.abs() > 0.05 {
+                if remaining > 0.05 {
                     ctx.request_repaint();
                 }
                 Some(Rot2::from_angle(-next.to_radians()))

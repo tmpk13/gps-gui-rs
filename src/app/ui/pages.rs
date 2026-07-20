@@ -11,7 +11,7 @@ use midair_proto::link::{TELEM_FLAG_CFG_LOADED, TELEM_FLAG_GPS_FIX, TELEM_FLAG_S
 
 use crate::app::{secs_text, BleIntent, MyApp, Page, PointFilter, RadioEdit, RegionSelect};
 use crate::ble::ConfigWrite;
-use crate::config::DistanceUnits;
+use crate::config::{DistanceUnits, COMPASS_HZ_MAX, COMPASS_HZ_MIN};
 use crate::gps::GpsFix;
 use crate::points::{age_text, PointSource, TrackPoint};
 use crate::radio::{EditVal, FieldType};
@@ -477,6 +477,33 @@ impl MyApp {
                         &mut self.config.distance.units,
                         DistanceUnits::Imperial,
                         "mi/ft",
+                    );
+                });
+
+                gap(ui, GAP_SECTION);
+                ui.strong("Compass");
+                ui.label(
+                    egui::RichText::new(
+                        "Heading-up always runs the compass at full rate. These are for the \
+                         other modes, where it only points the arrow on your marker.",
+                    )
+                    .weak(),
+                );
+                ui.checkbox(
+                    &mut self.config.compass.marker_arrow,
+                    "Point the marker arrow with the compass",
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Compass rate for the arrow (Hz):");
+                    ui.add_enabled(
+                        self.config.compass.marker_arrow,
+                        egui::DragValue::new(&mut self.config.compass.arrow_hz)
+                            .speed(0.1)
+                            .range(COMPASS_HZ_MIN..=COMPASS_HZ_MAX),
+                    )
+                    .on_hover_text(
+                        "Lower is cheaper: the sensor is fused from the accelerometer, \
+                         gyroscope and magnetometer, so it keeps all three awake",
                     );
                 });
 

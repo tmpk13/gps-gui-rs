@@ -23,3 +23,9 @@ distance_text = 14.0
 show = false
 units = "metric"
 dotted = true
+
+[compass]
+# Heading-up always runs the compass at full rate; these are for north-up and
+# tracking, where it only points the arrow on your marker.
+marker_arrow = true
+arrow_hz = 4.0

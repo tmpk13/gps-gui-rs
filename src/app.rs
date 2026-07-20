@@ -14,7 +14,7 @@ use walkers::{
 };
 
 use crate::ble::{BleCommand, BleEvent, BleHandle, ConfigWrite, Settings, Telemetry};
-use crate::compass::CompassHandle;
+use crate::compass::{self, CompassHandle};
 use crate::config::{normalize_mac, AppConfig};
 use crate::gps::GpsFix;
 use crate::offline::{self, DownloadProgress};
@@ -156,6 +156,29 @@ fn bearing_deg(a: Position, b: Position) -> f32 {
     y.atan2(x).to_degrees().rem_euclid(360.0) as f32
 }
 
+/// Ease `current` toward `target` (both degrees clockwise from north) the
+/// shortest way round the circle, over the time constant `tau`. Returns the new
+/// angle and how far it still had to travel, so the caller can keep asking for
+/// frames until it settles.
+///
+/// The easing is what makes a heading readable between sensor updates: the
+/// marker arrow and the heading-up map both glide instead of stepping, which
+/// matters most at the low compass rate the arrow alone runs at.
+pub(crate) fn ease_heading(current: f32, target: f32, dt: f32, tau: f32) -> (f32, f32) {
+    // Signed shortest angular distance to the target, in (-180, 180].
+    let delta = (target - current + 540.0).rem_euclid(360.0) - 180.0;
+    // Time-constant easing so the feel is frame-rate independent.
+    let alpha = 1.0 - (-dt / tau).exp();
+    ((current + delta * alpha).rem_euclid(360.0), delta.abs())
+}
+
+/// Time constant for easing the map's heading-up rotation.
+pub(crate) const ROTATE_TAU: f32 = 0.12;
+/// Time constant for easing the marker's heading arrow. Slower than the map's:
+/// the arrow is driven at `compass.arrow_hz`, so it has further to coast
+/// between readings and a tighter constant would just step visibly.
+pub(crate) const ARROW_TAU: f32 = 0.25;
+
 /// Config file loaded at startup and written back by the Settings page, unless
 /// another path is typed there.
 const DEFAULT_CONFIG_NAME: &str = "gps-config.toml";
@@ -173,6 +196,11 @@ fn default_config_path(cache_dir: Option<&std::path::Path>) -> String {
         _ => DEFAULT_CONFIG_NAME.to_string(),
     }
 }
+
+/// Compass rate while heading-up is turning the map. Fast enough that the whole
+/// view follows the phone rather than stepping after it; the other modes only
+/// move a small arrow and use the far slower `compass.arrow_hz` instead.
+const HEADING_UP_HZ: f32 = 60.0;
 
 /// Tracking mode: fraction of the screen height kept clear above the beacon and
 /// below the user, so neither marker sits hard against an edge.
@@ -331,6 +359,9 @@ pub struct MyApp {
     /// Rotation angle actually drawn, eased toward the live heading each frame so
     /// the map turns smoothly instead of snapping between sensor readings.
     smoothed_heading: Option<f32>,
+    /// The same for the marker's heading arrow, which is eased separately: it is
+    /// drawn in every mode, while the map only turns in heading-up and tracking.
+    smoothed_arrow: Option<f32>,
     track: Vec<TrackPoint>,
     /// Live position of the BLE beacon; replaces the old fixed reference
     /// point, so the distance line tracks the real device.
@@ -474,6 +505,7 @@ impl MyApp {
             heading_up: false,
             tracking_beacon: None,
             smoothed_heading: None,
+            smoothed_arrow: None,
             track: Vec::new(),
             beacon: None,
             beacon_time: None,
@@ -840,16 +872,29 @@ impl MyApp {
         self.effective_heading().is_some() || self.compass.is_some()
     }
 
-    /// Power the compass sensor for heading-up and nothing else.
+    /// Power the compass sensor, and at what rate, for what is being drawn.
     ///
     /// The rotation-vector sensor is fused from the accelerometer, gyroscope
-    /// and magnetometer, so it keeps all three awake; heading-up is the only
-    /// mode that draws a device heading. Tracking mode turns the map by the
-    /// bearing to the beacon instead, and the marker's heading arrow falls back
-    /// to course over ground.
+    /// and magnetometer, so it keeps all three awake and the rate is what a
+    /// device heading costs in battery. Heading-up turns the whole map and gets
+    /// the full rate. North-up and tracking (which turns the map by the bearing
+    /// to the beacon) only point the marker's heading arrow, so they run the
+    /// sensor at `compass.arrow_hz` - or leave it off, and the arrow on course
+    /// over ground, when `compass.marker_arrow` is unset.
     fn sync_compass_power(&mut self) {
         let Some(compass) = &self.compass else { return };
-        let wanted = self.heading_up;
+        // The arrow is only drawn on the map, so it only asks for the sensor
+        // there; nothing is measured for an arrow behind another page.
+        let arrow = self.config.compass.marker_arrow && self.page == Page::Map;
+        let wanted = self.heading_up || arrow;
+        let hz = if self.heading_up {
+            HEADING_UP_HZ
+        } else {
+            self.config.compass.arrow_hz
+        };
+        compass
+            .interval_us
+            .store(compass::interval_us(hz), Ordering::Relaxed);
         // Switching off drops the last reading: it stops being updated, so
         // holding on to it would draw a heading that quietly goes stale.
         if compass.wanted.swap(wanted, Ordering::Relaxed) && !wanted {

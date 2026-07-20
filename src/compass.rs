@@ -6,12 +6,13 @@
 //! emits the heading (degrees clockwise from north) whenever it changes.
 //!
 //! The sensor is powered only while the UI asks for it through
-//! [`CompassHandle::wanted`]. The rotation vector is fused from the
+//! [`CompassHandle::wanted`], and at the rate it asks for through
+//! [`CompassHandle::interval_us`]. The rotation vector is fused from the
 //! accelerometer, gyroscope and magnetometer, so leaving it enabled keeps all
-//! three awake; heading-up is the only mode that draws a device heading, so
-//! everywhere else the sensor stays off.
+//! three awake: heading-up turns the whole map and needs a fast rate, while the
+//! marker's heading arrow reads fine from a few updates a second.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
@@ -23,18 +24,51 @@ pub struct CompassHandle {
     /// while this is set and disables it again when it clears, so nothing is
     /// measured for a heading no one is drawing.
     pub wanted: Arc<AtomicBool>,
+    /// Requested delivery interval in microseconds. The thread applies changes
+    /// while the sensor is running, and clamps to the sensor's minimum delay
+    /// (asking for faster than the hardware allows is an error).
+    pub interval_us: Arc<AtomicI32>,
+}
+
+/// The requested interval in microseconds for a rate in Hz, for
+/// [`CompassHandle::interval_us`]. Non-positive or unrepresentable rates fall
+/// back to 1 Hz rather than dividing by zero into an absurd interval; the rest
+/// are capped at ten seconds, which is slower than any rate worth asking for.
+pub fn interval_us(hz: f32) -> i32 {
+    if hz <= 0.0 || !hz.is_finite() {
+        return 1_000_000;
+    }
+    (1_000_000.0 / hz).clamp(1.0, 10_000_000.0) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interval_us;
+
+    #[test]
+    fn rates_become_intervals_and_bad_ones_a_second() {
+        assert_eq!(interval_us(60.0), 16_666);
+        assert_eq!(interval_us(4.0), 250_000);
+        // The slowest rate the settings allow still gets its full interval.
+        assert_eq!(interval_us(0.5), 2_000_000);
+        assert_eq!(interval_us(0.0), 1_000_000);
+        assert_eq!(interval_us(f32::NAN), 1_000_000);
+    }
 }
 
 #[cfg(target_os = "android")]
 mod imp {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::mpsc::{channel, Sender};
     use std::sync::Arc;
     use std::thread;
 
     use ndk_sys as ns;
 
-    use super::CompassHandle;
+    use super::{interval_us, CompassHandle};
+
+    /// Rate the sensor starts at until the UI asks for another.
+    const DEFAULT_HZ: f32 = 60.0;
 
     /// Spawn the compass sensor loop. It starts with the sensor off; set
     /// [`CompassHandle::wanted`] to power it up. Emits the device heading in
@@ -43,15 +77,23 @@ mod imp {
     pub fn spawn(ctx: egui::Context) -> CompassHandle {
         let (tx, rx) = channel();
         let wanted = Arc::new(AtomicBool::new(false));
+        let interval = Arc::new(AtomicI32::new(interval_us(DEFAULT_HZ)));
         let thread_wanted = wanted.clone();
-        thread::spawn(move || unsafe { run(&tx, &thread_wanted, &ctx) });
+        let thread_interval = interval.clone();
+        thread::spawn(move || unsafe { run(&tx, &thread_wanted, &thread_interval, &ctx) });
         CompassHandle {
             headings: rx,
             wanted,
+            interval_us: interval,
         }
     }
 
-    unsafe fn run(tx: &Sender<f32>, wanted: &AtomicBool, ctx: &egui::Context) {
+    unsafe fn run(
+        tx: &Sender<f32>,
+        wanted: &AtomicBool,
+        interval: &AtomicI32,
+        ctx: &egui::Context,
+    ) {
         let package = match std::ffi::CString::new("rs.gps.gui") {
             Ok(p) => p,
             Err(_) => return,
@@ -89,24 +131,39 @@ mod imp {
             return;
         }
 
+        // Asking for a shorter interval than the hardware delivers is an error,
+        // so every requested rate is floored at the sensor's own minimum.
+        let min_delay = ns::ASensor_getMinDelay(sensor).max(1);
+
         let mut last_sent: Option<f32> = None;
         // The sensor starts off and is only enabled while the UI wants it.
         let mut enabled = false;
+        // The rate last handed to the queue, so a change is applied once rather
+        // than re-sent every poll.
+        let mut applied_us = 0;
 
         loop {
             // Follow the UI's request. Enabling costs a fresh `setEventRate`
             // (the rate is per enable), disabling drops the last heading so a
             // stale one is not re-sent when the sensor comes back.
             let want = wanted.load(Ordering::Relaxed);
+            let want_us = interval.load(Ordering::Relaxed).max(min_delay);
             if want != enabled {
                 if want {
                     ns::ASensorEventQueue_enableSensor(queue, sensor);
-                    ns::ASensorEventQueue_setEventRate(queue, sensor, 16_000); // ~60 Hz
+                    ns::ASensorEventQueue_setEventRate(queue, sensor, want_us);
+                    applied_us = want_us;
                 } else {
                     ns::ASensorEventQueue_disableSensor(queue, sensor);
                     last_sent = None;
                 }
                 enabled = want;
+            } else if enabled && want_us != applied_us {
+                // Rate changes take effect on a running sensor, so switching
+                // between heading-up and the slow marker-arrow rate does not
+                // interrupt the readings.
+                ns::ASensorEventQueue_setEventRate(queue, sensor, want_us);
+                applied_us = want_us;
             }
 
             // Block up to 250 ms for sensor data. With the sensor disabled this
