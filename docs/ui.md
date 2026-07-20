@@ -216,10 +216,11 @@ Settings holds what the app owns and can save: the config file itself, the
 marker colors and overlay sizes, what the map draws (including the beacon path
 and the distance read-out), track recording, and the offline-map download.
 Everything the *board* owns, plus the link that reaches it, is on the Beacon
-page below. Two beacon-related app settings (`[ble] enabled` and `mac`) live
-there anyway, because they decide how the link is made and are useless apart
-from it; they repeat the Save button rather than sending you back here for it,
-writing the same file and sharing the same `config_feedback` line.
+page below. The beacon-related app settings (`[ble] enabled`, `mac` and the
+`[ble.names]` nicknames) live there anyway, because they decide how the link is
+made and are useless apart from it; they repeat the Save button rather than
+sending you back here for it, writing the same file and sharing the same
+`config_feedback` line.
 
 - **Save** (`MyApp::save_config` -> `AppConfig::save`) edits an existing file in
   place with `toml_edit`: comments, key order, and any keys the app knows nothing
@@ -234,16 +235,48 @@ writing the same file and sharing the same `config_feedback` line.
   be saved. On desktop the cache is relative, leaving the plain filename in the
   working directory. It is both what starts loaded and what Save writes back to.
 - `[ble] show_path` is the single source of truth for the beacon-path overlay
-  (there is no separate runtime flag), and the `mac` input keeps its own text
-  buffer, `ble_mac_text`, since the setting itself is an `Option<String>` where
-  empty means "scan by service". Changing `enabled`/`mac` takes effect on
-  Reconnect, not per keystroke.
+  (there is no separate runtime flag). `mac` is an `Option<String>` where `None`
+  means "any board"; it is no longer typed by hand but chosen in the Beacon
+  page's device picker.
 
 ## The Beacon page (`pages.rs` + `ble/`)
 
-Everything about the beacon that is not drawing: the link (`ble_link_ui`), the
-two connection settings above, the notify interval, and the board's own power
-and sleep settings.
+Everything about the beacon that is not drawing: which board to talk to
+(`device_picker_ui`), the link to it (`ble_link_ui`), the connection settings,
+the notify interval, and the board's own power and sleep settings.
+
+### Choosing a board (`device_picker_ui`)
+
+Several boards can be in range at once - typically when they are together to be
+configured or woken, rather than tracked. **Only one is ever connected**, so the
+picker is a single-choice list and the transports keep their single-session
+shape.
+
+- **Identity is the MAC, the readable name is the app's.** Every board runs the
+  same firmware and so advertises the same `packet::DEVICE_NAME`, which makes a
+  raw scan a list of identical entries. `[ble.names]` maps MAC -> nickname in
+  the app's config; the board is never told its name. `normalize_mac` is what
+  makes the key stable - addresses come back in whatever case the stack prefers
+  and a hand-edited file may use dashes, so the raw string would file one board
+  twice.
+- **Discovery is its own worker mode, not the connect scan.** `BleCommand::Scan`
+  reports every board that answers as a `BleEvent::Discovered` and keeps going;
+  the scan inside a connect stops at the first match. `BleIntent::Scanning` maps
+  to it and drops any live link, since a connected session does not scan.
+- **The list is what is on the air plus what has a name.** `device_rows()` unions
+  the nicknames with the current scan's sightings, and always includes the pinned
+  MAC so the selected board is never invisible. Sightings age out after
+  `SEEN_TIMEOUT`, so a board that stops advertising reads as "not answering"
+  rather than silently keeping its last signal reading.
+- **Nicknames commit on blur, not per keystroke.** An empty name forgets the
+  board, so committing on every keystroke would delete the row the moment the box
+  was cleared to retype. `name_edits` holds the buffers separately from
+  `config.ble.names` for the same reason.
+- **Switching boards drops the last one's state** (`forget_board_state`). The
+  position, packet, telemetry, log and settings all describe the old board; a
+  stale beacon position is the worst of them, since the map would go on drawing
+  it as the board now selected. `beacon_track` is deliberately kept - it is
+  recorded history that also backs the Points page.
 
 ### Board power and sleep (`board_power_ui`)
 

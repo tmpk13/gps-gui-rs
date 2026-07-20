@@ -22,7 +22,7 @@ use gps_proto::packet::{self, PositionPacket};
 use midair_proto::ble;
 use midair_proto::link::Telemetry;
 
-use super::{settings_event, BleCommand, BleEvent, BleHandle, ConfigWrite};
+use super::{settings_event, BleCommand, BleEvent, BleHandle, ConfigWrite, DiscoveredDevice};
 
 /// The compiled dex with rs.gps.gui.BleBridge (see android/build-dex.sh).
 const BRIDGE_DEX: &[u8] = include_bytes!("../../assets/ble-bridge.dex");
@@ -30,12 +30,27 @@ const BRIDGE_CLASS: &str = "rs.gps.gui.BleBridge";
 
 /// Events pushed by the Java callbacks (Binder threads) to the worker.
 enum Cb {
-    Scan { address: String },
-    ConnectionState { new_state: i32 },
-    ServicesDiscovered { status: i32 },
-    Notify { uuid: String, value: Vec<u8> },
-    WriteDone { status: i32 },
-    DescriptorWrite { status: i32 },
+    Scan {
+        address: String,
+        name: String,
+        rssi: i32,
+    },
+    ConnectionState {
+        new_state: i32,
+    },
+    ServicesDiscovered {
+        status: i32,
+    },
+    Notify {
+        uuid: String,
+        value: Vec<u8>,
+    },
+    WriteDone {
+        status: i32,
+    },
+    DescriptorWrite {
+        status: i32,
+    },
 }
 
 /// Set once before RegisterNatives, so the Java callbacks can never fire
@@ -60,11 +75,16 @@ extern "system" fn native_on_scan(
     mut env: JNIEnv,
     _class: JClass,
     address: JString,
-    _name: JString,
-    _rssi: jint,
+    name: JString,
+    rssi: jint,
 ) {
     let address = jstring_or_empty(&mut env, &address);
-    push_cb(Cb::Scan { address });
+    let name = jstring_or_empty(&mut env, &name);
+    push_cb(Cb::Scan {
+        address,
+        name,
+        rssi,
+    });
 }
 
 extern "system" fn native_on_connection_state(
@@ -184,33 +204,45 @@ fn worker(
         return Ok(());
     }
 
-    let mut wanted_connect = false;
-    let mut mac: Option<String> = None;
-    let mut chase = false;
+    let mut wanted = Wanted {
+        connect: false,
+        scan: false,
+        mac: None,
+        chase: false,
+    };
     let mut writes: Vec<ConfigWrite> = Vec::new();
     let mut permissions_done = false;
 
     loop {
-        if drain_commands(
-            &cmd_rx,
-            &mut wanted_connect,
-            &mut mac,
-            &mut chase,
-            &mut writes,
-        )
-        .is_err()
-        {
+        if drain_commands(&cmd_rx, &mut wanted, &mut writes).is_err() {
             return Ok(()); // UI has gone away
         }
-        if !wanted_connect {
+        if !wanted.connect && !wanted.scan {
             std::thread::sleep(Duration::from_millis(200));
             continue;
         }
 
+        // Scanning needs the same runtime permissions connecting does, so this
+        // gate covers both.
         if !permissions_done {
             report.status("waiting for Bluetooth permissions...");
             bridge.ensure_permissions()?;
             permissions_done = true;
+        }
+
+        if wanted.scan {
+            if let Err(e) = discover(
+                &mut bridge,
+                report,
+                &cb_rx,
+                &cmd_rx,
+                &mut wanted,
+                &mut writes,
+            ) {
+                report.status(format!("{e}; retrying"));
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            continue;
         }
 
         match session(
@@ -218,9 +250,7 @@ fn worker(
             report,
             &cb_rx,
             &cmd_rx,
-            &mut wanted_connect,
-            &mut mac,
-            &mut chase,
+            &mut wanted,
             &mut writes,
         ) {
             Ok(()) => {} // clean stop requested by the UI
@@ -234,21 +264,39 @@ fn worker(
     }
 }
 
+/// What the UI currently wants from us. `connect` and `scan` are mutually
+/// exclusive: a discovery scan has no link, and a connected session does not
+/// scan.
+struct Wanted {
+    connect: bool,
+    /// Run a discovery scan for the device picker; see [`BleCommand::Scan`].
+    scan: bool,
+    mac: Option<String>,
+    /// The board may be asleep; see [`BleCommand::Connect`].
+    chase: bool,
+}
+
 fn drain_commands(
     cmd_rx: &Receiver<BleCommand>,
-    wanted_connect: &mut bool,
-    mac: &mut Option<String>,
-    chase: &mut bool,
+    wanted: &mut Wanted,
     writes: &mut Vec<ConfigWrite>,
 ) -> Result<(), ()> {
     loop {
         match cmd_rx.try_recv() {
-            Ok(BleCommand::Connect { mac: m, chase: c }) => {
-                *wanted_connect = true;
-                *mac = m;
-                *chase = c;
+            Ok(BleCommand::Connect { mac, chase }) => {
+                wanted.connect = true;
+                wanted.scan = false;
+                wanted.mac = mac;
+                wanted.chase = chase;
             }
-            Ok(BleCommand::Disconnect) => *wanted_connect = false,
+            Ok(BleCommand::Scan) => {
+                wanted.connect = false;
+                wanted.scan = true;
+            }
+            Ok(BleCommand::Disconnect) => {
+                wanted.connect = false;
+                wanted.scan = false;
+            }
             Ok(BleCommand::Config(w)) => writes.push(w),
             Err(TryRecvError::Empty) => return Ok(()),
             Err(TryRecvError::Disconnected) => return Err(()),
@@ -256,20 +304,67 @@ fn drain_commands(
     }
 }
 
+/// Scan without connecting, reporting every board that answers, until the UI
+/// asks for something else. The scan callback fires per advertisement, so a
+/// board is re-reported as long as it keeps advertising and the picker's signal
+/// strength stays current.
+fn discover(
+    bridge: &mut Bridge,
+    report: &Reporter,
+    cb_rx: &Receiver<Cb>,
+    cmd_rx: &Receiver<BleCommand>,
+    wanted: &mut Wanted,
+    writes: &mut Vec<ConfigWrite>,
+) -> Result<(), String> {
+    // Drop stale callbacks from a previous session so old sightings cannot be
+    // reported as if they were fresh.
+    while cb_rx.try_recv().is_ok() {}
+
+    report.status("scanning for boards...");
+    if !bridge.start_scan(packet::SERVICE_UUID) {
+        return Err("scan failed (Bluetooth off?)".into());
+    }
+
+    let result = loop {
+        if drain_commands(cmd_rx, wanted, writes).is_err() || !wanted.scan {
+            break Ok(());
+        }
+        match cb_rx.recv_timeout(Duration::from_millis(300)) {
+            Ok(Cb::Scan {
+                address,
+                name,
+                rssi,
+            }) => {
+                report.send(BleEvent::Discovered(DiscoveredDevice {
+                    address,
+                    name: (!name.is_empty()).then_some(name),
+                    rssi: Some(rssi as i16),
+                }));
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break Err("worker gone".to_string()),
+        }
+    };
+
+    bridge.stop_scan();
+    if result.is_ok() {
+        report.status("scan stopped");
+    }
+    result
+}
+
 /// One scan+connect+subscribe+pump attempt. `Ok(())` means the UI asked to
 /// stop; `Err` means retry.
-#[allow(clippy::too_many_arguments)]
 fn session(
     bridge: &mut Bridge,
     report: &Reporter,
     cb_rx: &Receiver<Cb>,
     cmd_rx: &Receiver<BleCommand>,
-    wanted_connect: &mut bool,
-    mac: &mut Option<String>,
-    chase: &mut bool,
+    wanted: &mut Wanted,
     writes: &mut Vec<ConfigWrite>,
 ) -> Result<(), String> {
-    let session_mac = mac.clone();
+    let session_mac = wanted.mac.clone();
 
     // Drop stale callback events from a previous session (e.g. a disconnect
     // that raced the teardown), so the waits below cannot match them.
@@ -283,7 +378,7 @@ fn session(
     // listening, so any window is caught the moment it opens - and matches
     // the pinned address among the hits, exactly as the desktop worker does.
     let address = match session_mac.clone() {
-        Some(m) if !*chase => m,
+        Some(m) if !wanted.chase => m,
         pinned => {
             report.status(if pinned.is_some() {
                 "waiting for a wake window..."
@@ -294,14 +389,12 @@ fn session(
                 return Err("scan failed (Bluetooth off?)".into());
             }
             let found = loop {
-                if drain_commands(cmd_rx, wanted_connect, mac, chase, writes).is_err()
-                    || !*wanted_connect
-                {
+                if drain_commands(cmd_rx, wanted, writes).is_err() || !wanted.connect {
                     bridge.stop_scan();
                     return Ok(());
                 }
                 match cb_rx.recv_timeout(Duration::from_millis(300)) {
-                    Ok(Cb::Scan { address }) => match &pinned {
+                    Ok(Cb::Scan { address, .. }) => match &pinned {
                         // Another GPS board answering the same service filter.
                         Some(m) if !address.eq_ignore_ascii_case(m) => {}
                         _ => break address,
@@ -403,13 +496,13 @@ fn session(
             Err(RecvTimeoutError::Disconnected) => return Err("worker gone".into()),
         }
 
-        if drain_commands(cmd_rx, wanted_connect, mac, chase, writes).is_err() || !*wanted_connect {
+        if drain_commands(cmd_rx, wanted, writes).is_err() || !wanted.connect {
             bridge.disconnect();
             report.send(BleEvent::Connected(false));
             report.status("disconnected");
             return Ok(());
         }
-        if *mac != session_mac {
+        if wanted.mac != session_mac {
             // The UI pinned a different device (e.g. a config reload).
             bridge.disconnect();
             report.send(BleEvent::Connected(false));

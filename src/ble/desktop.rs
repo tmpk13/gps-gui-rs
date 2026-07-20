@@ -8,7 +8,10 @@
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
-use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter, WriteType};
+use btleplug::api::{
+    Central, CharPropFlags, Manager as _, Peripheral as _, PeripheralProperties, ScanFilter,
+    WriteType,
+};
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
 use gps_proto::packet::{self, PositionPacket};
@@ -16,7 +19,7 @@ use midair_proto::ble;
 use midair_proto::link::Telemetry;
 use uuid::Uuid;
 
-use super::{settings_event, BleCommand, BleEvent, BleHandle, ConfigWrite};
+use super::{settings_event, BleCommand, BleEvent, BleHandle, ConfigWrite, DiscoveredDevice};
 
 const SERVICE_UUID: Uuid = Uuid::from_u128(packet::SERVICE_UUID_U128);
 const POSITION_UUID: Uuid = Uuid::from_u128(packet::POSITION_UUID_U128);
@@ -72,9 +75,13 @@ impl Reporter {
     }
 }
 
-/// What the UI currently wants from us.
+/// What the UI currently wants from us. `connect` and `scan` are mutually
+/// exclusive: a discovery scan has no link, and a connected session does not
+/// scan.
 struct Wanted {
     connect: bool,
+    /// Run a discovery scan for the device picker; see [`BleCommand::Scan`].
+    scan: bool,
     mac: Option<String>,
     /// The board may be asleep; see [`BleCommand::Connect`]. This transport
     /// always finds its device by scanning, so chasing changes nothing about
@@ -94,10 +101,18 @@ fn drain_commands(
         match cmd_rx.try_recv() {
             Ok(BleCommand::Connect { mac, chase }) => {
                 wanted.connect = true;
+                wanted.scan = false;
                 wanted.mac = mac;
                 wanted.chase = chase;
             }
-            Ok(BleCommand::Disconnect) => wanted.connect = false,
+            Ok(BleCommand::Scan) => {
+                wanted.connect = false;
+                wanted.scan = true;
+            }
+            Ok(BleCommand::Disconnect) => {
+                wanted.connect = false;
+                wanted.scan = false;
+            }
             Ok(BleCommand::Config(w)) => writes.push(w),
             Err(TryRecvError::Empty) => return Ok(()),
             Err(TryRecvError::Disconnected) => return Err(()),
@@ -118,6 +133,7 @@ async fn worker(ctx: egui::Context, tx: Sender<BleEvent>, cmd_rx: Receiver<BleCo
 
     let mut wanted = Wanted {
         connect: false,
+        scan: false,
         mac: None,
         chase: false,
     };
@@ -127,7 +143,7 @@ async fn worker(ctx: egui::Context, tx: Sender<BleEvent>, cmd_rx: Receiver<BleCo
         if drain_commands(&cmd_rx, &mut wanted, &mut writes).is_err() {
             return; // UI has gone away.
         }
-        if !wanted.connect {
+        if !wanted.connect && !wanted.scan {
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         }
@@ -141,6 +157,14 @@ async fn worker(ctx: egui::Context, tx: Sender<BleEvent>, cmd_rx: Receiver<BleCo
             }
         };
 
+        if wanted.scan {
+            if let Err(e) = discover(&adapter, &report, &cmd_rx, &mut wanted, &mut writes).await {
+                report.status(format!("{e}; retrying"));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            continue;
+        }
+
         // One connect attempt; on any failure fall through, wait, retry.
         match session(&adapter, &report, &cmd_rx, &mut wanted, &mut writes).await {
             Ok(()) => {} // clean disconnect requested by the UI
@@ -151,6 +175,60 @@ async fn worker(ctx: egui::Context, tx: Sender<BleEvent>, cmd_rx: Receiver<BleCo
             }
         }
     }
+}
+
+/// Scan without connecting, reporting every board that answers, until the UI
+/// asks for something else. Unlike the scan inside [`session`] this never stops
+/// at the first hit: the picker wants the whole list, and a board that starts
+/// advertising late still has to appear.
+///
+/// Boards are re-reported for as long as the scan runs rather than only on
+/// first sight, so the signal strength the picker shows keeps up with a board
+/// being carried around.
+async fn discover(
+    adapter: &Adapter,
+    report: &Reporter,
+    cmd_rx: &Receiver<BleCommand>,
+    wanted: &mut Wanted,
+    writes: &mut Vec<ConfigWrite>,
+) -> Result<(), String> {
+    report.status("scanning for boards...");
+    adapter
+        .start_scan(ScanFilter {
+            services: vec![SERVICE_UUID],
+        })
+        .await
+        .map_err(|e| format!("scan failed: {e}"))?;
+
+    let result = loop {
+        if drain_commands(cmd_rx, wanted, writes).is_err() || !wanted.scan {
+            break Ok(());
+        }
+        let peripherals = match adapter.peripherals().await {
+            Ok(p) => p,
+            Err(e) => break Err(format!("scan failed: {e}")),
+        };
+        for p in peripherals {
+            // The adapter remembers devices from earlier scans, so match on
+            // what is being advertised now rather than trusting the cache.
+            if let Ok(Some(props)) = p.properties().await {
+                if is_beacon(&props) {
+                    report.send(BleEvent::Discovered(DiscoveredDevice {
+                        address: p.address().to_string(),
+                        name: props.local_name.clone(),
+                        rssi: props.rssi,
+                    }));
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    let _ = adapter.stop_scan().await;
+    if result.is_ok() {
+        report.status("scan stopped");
+    }
+    result
 }
 
 /// Scan for the beacon, connect, run one connected session, then always
@@ -358,8 +436,15 @@ async fn connected(
     }
 }
 
+/// Whether this advertisement is one of our boards: it offers the GPS service,
+/// or it goes by the firmware's name.
+fn is_beacon(props: &PeripheralProperties) -> bool {
+    props.services.contains(&SERVICE_UUID)
+        || props.local_name.as_deref() == Some(packet::DEVICE_NAME)
+}
+
 /// Find a discovered peripheral matching the pinned MAC (case-insensitive) or,
-/// with no MAC, one advertising our service UUID or the beacon name.
+/// with no MAC, the first board that answers.
 async fn find_match(adapter: &Adapter, mac: Option<&str>) -> Option<Peripheral> {
     let peripherals = adapter.peripherals().await.ok()?;
     for p in peripherals {
@@ -370,9 +455,7 @@ async fn find_match(adapter: &Adapter, mac: Option<&str>) -> Option<Peripheral> 
             continue;
         }
         if let Ok(Some(props)) = p.properties().await {
-            if props.services.contains(&SERVICE_UUID)
-                || props.local_name.as_deref() == Some(packet::DEVICE_NAME)
-            {
+            if is_beacon(&props) {
                 return Some(p);
             }
         }

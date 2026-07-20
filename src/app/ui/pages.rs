@@ -523,19 +523,26 @@ impl MyApp {
     /// ever reported by the board (see `board_power_ui`).
     pub(crate) fn beacon_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
         let top = self.top_inset(ctx);
-        let field_width = (screen.width() - 200.0).clamp(120.0, 360.0);
         content_page(ctx, "beacon", screen, top, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Beacon");
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "The BLE link to the GPS beacon.",
+                        "The BLE link to a GPS beacon. One board at a time.",
                     )
                     .weak(),
                 );
                 ui.add_space(12.0);
 
+                // Which board first, then what to do about the link to it.
+                ui.strong("Device");
+                ui.add_space(6.0);
+                self.device_picker_ui(ui);
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(8.0);
                 ui.strong("Link");
                 ui.add_space(6.0);
                 self.ble_link_ui(ui);
@@ -550,24 +557,17 @@ impl MyApp {
                     "Connect automatically at startup",
                 )
                 .on_hover_text("Only read when the app launches; use the buttons above now");
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("MAC:");
-                    let field = egui::TextEdit::singleline(&mut self.ble_mac_text)
-                        .hint_text("empty = scan by service")
-                        .desired_width(field_width);
-                    if ui.add(field).changed() {
-                        let mac = self.ble_mac_text.trim();
-                        self.config.ble.mac = (!mac.is_empty()).then(|| mac.to_string());
-                    }
-                });
-                ui.label(egui::RichText::new("A changed MAC applies on the next Connect.").weak());
                 ui.add_space(6.0);
-                // The two settings above are the app's, not the board's, so
-                // they need the same Save the Settings page has rather than a
-                // trip back to it. Same file, same feedback line.
+                // The board names, the selected board and the checkbox above are
+                // the app's settings, not the board's, so they need the same
+                // Save the Settings page has rather than a trip back to it.
+                // Same file, same feedback line.
                 if ui
                     .button("Save to config file")
-                    .on_hover_text("Write these to the app's config file, set on the Settings page")
+                    .on_hover_text(
+                        "Write the board names and these settings to the app's config file, \
+                         set on the Settings page",
+                    )
                     .clicked()
                 {
                     self.save_config();
@@ -617,6 +617,111 @@ impl MyApp {
         });
     }
 
+    /// Pick which board to talk to. Only one is connected at a time, so this is
+    /// a single-choice list rather than a set of toggles.
+    ///
+    /// Every board runs the same firmware and advertises the same name, so a
+    /// raw scan is a list of identical entries told apart only by MAC. The
+    /// nickname box on each row is what makes the list readable, and it is
+    /// stored in the app's config file rather than on the board.
+    fn device_picker_ui(&mut self, ui: &mut egui::Ui) {
+        let scanning = self.ble_intent == BleIntent::Scanning;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button(if scanning {
+                    "Stop scanning"
+                } else {
+                    "Scan for boards"
+                })
+                .on_hover_text(if scanning {
+                    "Stop looking and leave the list as it stands"
+                } else {
+                    "Look for boards nearby. This drops the current link, since only one board is connected at a time."
+                })
+                .clicked()
+            {
+                self.set_ble_intent(if scanning {
+                    BleIntent::Idle
+                } else {
+                    BleIntent::Scanning
+                });
+            }
+            if scanning {
+                ui.spinner();
+            }
+        });
+        ui.add_space(6.0);
+
+        let rows = self.device_rows();
+        // Named boards are remembered, so an empty list means nothing has ever
+        // been named and nothing is on the air right now.
+        if rows.is_empty() {
+            ui.label(
+                egui::RichText::new(if scanning {
+                    "No boards yet. A sleeping board only answers during its advertising window."
+                } else {
+                    "No boards known yet. Scan to find one, then name it so you can tell it apart later."
+                })
+                .weak(),
+            );
+        }
+
+        let any_selected = self.config.ble.mac.is_none();
+        if ui
+            .radio(any_selected, "Any board")
+            .on_hover_text("Connect to the first board that answers, whichever it is")
+            .clicked()
+            && !any_selected
+        {
+            self.select_device(None);
+        }
+
+        // Sized off the text, so the box holds roughly the same number of
+        // characters whatever the font scale is.
+        let name_width = ui.text_style_height(&egui::TextStyle::Body) * 7.0;
+        for row in rows {
+            ui.horizontal_wrapped(|ui| {
+                if ui.radio(row.selected, "").clicked() && !row.selected {
+                    self.select_device(Some(&row.mac));
+                }
+                // Committing on blur rather than per keystroke: an empty name
+                // forgets the board, and that must not happen mid-edit just
+                // because the box was cleared before retyping.
+                let field = egui::TextEdit::singleline(self.name_edit(&row.mac))
+                    .hint_text("name this board")
+                    .desired_width(name_width);
+                if ui.add(field).lost_focus() {
+                    self.commit_name(&row.mac);
+                }
+                ui.label(egui::RichText::new(row.mac.as_str()).weak());
+                match row.rssi {
+                    // Only a running scan measures this, so its absence during
+                    // a scan is the useful signal: that board is not answering.
+                    Some(rssi) => {
+                        ui.label(egui::RichText::new(format!("{rssi} dBm")).color(OK_GREEN));
+                    }
+                    None if scanning => {
+                        ui.label(egui::RichText::new("not answering").weak());
+                    }
+                    None => {}
+                }
+            });
+        }
+
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "Names are the app's own and are saved with the rest of its settings. \
+                 Clearing a name forgets the board.",
+            )
+            .weak(),
+        );
+        // The signal readings move by themselves while a scan runs.
+        if scanning {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
     /// The link controls: one button per thing you can ask for, plus what the
     /// app and the worker each say is happening.
     ///
@@ -630,7 +735,7 @@ impl MyApp {
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(!connected, egui::Button::new("Connect"))
-                .on_hover_text("Go straight to the pinned MAC, or scan when none is set")
+                .on_hover_text("Go straight to the selected board, or scan when it is set to any")
                 .clicked()
             {
                 self.set_ble_intent(BleIntent::Connect);
@@ -654,6 +759,9 @@ impl MyApp {
         });
 
         ui.add_space(6.0);
+        // Which board these buttons act on. With several boards around, the
+        // link state means little without knowing whose it is.
+        ui.label(format!("Board: {}", self.selected_device_label()));
         if connected {
             ui.colored_label(OK_GREEN, self.ble_intent_text());
         } else if idle {

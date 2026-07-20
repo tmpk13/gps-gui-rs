@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use egui::Pos2;
 use gps_proto::packet::{self, Ack, PositionPacket};
@@ -14,7 +15,7 @@ use walkers::{
 
 use crate::ble::{BleCommand, BleEvent, BleHandle, ConfigWrite, Settings, Telemetry};
 use crate::compass::CompassHandle;
-use crate::config::AppConfig;
+use crate::config::{normalize_mac, AppConfig};
 use crate::gps::GpsFix;
 use crate::offline::{self, DownloadProgress};
 use crate::points::{PointSource, TrackPoint};
@@ -90,6 +91,35 @@ pub(crate) enum BleIntent {
     /// window cannot be missed. Costs more radio time, so it is not the
     /// default.
     ConnectSleeping,
+    /// Look for boards without connecting, to fill the device picker. Only one
+    /// board is ever connected at a time, so this drops any live link.
+    Scanning,
+}
+
+/// How long a board stays in the picker after its last advertisement. Boards
+/// advertise every few hundred ms, so a few seconds of silence means it is out
+/// of range or asleep rather than just between packets.
+const SEEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A board seen by the current scan. The address is the map key and the
+/// advertised name is the same on every board, so the sighting itself carries
+/// only what changes: how strong it was, and when.
+struct Seen {
+    rssi: Option<i16>,
+    /// When it last advertised, for ageing it out of the picker.
+    at: Instant,
+}
+
+/// One row of the device picker: a board the app knows about, whether from the
+/// nicknames in the config or from the running scan.
+pub(crate) struct DeviceRow {
+    /// Normalized MAC; the identity, and the key into the nickname table.
+    pub mac: String,
+    /// Signal strength from the running scan, absent for a board that is only
+    /// known from the config or has not been heard from recently.
+    pub rssi: Option<i16>,
+    /// This board is the pinned one, so it is what Connect will go to.
+    pub selected: bool,
 }
 
 /// A duration in seconds as a short human phrase ("45 s", "5 min", "12 h").
@@ -353,9 +383,14 @@ pub struct MyApp {
     config_path: String,
     /// Result of the last load/save: `Ok` message (green) or error (red).
     config_feedback: Option<Result<String, String>>,
-    /// Text buffer behind the `[ble] mac` input. Empty means "scan by service",
-    /// which is what `config.ble.mac == None` says.
-    ble_mac_text: String,
+    /// Boards seen since the current scan started, keyed by normalized MAC.
+    /// Cleared when a scan begins, so the picker shows what is on the air now
+    /// rather than everything ever seen.
+    discovered: BTreeMap<String, Seen>,
+    /// Text buffers behind the nickname inputs, keyed by normalized MAC. Held
+    /// apart from `config.ble.names` so a half-typed name (or one being cleared)
+    /// is not immediately written back over the config.
+    name_edits: BTreeMap<String, String>,
     /// The WIO-E5 RADIO.TOML being edited on the Radio page, once loaded.
     radio: Option<RadioDoc>,
     /// The RADIO.TOML path typed on the Radio page.
@@ -472,7 +507,8 @@ impl MyApp {
             // same file without the user having to type it.
             config_path: default_config_path(cache_dir.as_deref()),
             config_feedback: None,
-            ble_mac_text: String::new(),
+            discovered: BTreeMap::new(),
+            name_edits: BTreeMap::new(),
             radio: None,
             radio_path: "RADIO.toml".to_string(),
             radio_feedback: None,
@@ -502,9 +538,12 @@ impl MyApp {
         app
     }
 
-    /// Adopt a loaded config: colors, the MAC input, and the BLE connection.
+    /// Adopt a loaded config: colors, the board nicknames, and the BLE
+    /// connection.
     fn apply_config(&mut self, cfg: AppConfig) {
-        self.ble_mac_text = cfg.ble.mac.clone().unwrap_or_default();
+        // The nickname inputs mirror the old config; drop them so each reseeds
+        // from the config just loaded.
+        self.name_edits.clear();
         self.config = cfg;
         self.sync_ble_to_config();
     }
@@ -533,8 +572,14 @@ impl MyApp {
             self.intent_since = Instant::now();
         }
         self.ble_intent = intent;
+        // A new scan starts from an empty list: leaving the last one's boards
+        // there would show devices that may since have gone.
+        if intent == BleIntent::Scanning {
+            self.discovered.clear();
+        }
         let cmd = match intent {
             BleIntent::Idle => BleCommand::Disconnect,
+            BleIntent::Scanning => BleCommand::Scan,
             BleIntent::Connect => BleCommand::Connect {
                 mac: self.config.ble.mac.clone(),
                 chase: false,
@@ -547,6 +592,93 @@ impl MyApp {
         let _ = self.ble.commands.send(cmd);
     }
 
+    /// Pin `mac` (or `None` for "any board") as the device to connect to. When
+    /// something is already connected this switches to the new board, since only
+    /// one is ever connected at a time; while idle it just records the choice.
+    pub(crate) fn select_device(&mut self, mac: Option<&str>) {
+        let mac = mac.map(normalize_mac);
+        if mac == self.config.ble.mac {
+            return;
+        }
+        self.config.ble.mac = mac;
+        self.forget_board_state();
+        // Re-send so the worker switches now rather than at the next Connect.
+        // Scanning is left alone: choosing from the list should not stop the
+        // scan that is filling it.
+        match self.ble_intent {
+            BleIntent::Connect | BleIntent::ConnectSleeping => {
+                self.set_ble_intent(self.ble_intent);
+            }
+            BleIntent::Idle | BleIntent::Scanning => {}
+        }
+    }
+
+    /// Drop everything the last board told us, on switching to a different one.
+    /// None of it describes the new board, and a stale position is the worst of
+    /// it: the map would go on drawing the old board's last fix as if it were
+    /// the one now selected.
+    ///
+    /// `beacon_track` is deliberately kept. It is recorded history that also
+    /// backs the Points page, so discarding it would delete data the user may
+    /// want; the points carry their own timestamps and source.
+    fn forget_board_state(&mut self) {
+        self.beacon = None;
+        self.beacon_time = None;
+        self.beacon_packet = None;
+        self.board_settings = None;
+        self.settings_unsupported = false;
+        self.telemetry = None;
+        self.board_log = None;
+        self.ble_ack = None;
+        self.ble_ack_pending = false;
+    }
+
+    /// The device picker's rows: every board with a nickname, plus every board
+    /// the running scan has heard from. Named boards come first so the list has
+    /// a stable shape between scans, with unnamed ones (seen but never named)
+    /// after them.
+    ///
+    /// The pinned board always gets a row even when it is neither named nor on
+    /// the air, so what the app is set to connect to is never invisible.
+    pub(crate) fn device_rows(&self) -> Vec<DeviceRow> {
+        let mut macs: Vec<String> = self.config.ble.names.keys().cloned().collect();
+        for mac in self.discovered.keys().chain(self.config.ble.mac.iter()) {
+            if !macs.contains(mac) {
+                macs.push(mac.clone());
+            }
+        }
+        macs.into_iter()
+            .map(|mac| DeviceRow {
+                rssi: self
+                    .discovered
+                    .get(&mac)
+                    .filter(|seen| seen.at.elapsed() < SEEN_TIMEOUT)
+                    .and_then(|seen| seen.rssi),
+                selected: self.config.ble.is_selected(&mac),
+                mac,
+            })
+            .collect()
+    }
+
+    /// The nickname input's buffer for `mac`, seeded from the config the first
+    /// time the row is drawn.
+    pub(crate) fn name_edit(&mut self, mac: &str) -> &mut String {
+        if !self.name_edits.contains_key(mac) {
+            let seed = self.config.ble.name_of(mac).unwrap_or_default().to_string();
+            self.name_edits.insert(mac.to_string(), seed);
+        }
+        self.name_edits
+            .get_mut(mac)
+            .expect("inserted above when missing")
+    }
+
+    /// Adopt the typed nickname for `mac`. Blanking it forgets the board, which
+    /// is how a device leaves the picker for good.
+    pub(crate) fn commit_name(&mut self, mac: &str) {
+        let typed = self.name_edits.get(mac).cloned().unwrap_or_default();
+        self.config.ble.set_name(mac, &typed);
+    }
+
     /// What the app is doing about the link, for the Settings and Status
     /// pages. Separate from `ble_status`, which is the worker's own running
     /// commentary on the attempt.
@@ -554,11 +686,23 @@ impl MyApp {
         let waiting = secs_text((self.intent_since.elapsed().as_secs() as u32).max(1));
         match (self.ble_intent, self.ble_connected) {
             (BleIntent::Idle, _) => "Not connecting. The board is free to sleep.".to_string(),
+            (BleIntent::Scanning, _) => {
+                format!("Looking for boards for {waiting}. Not connected to any.")
+            }
             (_, true) => "Connected. The board stays awake until you disconnect.".to_string(),
             (BleIntent::Connect, false) => format!("Connecting for {waiting}."),
             (BleIntent::ConnectSleeping, false) => {
                 format!("Scanning for a sleeping board for {waiting}.")
             }
+        }
+    }
+
+    /// The board the app is pinned to, named for a heading or a status line.
+    /// "Any board" when nothing is pinned, which is what an empty MAC means.
+    pub(crate) fn selected_device_label(&self) -> String {
+        match &self.config.ble.mac {
+            Some(mac) => self.config.ble.label_of(mac),
+            None => "Any board".to_string(),
         }
     }
 
@@ -869,6 +1013,15 @@ impl MyApp {
         while let Ok(event) = self.ble.events.try_recv() {
             match event {
                 BleEvent::Status(s) => self.ble_status = s,
+                BleEvent::Discovered(device) => {
+                    self.discovered.insert(
+                        normalize_mac(&device.address),
+                        Seen {
+                            rssi: device.rssi,
+                            at: Instant::now(),
+                        },
+                    );
+                }
                 BleEvent::Connected(c) => {
                     self.ble_connected = c;
                     self.connected_at = c.then(Instant::now);

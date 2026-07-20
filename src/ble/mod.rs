@@ -21,10 +21,28 @@ mod desktop;
 #[cfg(target_os = "android")]
 mod android;
 
+/// One board seen while scanning, for the Beacon page's device picker.
+///
+/// Every board runs the same firmware and so advertises the same name, which
+/// makes `name` near-useless for telling two apart - the address is the
+/// identity, and the readable label comes from the nicknames in the app config.
+/// `rssi` is what actually distinguishes them in the field: the board in your
+/// hand is the loud one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiscoveredDevice {
+    pub address: String,
+    pub name: Option<String>,
+    pub rssi: Option<i16>,
+}
+
 /// Worker -> UI.
 pub enum BleEvent {
     /// Human-readable connection state for the Beacon page.
     Status(String),
+    /// A board seen during a discovery scan. Sent repeatedly for the same
+    /// board as the scan runs, so the signal strength stays current; the UI
+    /// keys them by address.
+    Discovered(DiscoveredDevice),
     /// Connection state changed; gates the config controls.
     Connected(bool),
     /// A decoded position packet from the beacon.
@@ -57,6 +75,15 @@ pub enum BleCommand {
     /// scans continuously instead - always listening, whenever the window
     /// happens to open.
     Connect { mac: Option<String>, chase: bool },
+    /// Scan without connecting, reporting every board that answers as a
+    /// [`BleEvent::Discovered`], until a `Connect` or `Disconnect` arrives.
+    ///
+    /// Separate from the scan a `Connect` does because the two want opposite
+    /// things: connecting takes the first board that matches and stops, while
+    /// the picker needs to keep looking so a board that advertises late still
+    /// turns up in the list. Only one board is ever connected at a time, so
+    /// this drops any live link first.
+    Scan,
     /// Write one setting to the config characteristic. The device answers on
     /// the ack characteristic with the value it actually applied.
     Config(ConfigWrite),

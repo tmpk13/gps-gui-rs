@@ -24,7 +24,7 @@ More color changes.
 
 App needs to read the stats over usb from ESP as well.
 
-Have receiver mode to get info from mesh.
+Have receiver mode to get info.
 
 Disconnect button or toggle (Must force disconnect).
 
@@ -40,3 +40,8 @@ Red pulsing icons at the top should be only pulsing for a time if pressed when n
 Maybe make top bar a dropdown?
 
 Text goes behind the page menu dropdown button.
+
+~~Need to be able to handel multiple ESP's BLE at once. (Probably one at a time? Names? Select from a list?)~~
+One at a time, picked from a scanned list, named in the app config (`[ble.names]`).
+
+Change `gps-config.toml` name.

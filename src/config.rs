@@ -30,9 +30,14 @@
 //! show_path = false   # draw the path of the incoming BLE GPS data
 //! mac = "AA:BB:CC:DD:EE:FF"  # pin a specific device; omit to scan by service
 //!
+//! [ble.names]         # nicknames for known boards, keyed by MAC
+//! "AA:BB:CC:DD:EE:FF" = "Truck"
+//!
 //! [track]
 //! min_distance = 3.0  # meters of movement before a new track point is recorded
 //! ```
+
+use std::collections::BTreeMap;
 
 use egui::Color32;
 use serde::Deserialize;
@@ -167,6 +172,12 @@ pub struct BleSettings {
     pub show_path: bool,
     /// Pin a specific device MAC; `None` scans for the GPS service.
     pub mac: Option<String>,
+    /// Nicknames for known boards, keyed by MAC. Every board runs the same
+    /// firmware and so advertises the same name, which makes a scan a list of
+    /// identical entries; these names are what tells them apart in the picker.
+    /// Keys are normalized by [`normalize_mac`] so lookups ignore case and
+    /// separator style.
+    pub names: BTreeMap<String, String>,
 }
 
 impl Default for BleSettings {
@@ -175,8 +186,55 @@ impl Default for BleSettings {
             enabled: true,
             show_path: false,
             mac: None,
+            names: BTreeMap::new(),
         }
     }
+}
+
+impl BleSettings {
+    /// The nickname for `mac`, if one is set.
+    pub fn name_of(&self, mac: &str) -> Option<&str> {
+        self.names.get(&normalize_mac(mac)).map(String::as_str)
+    }
+
+    /// Name `mac`, or forget it when `name` is blank - clearing the box is how
+    /// a board leaves the picker.
+    pub fn set_name(&mut self, mac: &str, name: &str) {
+        let key = normalize_mac(mac);
+        let name = name.trim();
+        if name.is_empty() {
+            self.names.remove(&key);
+        } else {
+            self.names.insert(key, name.to_string());
+        }
+    }
+
+    /// How this device should be labelled: its nickname, or the MAC itself
+    /// when it has none.
+    pub fn label_of(&self, mac: &str) -> String {
+        self.name_of(mac).unwrap_or(mac).to_string()
+    }
+
+    /// True when `mac` is the pinned device, comparing normalized.
+    pub fn is_selected(&self, mac: &str) -> bool {
+        self.mac.as_deref().map(normalize_mac) == Some(normalize_mac(mac))
+    }
+}
+
+/// A MAC as a table key: uppercase, colon-separated. Boards report addresses in
+/// whatever case their stack prefers and a hand-typed one may use dashes, so
+/// keying on the raw string would file the same board twice.
+pub fn normalize_mac(mac: &str) -> String {
+    mac.trim()
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_ascii_uppercase()
+        .as_bytes()
+        .chunks(2)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// Track recording settings.
@@ -246,6 +304,8 @@ struct RawBle {
     enabled: Option<bool>,
     show_path: Option<bool>,
     mac: Option<String>,
+    #[serde(default)]
+    names: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -293,6 +353,41 @@ fn set(doc: &mut DocumentMut, section: &str, key: &str, value: Value) {
         *value.decor_mut() = toml_edit::Decor::new(" ", "");
     }
     table.insert(key, Item::Value(value));
+}
+
+/// Rewrite `[ble.names]` to match `names`, adding the sub-table when it is
+/// missing. Entries that are still present keep their decor (so a comment on a
+/// nickname line survives), entries no longer in the map are dropped - that is
+/// what makes "forget this board" stick across a save.
+///
+/// MAC keys need quoting, which `toml_edit` applies by itself: a bare key
+/// cannot contain colons, so it falls back to a quoted one.
+fn set_names(doc: &mut DocumentMut, names: &BTreeMap<String, String>) {
+    let table = doc
+        .entry("ble")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let Some(table) = table.as_table_mut() else {
+        return;
+    };
+    let names_table = table
+        .entry("names")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let Some(names_table) = names_table.as_table_mut() else {
+        return;
+    };
+    // Drop keys we no longer know, and any spelled differently from the
+    // canonical form - the loop below re-adds those under their normalized
+    // key, and keeping the old spelling would file the same board twice.
+    names_table.retain(|key, _| names.contains_key(key) && normalize_mac(key) == key);
+    for (mac, name) in names {
+        if let Some(old) = names_table.get(mac).and_then(Item::as_value) {
+            let mut value: Value = name.as_str().into();
+            *value.decor_mut() = old.decor().clone();
+            names_table.insert(mac, Item::Value(value));
+        } else {
+            names_table.insert(mac, Item::Value(name.as_str().into()));
+        }
+    }
 }
 
 /// Validate an overlay size: finite and strictly positive.
@@ -366,6 +461,7 @@ impl AppConfig {
             "min_distance",
             self.track.min_distance.into(),
         );
+        set_names(&mut doc, &self.ble.names);
         std::fs::write(path, doc.to_string()).map_err(|e| format!("{path}: {e}"))?;
         Ok(false)
     }
@@ -374,6 +470,18 @@ impl AppConfig {
     /// page generates when there is no config file yet.
     pub fn to_toml(&self) -> String {
         let s = &self.sizes;
+        // With no boards named yet, show the shape as a comment: the section is
+        // hand-editable, and an empty header explains nothing about what goes
+        // in it.
+        let names = if self.ble.names.is_empty() {
+            "# \"AA:BB:CC:DD:EE:FF\" = \"Truck\"\n".to_string()
+        } else {
+            self.ble
+                .names
+                .iter()
+                .map(|(mac, name)| format!("{mac:?} = {name:?}\n"))
+                .collect()
+        };
         format!(
             "# gps-gui-rs settings. Every key is optional; a missing one keeps its default.\n\
              \n\
@@ -398,6 +506,9 @@ impl AppConfig {
              show_path = {show_path}    # draw the path of the incoming BLE GPS data\n\
              mac = \"{mac}\"            # pin a specific device; empty scans by service\n\
              \n\
+             [ble.names]          # nicknames for known boards; they all advertise the same name\n\
+             {names}\
+             \n\
              [track]\n\
              min_distance = {min_distance:?}   # meters of movement before a new track point\n",
             track = hex(self.colors.track),
@@ -413,6 +524,7 @@ impl AppConfig {
             enabled = self.ble.enabled,
             show_path = self.ble.show_path,
             mac = self.ble.mac.clone().unwrap_or_default(),
+            names = names,
             min_distance = self.track.min_distance,
         )
     }
@@ -459,6 +571,15 @@ impl AppConfig {
         // Treat an empty string as unset so a template line can stay in the
         // file.
         config.ble.mac = raw.ble.mac.filter(|m| !m.trim().is_empty());
+        // Normalize on the way in: a hand-edited file may spell a MAC any way,
+        // and the picker looks these up by normalized key.
+        config.ble.names = raw
+            .ble
+            .names
+            .into_iter()
+            .filter(|(_, name)| !name.trim().is_empty())
+            .map(|(mac, name)| (normalize_mac(&mac), name.trim().to_string()))
+            .collect();
         if let Some(v) = raw.track.min_distance {
             if !v.is_finite() || v < 0.0 {
                 return Err(format!("track.min_distance must be >= 0, got {v}"));
@@ -535,6 +656,73 @@ mod tests {
         let back = AppConfig::load(path).unwrap();
         assert_eq!(back.sizes.marker, 12.5);
         assert_eq!(back.colors.track, Color32::from_rgb(1, 2, 3));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mac_normalization_folds_case_and_separators() {
+        assert_eq!(normalize_mac("aa:bb:cc:dd:ee:ff"), "AA:BB:CC:DD:EE:FF");
+        assert_eq!(normalize_mac("AA-BB-CC-DD-EE-FF"), "AA:BB:CC:DD:EE:FF");
+        assert_eq!(normalize_mac(" aabbccddeeff "), "AA:BB:CC:DD:EE:FF");
+    }
+
+    #[test]
+    fn names_are_found_however_the_mac_is_spelled() {
+        let cfg = AppConfig::from_toml(
+            "[ble]\nmac = \"aa:bb:cc:dd:ee:ff\"\n\n[ble.names]\n\"AA-BB-CC-DD-EE-FF\" = \"Truck\"\n",
+        )
+        .unwrap();
+        // Stored canonically regardless of how the file spelled it.
+        assert_eq!(cfg.ble.names.get("AA:BB:CC:DD:EE:FF").unwrap(), "Truck");
+        assert_eq!(cfg.ble.name_of("aa:bb:cc:dd:ee:ff"), Some("Truck"));
+        // The pinned MAC matches the same board despite the different spelling.
+        assert!(cfg.ble.is_selected("AA-BB-CC-DD-EE-FF"));
+        assert!(!cfg.ble.is_selected("11:22:33:44:55:66"));
+    }
+
+    #[test]
+    fn unnamed_board_falls_back_to_its_mac() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.ble.label_of("AA:BB:CC:DD:EE:FF"), "AA:BB:CC:DD:EE:FF");
+    }
+
+    #[test]
+    fn set_name_adds_renames_and_forgets() {
+        let mut ble = BleSettings::default();
+        ble.set_name("aa:bb:cc:dd:ee:ff", "Truck");
+        assert_eq!(ble.name_of("AA:BB:CC:DD:EE:FF"), Some("Truck"));
+        // Renaming through a different spelling hits the same entry.
+        ble.set_name("AA-BB-CC-DD-EE-FF", "Van");
+        assert_eq!(ble.names.len(), 1);
+        assert_eq!(ble.name_of("AA:BB:CC:DD:EE:FF"), Some("Van"));
+        // Blanking the name forgets the board.
+        ble.set_name("AA:BB:CC:DD:EE:FF", "  ");
+        assert!(ble.names.is_empty());
+    }
+
+    #[test]
+    fn saved_names_round_trip_and_forgetting_sticks() {
+        let path = std::env::temp_dir().join("gps-gui-rs-config-names-test.toml");
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+
+        let mut cfg = AppConfig::default();
+        cfg.ble.set_name("AA:BB:CC:DD:EE:FF", "Truck");
+        cfg.ble.set_name("11:22:33:44:55:66", "Backpack");
+        // No file yet, so this generates one from the template.
+        assert!(cfg.save(path).unwrap());
+        let back = AppConfig::load(path).unwrap();
+        assert_eq!(back.ble.name_of("AA:BB:CC:DD:EE:FF"), Some("Truck"));
+        assert_eq!(back.ble.name_of("11:22:33:44:55:66"), Some("Backpack"));
+
+        // Forget one and save over the existing file: the line has to go, not
+        // linger because the edit-in-place path only ever adds.
+        let mut cfg = back;
+        cfg.ble.set_name("11:22:33:44:55:66", "");
+        assert!(!cfg.save(path).unwrap());
+        let back = AppConfig::load(path).unwrap();
+        assert_eq!(back.ble.name_of("AA:BB:CC:DD:EE:FF"), Some("Truck"));
+        assert_eq!(back.ble.name_of("11:22:33:44:55:66"), None);
         let _ = std::fs::remove_file(path);
     }
 
