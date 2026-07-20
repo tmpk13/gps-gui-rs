@@ -24,7 +24,7 @@ mod android;
 
 /// Worker -> UI.
 pub enum BleEvent {
-    /// Human-readable connection state for the Settings page.
+    /// Human-readable connection state for the Beacon page.
     Status(String),
     /// Connection state changed; gates the config controls.
     Connected(bool),

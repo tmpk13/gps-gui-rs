@@ -26,6 +26,9 @@ const BUTTON_PAD_Y_FRAC: f32 = 0.45;
 /// the smaller screen dimension.
 const CORNER_MARGIN_FRAC: f32 = 0.03;
 
+/// Margin between a content page's body and the screen edge, in points.
+const PAGE_MARGIN: i8 = 16;
+
 /// Green "ok" and red "error" used for the feedback lines across the pages.
 const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(60, 180, 75);
 const ERR_RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 60);
@@ -89,10 +92,10 @@ fn icon_button_pulse(
     ui.add(button)
 }
 
-/// A full-screen page: a Background `Area` filled with the panel color, a 16pt
-/// margin, sized to the screen, with the top safe-area inset already skipped.
-/// The closure supplies the page's heading and body (and its own `ScrollArea`
-/// where one is used).
+/// A full-screen page: a Background `Area` filled with the panel color, a
+/// [`PAGE_MARGIN`] margin, sized to the screen, with the top safe-area inset
+/// already skipped. The closure supplies the page's heading and body (and its
+/// own `ScrollArea` where one is used).
 fn content_page(
     ctx: &egui::Context,
     id: &str,
@@ -108,9 +111,17 @@ fn content_page(
         .show(ctx, |ui| {
             egui::Frame::NONE
                 .fill(ui.visuals().panel_fill)
-                .inner_margin(egui::Margin::same(16))
+                .inner_margin(egui::Margin::same(PAGE_MARGIN))
                 .show(ui, |ui| {
-                    ui.set_min_size(screen.size());
+                    // An Area sizes itself to whatever it held last frame, so
+                    // its Ui has no width to wrap against until something pins
+                    // one: without this a long label lays out as one endless
+                    // line and widens the page instead of wrapping. `set_width`
+                    // pins both bounds, which is also what makes the frame
+                    // (content plus its two margins) exactly screen-wide.
+                    let margin = f32::from(PAGE_MARGIN);
+                    ui.set_width(screen.width() - 2.0 * margin);
+                    ui.set_min_height(screen.height() - 2.0 * margin);
                     ui.add_space(top + 8.0);
                     add(ui);
                 });
@@ -134,7 +145,11 @@ fn background_area(
             egui::Frame::NONE
                 .fill(ui.visuals().panel_fill)
                 .show(ui, |ui| {
-                    ui.set_min_size(screen.size());
+                    // Bounded width for the same reason as `content_page`: it
+                    // is what lets text wrap, and what the centering measures
+                    // against.
+                    ui.set_width(screen.width());
+                    ui.set_min_height(screen.height());
                     add(ui);
                 });
         });
@@ -189,7 +204,7 @@ fn status_bool(ui: &mut egui::Ui, label: &str, ok: bool) {
 
 /// Every page in menu order, each with its label and icon. Drives the page
 /// dropdown menu.
-fn page_items() -> [(Page, &'static str, egui::ImageSource<'static>); 6] {
+fn page_items() -> [(Page, &'static str, egui::ImageSource<'static>); 7] {
     [
         (
             Page::Map,
@@ -210,6 +225,11 @@ fn page_items() -> [(Page, &'static str, egui::ImageSource<'static>); 6] {
             Page::Status,
             "Status",
             egui::include_image!("../../../assets/icons/status.svg"),
+        ),
+        (
+            Page::Beacon,
+            "Beacon",
+            egui::include_image!("../../../assets/icons/beacon.svg"),
         ),
         (
             Page::Settings,

@@ -1,5 +1,6 @@
 //! The non-map pages: the plain Data read-out, the searchable Points list, the
-//! board Status page, the Settings page, and the desktop manual-position bar.
+//! board Status page, the Beacon and Settings pages, and the desktop
+//! manual-position bar.
 
 use std::time::{Duration, SystemTime};
 
@@ -85,7 +86,7 @@ impl MyApp {
             ui.heading("GPS points");
             ui.add_space(12.0);
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.points_search)
                         .hint_text("search (e.g. 51.47 or central)")
@@ -96,7 +97,7 @@ impl MyApp {
                 }
             });
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Source:");
                 ui.selectable_value(&mut self.points_filter, PointFilter::All, "all");
                 // The source names come from `PointSource::label`, so the
@@ -300,7 +301,7 @@ impl MyApp {
                     ui.add_space(8.0);
                     ui.label(
                         "The GPS/LoRa power rail is switched off, so the WIO-E5 and the GPS \
-                         are unpowered and report nothing. Turn it on under Settings.",
+                         are unpowered and report nothing. Turn it on under Beacon.",
                     );
                 } else if warming {
                     ui.add_space(8.0);
@@ -365,9 +366,10 @@ impl MyApp {
         });
     }
 
-    /// The settings page: edit the app's own TOML settings and write them back
-    /// to the config file, then talk to the BLE beacon (status, notify interval
-    /// with device ack).
+    /// The settings page: the app's own TOML settings - what it draws, what it
+    /// records, and the config file itself. The beacon and the board's own
+    /// settings are a separate page ([`MyApp::beacon_page`]); the split is by
+    /// who owns the setting, since only the ones here are the app's to keep.
     ///
     /// Every widget here is bound straight to the live [`crate::config::AppConfig`],
     /// so a change takes effect on the map immediately; Save is what makes it
@@ -378,11 +380,19 @@ impl MyApp {
         let field_width = (screen.width() - 200.0).clamp(120.0, 360.0);
         content_page(ctx, "settings", screen, top, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Settings");
+                ui.heading("App settings");
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "What the app draws and records, kept in its own TOML file. The link to \
+                         the beacon and the board's own settings are on the Beacon page.",
+                    )
+                    .weak(),
+                );
                 ui.add_space(12.0);
 
                 ui.label("Config file (TOML):");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let field = egui::TextEdit::singleline(&mut self.config_path)
                         .hint_text("/path/to/config.toml")
                         .desired_width(field_width);
@@ -394,7 +404,7 @@ impl MyApp {
                 });
 
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui
                         .button("Save")
                         .on_hover_text(
@@ -447,7 +457,8 @@ impl MyApp {
                 });
 
                 ui.add_space(16.0);
-                ui.strong("Beacon distance");
+                ui.strong("Map overlays");
+                ui.checkbox(&mut self.config.ble.show_path, "Show beacon path on map");
                 ui.checkbox(
                     &mut self.config.distance.show,
                     "Show distance on the line to the beacon",
@@ -456,7 +467,7 @@ impl MyApp {
                     &mut self.config.distance.dotted,
                     "Draw that line dotted rather than solid",
                 );
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Units:");
                     ui.selectable_value(
                         &mut self.config.distance.units,
@@ -472,7 +483,9 @@ impl MyApp {
 
                 ui.add_space(16.0);
                 ui.strong("Track recording");
-                ui.horizontal(|ui| {
+                // Wrapped, not plain horizontal: the label is long enough to
+                // push the drag off a phone-width screen otherwise.
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Minimum move between points (m):");
                     ui.add(
                         egui::DragValue::new(&mut self.config.track.min_distance)
@@ -487,7 +500,7 @@ impl MyApp {
                     ui.add_space(16.0);
                     ui.separator();
                     ui.add_space(8.0);
-                    ui.heading("Offline maps");
+                    ui.strong("Offline maps");
                     ui.add_space(8.0);
                     let downloading = self.download.is_some();
                     if ui
@@ -505,22 +518,49 @@ impl MyApp {
                         ui.label("A download is already in progress.");
                     }
                 }
+            });
+        });
+    }
+
+    /// The beacon page: the BLE link to the board, the app-side settings that
+    /// decide how it connects, and the board's own power and sleep settings.
+    ///
+    /// Split from [`MyApp::settings_page`] by who owns each setting. The two
+    /// groups here read alike but are not: the connection settings are the
+    /// app's, saved to its TOML with the button beside them, while everything
+    /// under "Board power and sleep" lives in the board's flash and is only
+    /// ever reported by the board (see `board_power_ui`).
+    pub(crate) fn beacon_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let top = self.top_inset(ctx);
+        let field_width = (screen.width() - 200.0).clamp(120.0, 360.0);
+        content_page(ctx, "beacon", screen, top, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Beacon");
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "The BLE link to the GPS beacon, and the settings the board keeps for \
+                         itself. What the app draws for it is on the Settings page.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(12.0);
+
+                ui.strong("Link");
+                ui.add_space(6.0);
+                self.ble_link_ui(ui);
 
                 ui.add_space(16.0);
                 ui.separator();
                 ui.add_space(8.0);
-                ui.heading("GPS beacon (BLE)");
-                ui.add_space(8.0);
-                self.ble_link_ui(ui);
-
-                ui.add_space(12.0);
-                ui.checkbox(&mut self.config.ble.show_path, "Show beacon path on map");
+                ui.strong("Connection");
+                ui.add_space(6.0);
                 ui.checkbox(
                     &mut self.config.ble.enabled,
                     "Connect automatically at startup",
                 )
                 .on_hover_text("Only read when the app launches; use the buttons above now");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("MAC:");
                     let field = egui::TextEdit::singleline(&mut self.ble_mac_text)
                         .hint_text("empty = scan by service")
@@ -530,15 +570,27 @@ impl MyApp {
                         self.config.ble.mac = (!mac.is_empty()).then(|| mac.to_string());
                     }
                 });
-                ui.label(
-                    egui::RichText::new("A changed MAC applies on the next Connect.").weak(),
-                );
+                ui.label(egui::RichText::new("A changed MAC applies on the next Connect.").weak());
+                ui.add_space(6.0);
+                // The two settings above are the app's, not the board's, so
+                // they need the same Save the Settings page has rather than a
+                // trip back to it. Same file, same feedback line.
+                if ui
+                    .button("Save to config file")
+                    .on_hover_text("Write these to the app's config file, set on the Settings page")
+                    .clicked()
+                {
+                    self.save_config();
+                }
+                feedback_label(ui, &self.config_feedback);
 
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Notify interval (ms):");
+                    let width = ui.text_style_height(&egui::TextStyle::Body) * 5.0;
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.ble_interval_text).desired_width(80.0),
+                        egui::TextEdit::singleline(&mut self.ble_interval_text)
+                            .desired_width(width),
                     );
                     let ready = self.ble_connected && !self.ble_ack_pending;
                     let apply = ui.add_enabled(ready, egui::Button::new("Apply"));
@@ -561,7 +613,7 @@ impl MyApp {
                 ui.add_space(16.0);
                 ui.separator();
                 ui.add_space(8.0);
-                ui.heading("Board power and sleep");
+                ui.strong("Board power and sleep");
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
@@ -739,7 +791,7 @@ impl MyApp {
             .weak(),
         );
         let width = ui.text_style_height(&egui::TextStyle::Body) * 5.0;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Every (s):");
             ui.add(
                 egui::TextEdit::singleline(&mut self.sleep_interval_text).desired_width(width),
@@ -788,7 +840,7 @@ impl MyApp {
                 ui.add_space(12.0);
 
                 ui.label("File:");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let field = egui::TextEdit::singleline(&mut self.radio_path)
                         .hint_text("/path/to/RADIO.toml")
                         .desired_width((screen.width() - 200.0).clamp(120.0, 360.0));
@@ -891,7 +943,9 @@ impl MyApp {
         );
         // Action buttons sized to the text, so nothing is a raw pixel constant.
         let bsz = ui.text_style_height(&egui::TextStyle::Body) * 1.2;
-        ui.horizontal(|ui| {
+        // Wrapped so a long key or value drops its input to the next line
+        // rather than pushing the edit buttons past the screen edge.
+        ui.horizontal_wrapped(|ui| {
             ui.monospace(key);
             if active {
                 if let RadioEdit::Active { val, .. } = &mut self.radio_edit {

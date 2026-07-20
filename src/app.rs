@@ -172,7 +172,10 @@ pub enum Page {
     Points,
     /// Board health for the esp32c6-gps board (ESP/WIO/GPS/LoRa).
     Status,
-    /// Loading the TOML config file (marker colors, BLE beacon).
+    /// The BLE beacon: the link, and the board's own power and sleep settings.
+    Beacon,
+    /// The app's own settings, from the TOML config file (marker colors,
+    /// overlay sizes, distance read-out, track recording, offline maps).
     Settings,
     /// Viewing and editing the WIO-E5 RADIO.TOML (radio, mesh, beacon, GPS).
     Radio,
@@ -309,10 +312,10 @@ pub struct MyApp {
     beacon_packet: Option<PositionPacket>,
     /// Every beacon position recorded, for the path drawing and points list.
     beacon_track: Vec<TrackPoint>,
-    /// Last BLE status line, for the Settings page.
+    /// Last BLE status line, for the Beacon page.
     ble_status: String,
     ble_connected: bool,
-    /// Notify-interval input on the Settings page.
+    /// Notify-interval input on the Beacon page.
     ble_interval_text: String,
     /// Result of the last config write: device ack (green) or error (red).
     ble_ack: Option<Result<String, String>>,
@@ -339,7 +342,7 @@ pub struct MyApp {
     /// once a central connects, so telemetry is legitimately empty for the
     /// first seconds and the Status page says warming up, not broken.
     connected_at: Option<Instant>,
-    /// Wake-check interval input (seconds) on the Settings page.
+    /// Wake-check interval input (seconds) on the Beacon page.
     sleep_interval_text: String,
     /// Which screen is currently shown.
     page: Page,
@@ -945,6 +948,7 @@ impl eframe::App for MyApp {
             Page::Data => self.data_page(&ctx, screen),
             Page::Points => self.points_page(&ctx, screen),
             Page::Status => self.status_page(&ctx, screen),
+            Page::Beacon => self.beacon_page(&ctx, screen),
             Page::Settings => self.settings_page(&ctx, screen),
             Page::Radio => self.radio_page(&ctx, screen),
         }

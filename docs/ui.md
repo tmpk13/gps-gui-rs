@@ -15,8 +15,8 @@ The UI is [egui](https://docs.rs/egui) in immediate mode, driven each frame by
     layout constants, the page-menu dropdown, and the floating corner toggle.
   - `map.rs` - the interactive map page: the map itself, the controls bar,
     marker info popups, and the offline region-download selection/progress.
-  - `pages.rs` - the non-map pages: Data, Points, Status, Settings, Radio, and
-    the desktop manual-position bar.
+  - `pages.rs` - the non-map pages: Data, Points, Status, Beacon, Settings,
+    Radio, and the desktop manual-position bar.
 
 The page renderers read state that lives outside the UI too: `src/config.rs`
 holds the app's own TOML settings, and `src/radio.rs` holds the WIO-E5
@@ -65,11 +65,21 @@ Every page is built from a few helpers so each renderer reads as its own
 content rather than boilerplate:
 
 - `content_page(ctx, id, screen, top, add)` - a full-screen `Background` area
-  filled with the panel color, a 16pt margin, with the top safe-area inset
-  already skipped. The closure supplies the heading and body. Used by Points,
-  Status, Settings.
+  filled with the panel color, a `PAGE_MARGIN` margin, with the top safe-area
+  inset already skipped. The closure supplies the heading and body. Used by
+  Points, Status, Beacon, Settings, Radio.
 - `background_area(...)` - like `content_page` but with no margin/top spacing,
   for a page that centers its own content (the Data page).
+
+Both **pin the body's width** (`set_width`), and that is load-bearing rather
+than cosmetic. An `Area` sizes itself to whatever it held last frame, so its
+`Ui` has no width to wrap text against: a long label lays out as one endless
+line and widens the page instead of wrapping, and it never shrinks back. Pinning
+the width to the screen less the two margins is what makes the paragraphs on
+Status, Beacon and Settings wrap - and it also makes the frame exactly
+screen-wide. Rows that pair a long label with an input use `horizontal_wrapped`
+for the same reason: a plain `horizontal` never wraps, so on a phone the input
+is pushed off the edge.
 - `floating(ctx, id, order, pos, pivot, constrain, add)` - a popup `Frame` in
   its own area, for the transient overlays (selection hint, download confirm
   and progress, marker info bubble, manual position bar).
@@ -203,6 +213,16 @@ The app's own TOML settings are edited here, not just loaded. Every widget binds
 straight to the live `AppConfig` on `MyApp`, so a change shows on the map at
 once; the file is only touched by the buttons.
 
+**The split with the Beacon page is by who owns the setting**, not by subject.
+Settings holds what the app owns and can save: the config file itself, the
+marker colors and overlay sizes, what the map draws (including the beacon path
+and the distance read-out), track recording, and the offline-map download.
+Everything the *board* owns, plus the link that reaches it, is on the Beacon
+page below. Two beacon-related app settings (`[ble] enabled` and `mac`) live
+there anyway, because they decide how the link is made and are useless apart
+from it; they repeat the Save button rather than sending you back here for it,
+writing the same file and sharing the same `config_feedback` line.
+
 - **Save** (`MyApp::save_config` -> `AppConfig::save`) edits an existing file in
   place with `toml_edit`: comments, key order, and any keys the app knows nothing
   about survive, and only the values it owns are replaced (each keeps the decor
@@ -221,11 +241,17 @@ once; the file is only touched by the buttons.
   empty means "scan by service". Changing `enabled`/`mac` takes effect on
   Reconnect, not per keystroke.
 
+## The Beacon page (`pages.rs` + `ble/`)
+
+Everything about the beacon that is not drawing: the link (`ble_link_ui`), the
+two connection settings above, the notify interval, and the board's own power
+and sleep settings.
+
 ### Board power and sleep (`board_power_ui`)
 
-The bottom section of the page drives the ESP32-C6's own power rail and deep
-sleep. Unlike everything above it, **none of it is app state**: the board holds
-these in flash and is the authority on them.
+The bottom section of the Beacon page drives the ESP32-C6's own power rail and
+deep sleep. Unlike everything above it, **none of it is app state**: the board
+holds these in flash and is the authority on them.
 
 - **The board tells us, we do not tell the board.** The worker reads
   `ble::SETTINGS_UUID` on connect and subscribes to it; each blob decodes into
