@@ -255,6 +255,22 @@ these in flash and is the authority on them.
   event that can land while the Settings page holds unsaved edits, and a full
   `save` would commit those behind the user's back. With no config file to
   write to, the page says so in red rather than pretending it was remembered.
+- **Getting a sleeping board back** (`wake_mode_ui`). A sleeping board - stowed
+  or just on a wake-check interval - advertises for only about 15 s per wake,
+  so the only way in is to be listening when a window opens. The toggle sets
+  `MyApp::wake_mode`, which makes `sync_ble_to_config` send
+  `Connect { chase: true }` and overrides the stow suppression above without
+  clearing it: switching the toggle off puts things back exactly as they were,
+  still stowed. It clears itself on a successful connect. Unlike Reconnect,
+  which *is* the deliberate "forget the stow and connect" action.
+- **`chase` is what makes the two transports behave the same.** Desktop always
+  finds its device by scanning, so chasing only changes its status line. The
+  Android worker normally shortcuts a pinned MAC straight to `connectGatt`,
+  which is a *bounded* attempt - retried on a fixed cycle it can stay out of
+  phase with a 15 s window for a very long time. Chasing makes it scan and
+  match the address among the hits instead, exactly as desktop does, so it is
+  always listening. The shortcut stays for the normal case, where a continuous
+  low-latency scan would cost battery for nothing.
 
 ## The Radio config page (`pages.rs` + `radio.rs`)
 

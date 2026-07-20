@@ -599,10 +599,16 @@ impl MyApp {
                      auto-connect and disarm the stow. Save on this page first to keep it.",
                 );
             }
+            ui.add_space(8.0);
+            self.wake_mode_ui(ui, Some(secs));
             return;
         }
         if !self.ble_connected {
             ui.label("Connect to the board to see and change these.");
+            // A board on a wake-check interval advertises in the same brief
+            // windows a stowed one does, so the same chase applies.
+            ui.add_space(8.0);
+            self.wake_mode_ui(ui, None);
             return;
         }
         if self.settings_unsupported {
@@ -742,6 +748,58 @@ impl MyApp {
                 secs_text(s.stow_interval_s)
             ));
         }
+    }
+
+    /// The keep-trying-to-wake toggle, with how long it has been at it.
+    /// `stowed_for` is the interval the board is sleeping for when that is
+    /// known, which is what sets expectations for the wait.
+    fn wake_mode_ui(&mut self, ui: &mut egui::Ui, stowed_for: Option<u32>) {
+        // Offering to chase a board the master switch says not to talk to
+        // would only be a way to contradict it.
+        if !self.config.ble.enabled {
+            ui.label(
+                egui::RichText::new("Connecting to the beacon is switched off above.").weak(),
+            );
+            return;
+        }
+        let mut on = self.wake_mode;
+        if ui
+            .checkbox(&mut on, "Keep trying to wake it")
+            .on_hover_text(
+                "Scan without stopping so a wake window cannot be missed. Leaves the stow \
+                 alone: switching this off puts things back as they were.",
+            )
+            .changed()
+        {
+            self.set_wake_mode(on);
+        }
+        if !self.wake_mode {
+            return;
+        }
+
+        // Clamped off zero: `secs_text` reads 0 as "off", which is right for
+        // an interval and nonsense for an elapsed time.
+        let waiting = self
+            .wake_started
+            .map_or(1, |t| t.elapsed().as_secs().max(1) as u32);
+        ui.label(format!("Listening for {}.", secs_text(waiting)));
+        ui.label(
+            egui::RichText::new(match stowed_for {
+                Some(secs) => format!(
+                    "The board wakes about every {}, then advertises for around 15 s. Its \
+                     clock is a free-running RC oscillator, so a wake can drift tens of \
+                     minutes either way - this has to keep listening rather than time it.",
+                    secs_text(secs)
+                ),
+                None => "The board advertises for around 15 s per wake, so this has to be \
+                         listening when a window opens."
+                    .to_string(),
+            })
+            .weak(),
+        );
+        // The elapsed line is the only thing on the page that moves by itself;
+        // a one-second tick keeps it honest without pinning the frame rate.
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
     }
 
     /// Arming a stow is confirmed first: it disconnects immediately and leaves

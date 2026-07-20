@@ -53,7 +53,13 @@ pub enum BleEvent {
 pub enum BleCommand {
     /// Start (or restart) connecting. `mac` pins a specific device; `None`
     /// scans for the first device advertising the GPS service.
-    Connect { mac: Option<String> },
+    ///
+    /// `chase` says the board may be asleep, advertising for only about 15 s
+    /// per wake. That rules out bounded connect attempts, which can keep
+    /// missing a window they are out of phase with, so a chasing transport
+    /// scans continuously instead - always listening, whenever the window
+    /// happens to open.
+    Connect { mac: Option<String>, chase: bool },
     /// Write one setting to the config characteristic. The device answers on
     /// the ack characteristic with the value it actually applied.
     Config(ConfigWrite),

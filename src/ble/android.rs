@@ -186,11 +186,20 @@ fn worker(
 
     let mut wanted_connect = false;
     let mut mac: Option<String> = None;
+    let mut chase = false;
     let mut writes: Vec<ConfigWrite> = Vec::new();
     let mut permissions_done = false;
 
     loop {
-        if drain_commands(&cmd_rx, &mut wanted_connect, &mut mac, &mut writes).is_err() {
+        if drain_commands(
+            &cmd_rx,
+            &mut wanted_connect,
+            &mut mac,
+            &mut chase,
+            &mut writes,
+        )
+        .is_err()
+        {
             return Ok(()); // UI has gone away
         }
         if !wanted_connect {
@@ -211,6 +220,7 @@ fn worker(
             &cmd_rx,
             &mut wanted_connect,
             &mut mac,
+            &mut chase,
             &mut writes,
         ) {
             Ok(()) => {} // clean stop requested by the UI
@@ -228,13 +238,15 @@ fn drain_commands(
     cmd_rx: &Receiver<BleCommand>,
     wanted_connect: &mut bool,
     mac: &mut Option<String>,
+    chase: &mut bool,
     writes: &mut Vec<ConfigWrite>,
 ) -> Result<(), ()> {
     loop {
         match cmd_rx.try_recv() {
-            Ok(BleCommand::Connect { mac: m }) => {
+            Ok(BleCommand::Connect { mac: m, chase: c }) => {
                 *wanted_connect = true;
                 *mac = m;
+                *chase = c;
             }
             Ok(BleCommand::Disconnect) => *wanted_connect = false,
             Ok(BleCommand::Config(w)) => writes.push(w),
@@ -254,6 +266,7 @@ fn session(
     cmd_rx: &Receiver<BleCommand>,
     wanted_connect: &mut bool,
     mac: &mut Option<String>,
+    chase: &mut bool,
     writes: &mut Vec<ConfigWrite>,
 ) -> Result<(), String> {
     let session_mac = mac.clone();
@@ -262,24 +275,37 @@ fn session(
     // that raced the teardown), so the waits below cannot match them.
     while cb_rx.try_recv().is_ok() {}
 
-    // Resolve the target address: pinned MAC, or first scan hit advertising
-    // the GPS service (the scan is filtered device-side by service UUID).
+    // Resolve the target address. A pinned MAC normally connects straight
+    // off, which is cheaper than scanning. That is the wrong primitive for a
+    // board that may be asleep: `connect` is a bounded attempt, and retrying
+    // it on a fixed cycle can stay out of phase with a 15 s advertising
+    // window for a long time. Chasing therefore scans instead - always
+    // listening, so any window is caught the moment it opens - and matches
+    // the pinned address among the hits, exactly as the desktop worker does.
     let address = match session_mac.clone() {
-        Some(m) => m,
-        None => {
-            report.status("scanning for GPS beacon...");
+        Some(m) if !*chase => m,
+        pinned => {
+            report.status(if pinned.is_some() {
+                "waiting for a wake window..."
+            } else {
+                "scanning for GPS beacon..."
+            });
             if !bridge.start_scan(packet::SERVICE_UUID) {
                 return Err("scan failed (Bluetooth off?)".into());
             }
             let found = loop {
-                if drain_commands(cmd_rx, wanted_connect, mac, writes).is_err()
+                if drain_commands(cmd_rx, wanted_connect, mac, chase, writes).is_err()
                     || !*wanted_connect
                 {
                     bridge.stop_scan();
                     return Ok(());
                 }
                 match cb_rx.recv_timeout(Duration::from_millis(300)) {
-                    Ok(Cb::Scan { address }) => break address,
+                    Ok(Cb::Scan { address }) => match &pinned {
+                        // Another GPS board answering the same service filter.
+                        Some(m) if !address.eq_ignore_ascii_case(m) => {}
+                        _ => break address,
+                    },
                     Ok(_) => {}
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return Err("worker gone".into()),
@@ -394,7 +420,7 @@ fn session(
             Err(RecvTimeoutError::Disconnected) => return Err("worker gone".into()),
         }
 
-        if drain_commands(cmd_rx, wanted_connect, mac, writes).is_err() || !*wanted_connect {
+        if drain_commands(cmd_rx, wanted_connect, mac, chase, writes).is_err() || !*wanted_connect {
             bridge.disconnect();
             report.send(BleEvent::Connected(false));
             report.status("disconnected");

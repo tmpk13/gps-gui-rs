@@ -325,6 +325,13 @@ pub struct MyApp {
     /// The current stow was written to the config file, so it will still be
     /// known after a restart. False when there was no file to write it to.
     stow_persisted: bool,
+    /// Keep scanning for a sleeping board until it answers. A sleeping board
+    /// advertises for only about 15 s per wake, so the only way to reach one
+    /// is to be listening when a window opens - which may be hours away.
+    /// Session state: closing the app is a natural way to give up.
+    wake_mode: bool,
+    /// When the current wake attempt started, for the elapsed read-out.
+    wake_started: Option<Instant>,
     /// When the current connection came up. The GPS/LoRa rail only powers on
     /// once a central connects, so telemetry is legitimately empty for the
     /// first seconds and the Status page says warming up, not broken.
@@ -443,6 +450,8 @@ impl MyApp {
             stow_confirm: None,
             stowed: None,
             stow_persisted: false,
+            wake_mode: false,
+            wake_started: None,
             connected_at: None,
             // Both start at the low end of their clamp range, so a stray press
             // arms the shortest sleep rather than the longest.
@@ -501,14 +510,28 @@ impl MyApp {
     /// sleep on purpose would undo it - every launch, until the battery went.
     /// Reconnect is the way back in.
     fn sync_ble_to_config(&mut self) {
-        let cmd = if self.config.ble.enabled && self.config.ble.stowed_s == 0 {
+        let chasing = self.wake_mode;
+        let cmd = if chasing || (self.config.ble.enabled && self.config.ble.stowed_s == 0) {
             BleCommand::Connect {
                 mac: self.config.ble.mac.clone(),
+                chase: chasing,
             }
         } else {
             BleCommand::Disconnect
         };
         let _ = self.ble.commands.send(cmd);
+    }
+
+    /// Turn the keep-trying-to-wake mode on or off.
+    ///
+    /// Unlike Reconnect this leaves the stow memory alone: giving up on waking
+    /// a board should put things back exactly as they were, still stowed and
+    /// still not auto-connected, rather than quietly arming the app to disarm
+    /// the stow the next time it drifts past.
+    pub(crate) fn set_wake_mode(&mut self, on: bool) {
+        self.wake_mode = on;
+        self.wake_started = on.then(Instant::now);
+        self.sync_ble_to_config();
     }
 
     /// Remember that the board stowed itself, or - with 0 - that it is awake
@@ -852,6 +875,9 @@ impl MyApp {
                         // it also means the board has disarmed any stow, so
                         // the memory of one goes with it.
                         stow_memory = Some(0);
+                        // Whatever we were waiting for has happened.
+                        self.wake_mode = false;
+                        self.wake_started = None;
                         self.board_settings = None;
                         self.settings_unsupported = false;
                         self.telemetry = None;
@@ -951,5 +977,57 @@ impl eframe::App for MyApp {
         if self.gps_rx.is_none() && matches!(self.page, Page::Map | Page::Data) {
             self.manual_gps_bar(&ctx, screen);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reading 0 as "off" is what the interval read-outs want, and is exactly
+    /// wrong for an elapsed time - the wake-mode line clamps off zero for it.
+    #[test]
+    fn secs_text_scales_and_calls_zero_off() {
+        assert_eq!(secs_text(0), "off");
+        assert_eq!(secs_text(1), "1 s");
+        assert_eq!(secs_text(45), "45 s");
+        assert_eq!(secs_text(60), "1 min");
+        assert_eq!(secs_text(900), "15 min");
+        assert_eq!(secs_text(3600), "1 h");
+        assert_eq!(secs_text(43200), "12 h");
+        // Not a whole number of hours, so it keeps a decimal.
+        assert_eq!(secs_text(45000), "12.5 h");
+    }
+
+    /// The WIO statuses are a link failure between the ESP and the WIO-E5, not
+    /// a rejected value, and have to read as something the user can act on.
+    #[test]
+    fn ack_message_separates_wio_faults_from_rejections() {
+        let ack = |id, status| Ack {
+            id,
+            status,
+            value_u32: None,
+        };
+        assert!(ack_message(&Ack {
+            id: ble::CFG_ESP_SLEEP_S,
+            status: packet::ACK_OK,
+            value_u32: Some(300),
+        })
+        .unwrap()
+        .contains("5 min"));
+
+        let wio = ack_message(&ack(ble::CFG_WIO_SLEEP, ble::ACK_WIO_TIMEOUT)).unwrap_err();
+        assert!(wio.contains("WIO-E5"), "{wio}");
+        let bad = ack_message(&ack(ble::CFG_PWR_EN, packet::ACK_BAD_VALUE)).unwrap_err();
+        assert!(bad.contains("GPS/LoRa power"), "{bad}");
+        // A stow arm of 0 is a disarm, and must not read as "stow for off".
+        assert_eq!(
+            ack_message(&Ack {
+                id: ble::CFG_ESP_STOW_S,
+                status: packet::ACK_OK,
+                value_u32: Some(0),
+            }),
+            Ok("Board applied: stow disarmed".to_string())
+        );
     }
 }

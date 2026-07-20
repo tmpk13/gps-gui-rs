@@ -76,6 +76,10 @@ impl Reporter {
 struct Wanted {
     connect: bool,
     mac: Option<String>,
+    /// The board may be asleep; see [`BleCommand::Connect`]. This transport
+    /// always finds its device by scanning, so chasing changes nothing about
+    /// how it connects - only what it tells the user it is waiting for.
+    chase: bool,
 }
 
 /// Drain pending commands. Config writes are queued into `writes` so a
@@ -88,9 +92,10 @@ fn drain_commands(
 ) -> Result<(), ()> {
     loop {
         match cmd_rx.try_recv() {
-            Ok(BleCommand::Connect { mac }) => {
+            Ok(BleCommand::Connect { mac, chase }) => {
                 wanted.connect = true;
                 wanted.mac = mac;
+                wanted.chase = chase;
             }
             Ok(BleCommand::Disconnect) => wanted.connect = false,
             Ok(BleCommand::Config(w)) => writes.push(w),
@@ -128,6 +133,7 @@ async fn worker(ctx: egui::Context, tx: Sender<BleEvent>, cmd_rx: Receiver<BleCo
     let mut wanted = Wanted {
         connect: false,
         mac: None,
+        chase: false,
     };
     let mut writes: Vec<ConfigWrite> = Vec::new();
 
@@ -172,7 +178,11 @@ async fn session(
 ) -> Result<(), String> {
     let session_mac = wanted.mac.clone();
 
-    report.status("scanning for GPS beacon...");
+    report.status(if wanted.chase {
+        "waiting for a wake window..."
+    } else {
+        "scanning for GPS beacon..."
+    });
     let filter = ScanFilter {
         services: vec![SERVICE_UUID],
     };
