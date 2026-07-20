@@ -17,8 +17,9 @@ use crate::points::{age_text, PointSource, TrackPoint};
 use crate::radio::{EditVal, FieldType};
 
 use super::{
-    content_page, feedback_label, floating, icon_button, status_bool, CORNER_MARGIN_FRAC, ERR_RED,
-    OK_GREEN,
+    content_page, em, feedback_label, field_width, floating, gap, icon_button, page_margin,
+    status_bool, CORNER_MARGIN_FRAC, ERR_RED, GAP_BLOCK, GAP_HAIR, GAP_ITEM, GAP_SECTION,
+    GAP_TIGHT, OK_GREEN,
 };
 
 /// How long after connecting the board counts as warming up. The GPS/LoRa
@@ -52,7 +53,7 @@ fn radio_input(ui: &mut egui::Ui, key: &str, ty: &FieldType, val: &mut EditVal) 
                     });
             } else {
                 // Width in text units, not raw pixels, so it scales with the font.
-                let width = ui.text_style_height(&egui::TextStyle::Body) * 12.0;
+                let width = em(ui) * 12.0;
                 ui.add(egui::TextEdit::singleline(s).desired_width(width));
             }
         }
@@ -84,19 +85,21 @@ impl MyApp {
         let bottom = self.bottom_inset(ctx);
         content_page(ctx, "points", screen, top, |ui| {
             ui.heading("GPS points");
-            ui.add_space(12.0);
+            gap(ui, GAP_BLOCK);
 
             ui.horizontal_wrapped(|ui| {
+                // Most of the row, leaving the Clear button beside it.
+                let width = field_width(ui, screen, 0.6);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.points_search)
                         .hint_text("search (example 51.47 or central)")
-                        .desired_width((screen.width() - 140.0).clamp(120.0, 320.0)),
+                        .desired_width(width),
                 );
                 if ui.button("Clear").clicked() {
                     self.points_search.clear();
                 }
             });
-            ui.add_space(4.0);
+            gap(ui, GAP_HAIR);
             ui.horizontal_wrapped(|ui| {
                 ui.label("Source:");
                 ui.selectable_value(&mut self.points_filter, PointFilter::All, "all");
@@ -113,7 +116,7 @@ impl MyApp {
                     PointSource::Esp.label(),
                 );
             });
-            ui.add_space(8.0);
+            gap(ui, GAP_ITEM);
 
             let query = self.points_search.trim().to_lowercase();
             let mut rows: Vec<TrackPoint> = self
@@ -129,11 +132,14 @@ impl MyApp {
 
             let total = self.track.len() + self.beacon_track.len();
             ui.label(format!("{} of {total} points", rows.len()));
-            ui.add_space(4.0);
+            gap(ui, GAP_HAIR);
 
             let now = SystemTime::now();
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-            let list_height = (screen.bottom() - bottom - ui.cursor().min.y - 16.0).max(60.0);
+            // Everything left below the filters, less the page's own bottom
+            // margin, and never so short that no row fits.
+            let list_height = (screen.bottom() - bottom - ui.cursor().min.y - page_margin(screen))
+                .max(em(ui) * 4.0);
             let mut goto: Option<Position> = None;
             egui::ScrollArea::vertical()
                 .max_height(list_height)
@@ -179,9 +185,10 @@ impl MyApp {
             |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Position:");
+                    let width = field_width(ui, screen, 0.5);
                     let field = egui::TextEdit::singleline(&mut self.manual_gps_text)
                         .hint_text("lat, lon")
-                        .desired_width((screen.width() * 0.5).clamp(140.0, 320.0));
+                        .desired_width(width);
                     let resp = ui.add(field);
                     let entered =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -220,7 +227,7 @@ impl MyApp {
         content_page(ctx, "status", screen, top, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Status");
-                ui.add_space(12.0);
+                gap(ui, GAP_BLOCK);
 
                 // Where we are, and how far off the beacon is. First because it
                 // is the one section that needs no board at all.
@@ -245,7 +252,7 @@ impl MyApp {
 
                 // The beacon's own position, when it is streaming.
                 if let (Some(b), Some(p)) = (self.beacon, self.beacon_packet) {
-                    ui.add_space(8.0);
+                    gap(ui, GAP_ITEM);
                     ui.label(
                         egui::RichText::new(format!("Beacon: {:.5}, {:.5}", b.y(), b.x()))
                             .monospace(),
@@ -260,7 +267,7 @@ impl MyApp {
                 }
 
                 // ESP32-C6 / BLE link.
-                ui.add_space(16.0);
+                gap(ui, GAP_SECTION);
                 ui.strong("ESP32-C6 (BLE)");
                 status_bool(ui, "Link", self.ble_connected);
                 ui.label(self.ble_intent_text());
@@ -290,13 +297,13 @@ impl MyApp {
                     .is_some_and(|t| t.elapsed() < BOARD_WARMUP);
                 let rail_off = self.board_settings.is_some_and(|s| !s.pwr_en);
                 if rail_off {
-                    ui.add_space(8.0);
+                    gap(ui, GAP_ITEM);
                     ui.label(
                         "The GPS/LoRa power rail is switched off, so the WIO-E5 and the GPS \
                          are unpowered and report nothing. Turn it on under Beacon.",
                     );
                 } else if warming {
-                    ui.add_space(8.0);
+                    gap(ui, GAP_ITEM);
                     ui.label(
                         "Warming up: the rail powers on at connect, so the WIO-E5 is still \
                          booting and the GPS is working on a cold fix.",
@@ -304,7 +311,7 @@ impl MyApp {
                 }
 
                 let Some(t) = self.telemetry else {
-                    ui.add_space(16.0);
+                    gap(ui, GAP_SECTION);
                     if !warming && !rail_off {
                         ui.label(
                             "No board telemetry yet.\n\
@@ -313,7 +320,7 @@ impl MyApp {
                         );
                     }
                     if let Some(line) = &self.board_log {
-                        ui.add_space(16.0);
+                        gap(ui, GAP_SECTION);
                         ui.strong("Last message");
                         ui.label(egui::RichText::new(line).monospace());
                     }
@@ -321,13 +328,13 @@ impl MyApp {
                 };
 
                 // GPS (via the WIO's MAX-M10).
-                ui.add_space(16.0);
+                gap(ui, GAP_SECTION);
                 ui.strong("GPS");
                 status_bool(ui, "Fix", t.flags & TELEM_FLAG_GPS_FIX != 0);
                 ui.label(format!("Satellites: {}", t.sats));
 
                 // LoRa mesh link (WIO-E5 radio).
-                ui.add_space(16.0);
+                gap(ui, GAP_SECTION);
                 ui.strong("LoRa");
                 let last_rx = match t.secs_since_rx {
                     0xFFFF => "never".to_string(),
@@ -344,13 +351,13 @@ impl MyApp {
                 ui.label(format!("RX: {}   TX: {}", t.rx_count, t.tx_count));
 
                 // WIO-E5 housekeeping.
-                ui.add_space(16.0);
+                gap(ui, GAP_SECTION);
                 ui.strong("WIO-E5");
                 status_bool(ui, "SD logging", t.flags & TELEM_FLAG_SD_OK != 0);
                 status_bool(ui, "Radio config", t.flags & TELEM_FLAG_CFG_LOADED != 0);
 
                 if let Some(line) = &self.board_log {
-                    ui.add_space(16.0);
+                    gap(ui, GAP_SECTION);
                     ui.strong("Last message");
                     ui.label(egui::RichText::new(line).monospace());
                 }
@@ -368,25 +375,26 @@ impl MyApp {
     /// outlast the session.
     pub(crate) fn settings_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
         let top = self.top_inset(ctx);
-        // The field column is the screen less room for its label and buttons.
-        let field_width = (screen.width() - 200.0).clamp(120.0, 360.0);
         content_page(ctx, "settings", screen, top, |ui| {
+            // The field column is half the screen, leaving room for its label
+            // and the buttons beside it.
+            let path_width = field_width(ui, screen, 0.5);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("App settings");
-                ui.add_space(6.0);
+                gap(ui, GAP_TIGHT);
                 ui.label(
                     egui::RichText::new(
                         "What the app draws and records, kept in its own TOML file.",
                     )
                     .weak(),
                 );
-                ui.add_space(12.0);
+                gap(ui, GAP_BLOCK);
 
                 ui.label("Config file (TOML):");
                 ui.horizontal_wrapped(|ui| {
                     let field = egui::TextEdit::singleline(&mut self.config_path)
                         .hint_text("/path/to/config.toml")
-                        .desired_width(field_width);
+                        .desired_width(path_width);
                     let resp = ui.add(field);
                     let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Load").clicked() || entered {
@@ -394,7 +402,7 @@ impl MyApp {
                     }
                 });
 
-                ui.add_space(8.0);
+                gap(ui, GAP_ITEM);
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .button("Save")
@@ -414,10 +422,10 @@ impl MyApp {
                     }
                 });
 
-                ui.add_space(8.0);
+                gap(ui, GAP_ITEM);
                 feedback_label(ui, &self.config_feedback);
 
-                ui.add_space(16.0);
+                gap(ui, GAP_SECTION);
                 ui.strong("Marker colors");
                 egui::Grid::new("cfg_colors").num_columns(2).show(ui, |ui| {
                     ui.label("track");
@@ -428,7 +436,7 @@ impl MyApp {
                     ui.end_row();
                 });
 
-                ui.add_space(16.0);
+                gap(ui, GAP_SECTION);
                 ui.strong("Overlay sizes (points)");
                 let s = &mut self.config.sizes;
                 egui::Grid::new("cfg_sizes").num_columns(2).show(ui, |ui| {
@@ -447,7 +455,7 @@ impl MyApp {
                     }
                 });
 
-                ui.add_space(16.0);
+                gap(ui, GAP_SECTION);
                 ui.strong("Map overlays");
                 ui.checkbox(&mut self.config.ble.show_path, "Show beacon path on map");
                 ui.checkbox(
@@ -472,7 +480,7 @@ impl MyApp {
                     );
                 });
 
-                ui.add_space(16.0);
+                gap(ui, GAP_SECTION);
                 ui.strong("Track recording");
                 // Wrapped, not plain horizontal: the label is long enough to
                 // push the drag off a phone-width screen otherwise.
@@ -488,11 +496,11 @@ impl MyApp {
                 // Offline maps: start a region download. Only when tiles are cached
                 // to disk; jumps to the map and begins the box selection there.
                 if self.cache_dir.is_some() {
-                    ui.add_space(16.0);
+                    gap(ui, GAP_SECTION);
                     ui.separator();
-                    ui.add_space(8.0);
+                    gap(ui, GAP_ITEM);
                     ui.strong("Offline maps");
-                    ui.add_space(8.0);
+                    gap(ui, GAP_ITEM);
                     let downloading = self.download.is_some();
                     if ui
                         .add_enabled(!downloading, egui::Button::new("Download region"))
@@ -526,38 +534,38 @@ impl MyApp {
         content_page(ctx, "beacon", screen, top, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Beacon");
-                ui.add_space(6.0);
+                gap(ui, GAP_TIGHT);
                 ui.label(
                     egui::RichText::new(
                         "The BLE link to a GPS beacon. One board at a time.",
                     )
                     .weak(),
                 );
-                ui.add_space(12.0);
+                gap(ui, GAP_BLOCK);
 
                 // Which board first, then what to do about the link to it.
                 ui.strong("Device");
-                ui.add_space(6.0);
+                gap(ui, GAP_TIGHT);
                 self.device_picker_ui(ui);
 
-                ui.add_space(16.0);
+                gap(ui, GAP_SECTION);
                 ui.separator();
-                ui.add_space(8.0);
+                gap(ui, GAP_ITEM);
                 ui.strong("Link");
-                ui.add_space(6.0);
+                gap(ui, GAP_TIGHT);
                 self.ble_link_ui(ui);
 
-                ui.add_space(16.0);
+                gap(ui, GAP_SECTION);
                 ui.separator();
-                ui.add_space(8.0);
+                gap(ui, GAP_ITEM);
                 ui.strong("Connection");
-                ui.add_space(6.0);
+                gap(ui, GAP_TIGHT);
                 ui.checkbox(
                     &mut self.config.ble.enabled,
                     "Connect automatically at startup",
                 )
                 .on_hover_text("Only read when the app launches; use the buttons above now");
-                ui.add_space(6.0);
+                gap(ui, GAP_TIGHT);
                 // The board names, the selected board and the checkbox above are
                 // the app's settings, not the board's, so they need the same
                 // Save the Settings page has rather than a trip back to it.
@@ -574,10 +582,10 @@ impl MyApp {
                 }
                 feedback_label(ui, &self.config_feedback);
 
-                ui.add_space(8.0);
+                gap(ui, GAP_ITEM);
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Notify interval (ms):");
-                    let width = ui.text_style_height(&egui::TextStyle::Body) * 5.0;
+                    let width = em(ui) * 5.0;
                     ui.add(
                         egui::TextEdit::singleline(&mut self.ble_interval_text)
                             .desired_width(width),
@@ -600,18 +608,18 @@ impl MyApp {
                     feedback_label(ui, &self.ble_ack);
                 }
 
-                ui.add_space(16.0);
+                gap(ui, GAP_SECTION);
                 ui.separator();
-                ui.add_space(8.0);
+                gap(ui, GAP_ITEM);
                 ui.strong("Board power and sleep");
-                ui.add_space(6.0);
+                gap(ui, GAP_TIGHT);
                 ui.label(
                     egui::RichText::new(
                         "ESP32-C6 settings. The board keeps these in flash, so they outlast a power cycle.",
                     )
                     .weak(),
                 );
-                ui.add_space(8.0);
+                gap(ui, GAP_ITEM);
                 self.board_power_ui(ui);
             });
         });
@@ -650,7 +658,7 @@ impl MyApp {
                 ui.spinner();
             }
         });
-        ui.add_space(6.0);
+        gap(ui, GAP_TIGHT);
 
         let rows = self.device_rows();
         // Named boards are remembered, so an empty list means nothing has ever
@@ -678,7 +686,7 @@ impl MyApp {
 
         // Sized off the text, so the box holds roughly the same number of
         // characters whatever the font scale is.
-        let name_width = ui.text_style_height(&egui::TextStyle::Body) * 7.0;
+        let name_width = em(ui) * 7.0;
         for row in rows {
             ui.horizontal_wrapped(|ui| {
                 if ui.radio(row.selected, "").clicked() && !row.selected {
@@ -708,7 +716,7 @@ impl MyApp {
             });
         }
 
-        ui.add_space(6.0);
+        gap(ui, GAP_TIGHT);
         ui.label(
             egui::RichText::new(
                 "Names are the app's own and are saved with the rest of its settings. \
@@ -758,7 +766,7 @@ impl MyApp {
             }
         });
 
-        ui.add_space(6.0);
+        gap(ui, GAP_TIGHT);
         // Which board these buttons act on. With several boards around, the
         // link state means little without knowing whose it is.
         ui.label(format!("Board: {}", self.selected_device_label()));
@@ -778,7 +786,7 @@ impl MyApp {
         // nothing" is usually just the app holding the link open.
         if connected {
             if let Some(s) = self.board_settings {
-                ui.add_space(4.0);
+                gap(ui, GAP_HAIR);
                 ui.label(
                     egui::RichText::new(match s.sleep_interval_s {
                         0 => "Sleep is disabled on the board, so it stays awake after you \
@@ -795,7 +803,7 @@ impl MyApp {
             }
         }
         if !connected && !idle {
-            ui.add_space(4.0);
+            gap(ui, GAP_HAIR);
             ui.label(
                 egui::RichText::new(
                     "During sleep intervals the board is only reachable on its advertising window.",
@@ -869,7 +877,7 @@ impl MyApp {
             }
         });
 
-        ui.add_space(12.0);
+        gap(ui, GAP_BLOCK);
         ui.strong("Wake check");
         ui.label(
             egui::RichText::new(format!(
@@ -879,12 +887,10 @@ impl MyApp {
             ))
             .weak(),
         );
-        let width = ui.text_style_height(&egui::TextStyle::Body) * 5.0;
+        let width = em(ui) * 5.0;
         ui.horizontal_wrapped(|ui| {
             ui.label("Every (s):");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.sleep_interval_text).desired_width(width),
-            );
+            ui.add(egui::TextEdit::singleline(&mut self.sleep_interval_text).desired_width(width));
             if ui.add_enabled(!busy, egui::Button::new("Apply")).clicked() {
                 match self.sleep_interval_text.trim().parse::<u32>() {
                     Ok(secs) => self.send_config(ConfigWrite::Seconds {
@@ -913,7 +919,7 @@ impl MyApp {
             secs => format!("Board: waking every {}.", secs_text(secs)),
         });
 
-        ui.add_space(12.0);
+        gap(ui, GAP_BLOCK);
         ui.strong("Advertising window");
         ui.label(
             egui::RichText::new(format!(
@@ -957,15 +963,16 @@ impl MyApp {
         content_page(ctx, "radio", screen, top, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Radio config");
-                ui.add_space(6.0);
+                gap(ui, GAP_TIGHT);
                 ui.label(egui::RichText::new("WIO-E5 RADIO.TOML for the esp32c6-gps board.").weak());
-                ui.add_space(12.0);
+                gap(ui, GAP_BLOCK);
 
                 ui.label("File:");
                 ui.horizontal_wrapped(|ui| {
+                    let width = field_width(ui, screen, 0.5);
                     let field = egui::TextEdit::singleline(&mut self.radio_path)
                         .hint_text("/path/to/RADIO.toml")
-                        .desired_width((screen.width() - 200.0).clamp(120.0, 360.0));
+                        .desired_width(width);
                     let resp = ui.add(field);
                     let entered =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -978,20 +985,20 @@ impl MyApp {
                         self.save_radio();
                     }
                 });
-                ui.add_space(6.0);
+                gap(ui, GAP_TIGHT);
                 feedback_label(ui, &self.radio_feedback);
 
                 if self.radio.is_some() {
-                    ui.add_space(8.0);
+                    gap(ui, GAP_ITEM);
                     self.radio_fields_ui(ui);
                     self.radio_backups_ui(ui);
                 } else {
-                    ui.add_space(12.0);
+                    gap(ui, GAP_BLOCK);
                     ui.label(
                         "Load a RADIO.TOML to view and edit the radio, mesh, beacon and GPS \
                          settings.",
                     );
-                    ui.add_space(8.0);
+                    gap(ui, GAP_ITEM);
                     // With no file to load (a fresh SD card), start from the
                     // firmware defaults instead. It fills the editor only; Save
                     // is what writes the file.
@@ -1034,7 +1041,7 @@ impl MyApp {
                 )
             };
             if section != section_shown {
-                ui.add_space(10.0);
+                gap(ui, GAP_BLOCK);
                 ui.strong(if section.is_empty() {
                     "general"
                 } else {
@@ -1064,7 +1071,7 @@ impl MyApp {
                 if s.as_str() == section && k.as_str() == key
         );
         // Action buttons sized to the text, so nothing is a raw pixel constant.
-        let bsz = ui.text_style_height(&egui::TextStyle::Body) * 1.2;
+        let bsz = em(ui) * 1.2;
         // Wrapped so a long key or value drops its input to the next line
         // rather than pushing the edit buttons past the screen edge.
         ui.horizontal_wrapped(|ui| {
@@ -1117,7 +1124,7 @@ impl MyApp {
         if let Some(d) = desc {
             ui.label(egui::RichText::new(d).weak().small());
         }
-        ui.add_space(6.0);
+        gap(ui, GAP_TIGHT);
     }
 
     /// The floating Edit / Cancel popup shown when a field's pencil is pressed.
@@ -1136,7 +1143,7 @@ impl MyApp {
             false,
             |ui| {
                 ui.label(format!("Edit \"{key}\"?"));
-                ui.add_space(8.0);
+                gap(ui, GAP_ITEM);
                 ui.horizontal(|ui| {
                     if ui.button("Edit").clicked() {
                         let val = self
@@ -1165,7 +1172,7 @@ impl MyApp {
             Some(r) => r.backups(),
             None => return,
         };
-        ui.add_space(12.0);
+        gap(ui, GAP_BLOCK);
         ui.separator();
         egui::CollapsingHeader::new(format!("Backups ({})", backups.len()))
             .id_salt("radio_backups")

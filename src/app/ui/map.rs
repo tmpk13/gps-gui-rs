@@ -15,8 +15,8 @@ use crate::points::age_text;
 use crate::tiles::MapLayer;
 
 use super::{
-    floating, icon_button, icon_button_pulse, icon_size_for, icon_size_for_row, BUTTON_PAD_X_FRAC,
-    BUTTON_PAD_Y_FRAC, ERR_RED,
+    floating, gap, icon_button, icon_button_pulse, icon_size_for, icon_size_for_row,
+    BUTTON_PAD_X_FRAC, BUTTON_PAD_Y_FRAC, CORNER_MARGIN_FRAC, ERR_RED, GAP_ITEM,
 };
 
 /// Where the map looks before the first GPS fix arrives.
@@ -31,8 +31,15 @@ const MAX_REGION_TILES: u64 = 10_000;
 /// Rough average size of a cached OSM tile, for the download estimate.
 const TILE_SIZE_ESTIMATE_KB: u64 = 15;
 
-/// How close (in points) a double-click must land to a marker to select it.
-const MARKER_HIT_RADIUS: f32 = 40.0;
+/// How close a double-click must land to a marker to select it: one icon side,
+/// so the reach is the same as a toolbar button's touch target.
+fn marker_hit_radius(screen: egui::Rect) -> f32 {
+    icon_size_for(screen)
+}
+
+/// Smallest box drag that counts as a region selection rather than a tap, as a
+/// fraction of the smaller screen dimension.
+const MIN_DRAG_FRAC: f32 = 0.025;
 
 /// Seconds per beat of the connected-beacon heartbeat, and how often that
 /// animation asks for a repaint. A beat a second reads as a pulse rather than a
@@ -41,9 +48,21 @@ const MARKER_HIT_RADIUS: f32 = 40.0;
 const PULSE_PERIOD: f64 = 1.0;
 const PULSE_FRAME: f32 = 0.05;
 
-/// Inner margin of the controls bar frame, in points.
-const CONTROLS_MARGIN_X: i8 = 8;
-const CONTROLS_MARGIN_Y: i8 = 4;
+/// Inner margin of the controls bar frame, as a fraction of the smaller screen
+/// dimension. Wider than it is tall: the bar spans the screen, so the side gaps
+/// are what keep the end buttons off the edges.
+const CONTROLS_MARGIN_X_FRAC: f32 = 0.02;
+const CONTROLS_MARGIN_Y_FRAC: f32 = 0.01;
+
+/// The controls bar margins in whole points, rounded once so the frame and the
+/// width it pins on its content cannot disagree.
+fn controls_margin(screen: egui::Rect) -> (i8, i8) {
+    let side = screen.size().min_elem();
+    (
+        (side * CONTROLS_MARGIN_X_FRAC) as i8,
+        (side * CONTROLS_MARGIN_Y_FRAC) as i8,
+    )
+}
 
 impl MyApp {
     fn controls(&mut self, ui: &mut egui::Ui, screen: egui::Rect) {
@@ -400,7 +419,9 @@ impl MyApp {
         let rot = rotation.unwrap_or(Rot2::IDENTITY);
         let mid = user_px + (beacon_px - user_px) * 0.5;
         let size = self.config.sizes.distance_text;
-        let pad = size * 0.4 + 4.0;
+        // Lift off the line by a fraction of the label's own font size, so the
+        // gap stays the same to the eye at any configured text size.
+        let pad = size * 0.7;
         let anchor = rotate_pos(mid, rot, clip.center()) + rot * egui::Vec2::new(0.0, -pad);
 
         // The label reads in the theme's text color lightened a little (the
@@ -553,18 +574,16 @@ impl MyApp {
             .movable(false)
             .constrain(false)
             .show(ctx, |ui| {
+                let (margin_x, margin_y) = controls_margin(screen);
                 egui::Frame::NONE
                     .fill(ui.visuals().panel_fill)
-                    .inner_margin(egui::Margin::symmetric(
-                        CONTROLS_MARGIN_X,
-                        CONTROLS_MARGIN_Y,
-                    ))
+                    .inner_margin(egui::Margin::symmetric(margin_x, margin_y))
                     .show(ui, |ui| {
                         // The frame's margin is part of the screen width, so the
                         // content gets what is left of it. Setting the full width
                         // here would push the bar (and the button row it sizes)
                         // past the right edge by the margin.
-                        ui.set_width(screen.width() - 2.0 * f32::from(CONTROLS_MARGIN_X));
+                        ui.set_width(screen.width() - 2.0 * f32::from(margin_x));
                         ui.add_space(top);
                         self.controls(ui, screen);
                     });
@@ -687,7 +706,7 @@ impl MyApp {
                     .filter_map(|(kind, pos)| {
                         pos.as_ref().map(|p| (*kind, to_screen(*p).distance(click)))
                     })
-                    .filter(|(_, dist)| *dist <= MARKER_HIT_RADIUS)
+                    .filter(|(_, dist)| *dist <= marker_hit_radius(screen))
                     .min_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(kind, _)| kind);
             }
@@ -716,7 +735,8 @@ impl MyApp {
             ctx,
             "marker_info",
             egui::Order::Foreground,
-            egui::pos2(anchor.x, anchor.y - 14.0),
+            // Clear of the marker it points at, by about a third of an icon side.
+            egui::pos2(anchor.x, anchor.y - icon_size_for(screen) * 0.35),
             egui::Align2::CENTER_BOTTOM,
             true,
             |ui| {
@@ -769,7 +789,8 @@ impl MyApp {
                         (true, Some(s), Some(c)) => {
                             let rect = egui::Rect::from_two_pos(s, c);
                             // Ignore taps and hairline drags.
-                            if rect.width() >= 10.0 && rect.height() >= 10.0 {
+                            let min_drag = screen.size().min_elem() * MIN_DRAG_FRAC;
+                            if rect.width() >= min_drag && rect.height() >= min_drag {
                                 // Same clip rect and position the map was
                                 // drawn with (selection forces north-up, so
                                 // the map rect is exactly the screen).
@@ -813,6 +834,10 @@ impl MyApp {
     /// count, max-zoom stepper) once one is chosen.
     fn select_ui(&mut self, ctx: &egui::Context, screen: egui::Rect) {
         let top = self.top_inset(ctx);
+        // Both panels are measured off the icon size, which is itself a
+        // fraction of the screen: the hint clears the controls bar it sits
+        // under, and the confirm panel's buttons stay a touch target.
+        let icon = icon_size_for(screen);
         match self.select {
             RegionSelect::Inactive => {}
             RegionSelect::Picking { .. } => {
@@ -821,7 +846,7 @@ impl MyApp {
                     ctx,
                     "select_hint",
                     egui::Order::Foreground,
-                    egui::Pos2::new(screen.center().x, top + 64.0),
+                    egui::Pos2::new(screen.center().x, top + icon * 1.6),
                     egui::Align2::CENTER_TOP,
                     false,
                     |ui| {
@@ -849,9 +874,9 @@ impl MyApp {
                     egui::Align2::CENTER_CENTER,
                     false,
                     |ui| {
-                        ui.spacing_mut().button_padding = egui::vec2(15.0, 10.0);
+                        ui.spacing_mut().button_padding = egui::vec2(icon * 0.35, icon * 0.25);
                         ui.label(egui::RichText::new("Download region for offline use").strong());
-                        ui.add_space(8.0);
+                        gap(ui, GAP_ITEM);
                         ui.horizontal(|ui| {
                             ui.label("Max zoom:");
                             if ui.add_enabled(max_zoom > 1, egui::Button::new("-")).clicked() {
@@ -873,7 +898,7 @@ impl MyApp {
                                 "Too many tiles: shrink the box or lower the max zoom.",
                             );
                         }
-                        ui.add_space(8.0);
+                        gap(ui, GAP_ITEM);
                         ui.horizontal(|ui| {
                             let can_download =
                                 count <= MAX_REGION_TILES && self.cache_dir.is_some();
@@ -911,11 +936,14 @@ impl MyApp {
     pub(crate) fn download_ui(&mut self, ctx: &egui::Context, screen: egui::Rect) {
         let Some(progress) = self.download.clone() else { return };
         let bottom = self.bottom_inset(ctx);
+        // Inset from the corner by the same fraction the floating page toggle
+        // uses, so the two read as the same distance from the edge.
+        let margin = screen.size().min_elem() * CORNER_MARGIN_FRAC;
         floating(
             ctx,
             "download_progress",
             egui::Order::Foreground,
-            screen.left_bottom() + egui::vec2(8.0, -(8.0 + bottom)),
+            screen.left_bottom() + egui::vec2(margin, -(margin + bottom)),
             egui::Align2::LEFT_BOTTOM,
             false,
             |ui| {

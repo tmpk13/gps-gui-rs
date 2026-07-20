@@ -26,16 +26,60 @@ const BUTTON_PAD_Y_FRAC: f32 = 0.45;
 /// the smaller screen dimension.
 const CORNER_MARGIN_FRAC: f32 = 0.03;
 
-/// Margin between a content page's body and the screen edge, in points.
-const PAGE_MARGIN: i8 = 16;
+/// Margin between a content page's body and the screen edge, as a fraction of
+/// the smaller screen dimension.
+const PAGE_MARGIN_FRAC: f32 = 0.025;
+
+/// The vertical rhythm of the pages, in body-text heights: a hair, a tight
+/// gap, the gap between controls, between blocks, and between sections.
+///
+/// Spacing written in text units follows the font, so a page keeps its
+/// proportions on a phone and on a desktop; a fixed point count reads as
+/// cramped on one and loose on the other.
+const GAP_HAIR: f32 = 0.25;
+const GAP_TIGHT: f32 = 0.4;
+const GAP_ITEM: f32 = 0.5;
+const GAP_BLOCK: f32 = 0.75;
+const GAP_SECTION: f32 = 1.0;
+
+/// A text input is a fraction of the screen width, held between these two
+/// widths in text units: wide enough to type in on a phone, and not sprawling
+/// across a desktop window.
+const FIELD_MIN_EM: f32 = 8.0;
+const FIELD_MAX_EM: f32 = 22.0;
 
 /// Green "ok" and red "error" used for the feedback lines across the pages.
 const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(60, 180, 75);
 const ERR_RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 60);
 
 /// Square icon side length in points for the current screen size.
+///
+/// The clamp is the one measure in the UI that stays absolute: it is a touch
+/// target, and a fingertip is the same size whatever the screen is.
 fn icon_size_for(screen: egui::Rect) -> f32 {
     (screen.size().min_elem() * ICON_SIZE_FRAC).clamp(ICON_SIZE_MIN, ICON_SIZE_MAX)
+}
+
+/// The body text height: the unit the page measures are written in.
+fn em(ui: &egui::Ui) -> f32 {
+    ui.text_style_height(&egui::TextStyle::Body)
+}
+
+/// Vertical space of `ems` body-text heights.
+fn gap(ui: &mut egui::Ui, ems: f32) {
+    let space = em(ui) * ems;
+    ui.add_space(space);
+}
+
+/// Margin between a page's body and the screen edge, in points.
+fn page_margin(screen: egui::Rect) -> f32 {
+    screen.size().min_elem() * PAGE_MARGIN_FRAC
+}
+
+/// Width for a text input: `frac` of the screen width, kept readable.
+fn field_width(ui: &egui::Ui, screen: egui::Rect, frac: f32) -> f32 {
+    let em = em(ui);
+    (screen.width() * frac).clamp(em * FIELD_MIN_EM, em * FIELD_MAX_EM)
 }
 
 /// Largest icon side that keeps a row of `count` icon buttons within `avail`
@@ -93,7 +137,7 @@ fn icon_button_pulse(
 }
 
 /// A full-screen page: a Background `Area` filled with the panel color, a
-/// [`PAGE_MARGIN`] margin, sized to the screen, with the top safe-area inset
+/// [`page_margin`] margin, sized to the screen, with the top safe-area inset
 /// already skipped. The closure supplies the page's heading and body (and its
 /// own `ScrollArea` where one is used).
 fn content_page(
@@ -103,6 +147,9 @@ fn content_page(
     top: f32,
     add: impl FnOnce(&mut egui::Ui),
 ) {
+    // `Margin` counts in whole points, so the fraction is rounded once here and
+    // the layout inside uses that same rounded value.
+    let margin = page_margin(screen) as i8;
     egui::Area::new(egui::Id::new(id))
         .order(egui::Order::Background)
         .fixed_pos(egui::Pos2::ZERO)
@@ -111,7 +158,7 @@ fn content_page(
         .show(ctx, |ui| {
             egui::Frame::NONE
                 .fill(ui.visuals().panel_fill)
-                .inner_margin(egui::Margin::same(PAGE_MARGIN))
+                .inner_margin(egui::Margin::same(margin))
                 .show(ui, |ui| {
                     // An Area sizes itself to whatever it held last frame, so
                     // its Ui has no width to wrap against until something pins
@@ -119,10 +166,11 @@ fn content_page(
                     // line and widens the page instead of wrapping. `set_width`
                     // pins both bounds, which is also what makes the frame
                     // (content plus its two margins) exactly screen-wide.
-                    let margin = f32::from(PAGE_MARGIN);
+                    let margin = f32::from(margin);
                     ui.set_width(screen.width() - 2.0 * margin);
                     ui.set_min_height(screen.height() - 2.0 * margin);
-                    ui.add_space(top + 8.0);
+                    ui.add_space(top);
+                    gap(ui, GAP_ITEM);
                     add(ui);
                 });
         });

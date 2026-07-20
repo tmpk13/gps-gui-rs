@@ -65,7 +65,7 @@ Every page is built from a few helpers so each renderer reads as its own
 content rather than boilerplate:
 
 - `content_page(ctx, id, screen, top, add)` - a full-screen `Background` area
-  filled with the panel color, a `PAGE_MARGIN` margin, with the top safe-area
+  filled with the panel color, a `page_margin` margin, with the top safe-area
   inset already skipped. The closure supplies the heading and body. Used by
   Points, Status, Beacon, Settings, Radio.
 
@@ -97,8 +97,30 @@ is pushed off the edge.
   this, so adding one shrinks the row instead of pushing it off the edge.
 
 Constants at the top of `mod.rs` (`ICON_SIZE_*`, `BUTTON_PAD_*_FRAC`,
-`CORNER_MARGIN_FRAC`) and the `OK_GREEN` / `ERR_RED` colors are the tuning knobs
-for sizing and feedback.
+`CORNER_MARGIN_FRAC`, `PAGE_MARGIN_FRAC`, `GAP_*`, `FIELD_*_EM`) and the
+`OK_GREEN` / `ERR_RED` colors are the tuning knobs for sizing and feedback.
+
+## Sizing: nothing is a fixed pixel count
+
+Every measure in the UI is a fraction of something that already scales, so a
+page holds its proportions on a phone and on a desktop:
+
+- **Fractions of the screen** for the layout frame - the icon size
+  (`icon_size_for`), the page and controls-bar margins (`page_margin`,
+  `controls_margin`), the corner inset (`CORNER_MARGIN_FRAC`), the marker hit
+  radius, and the smallest drag that counts as a region box.
+- **Fractions of the icon size** for anything sitting beside the toolbar: the
+  button padding, the popup row heights, and how far the floating panels hang
+  below the bar.
+- **Text units** (`em(ui)`, the body text height) for everything inside a page:
+  the vertical rhythm (`gap(ui, GAP_*)`, five steps from `GAP_HAIR` to
+  `GAP_SECTION`) and input widths (`field_width`, a fraction of the screen held
+  between `FIELD_MIN_EM` and `FIELD_MAX_EM`). Spacing written this way follows
+  the font rather than fighting it.
+
+The one deliberate exception is `ICON_SIZE_MIN` / `ICON_SIZE_MAX`, which clamp
+the icon in absolute points: it is a touch target, and a fingertip is the same
+size whatever the screen is.
 
 ## Pages and navigation
 
