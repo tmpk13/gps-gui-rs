@@ -38,3 +38,5 @@ Remove some buttons on top bar? (Need to choose)
 Red pulsing icons at the top should be only pulsing for a time if pressed when not valid. Otherwise greyed out.
 
 Maybe make top bar a dropdown?
+
+Text goes behind the page menu dropdown button.
