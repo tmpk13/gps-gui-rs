@@ -15,7 +15,7 @@ The UI is [egui](https://docs.rs/egui) in immediate mode, driven each frame by
     layout constants, the page-menu dropdown, and the floating corner toggle.
   - `map.rs` - the interactive map page: the map itself, the controls bar,
     marker info popups, and the offline region-download selection/progress.
-  - `pages.rs` - the non-map pages: Data, Points, Status, Beacon, Settings,
+  - `pages.rs` - the non-map pages: Points, Status, Beacon, Settings,
     Radio, and the desktop manual-position bar.
 
 The page renderers read state that lives outside the UI too: `src/config.rs`
@@ -68,10 +68,8 @@ content rather than boilerplate:
   filled with the panel color, a `PAGE_MARGIN` margin, with the top safe-area
   inset already skipped. The closure supplies the heading and body. Used by
   Points, Status, Beacon, Settings, Radio.
-- `background_area(...)` - like `content_page` but with no margin/top spacing,
-  for a page that centers its own content (the Data page).
 
-Both **pin the body's width** (`set_width`), and that is load-bearing rather
+It **pins the body's width** (`set_width`), and that is load-bearing rather
 than cosmetic. An `Area` sizes itself to whatever it held last frame, so its
 `Ui` has no width to wrap text against: a long label lays out as one endless
 line and widens the page instead of wrapping, and it never shrinks back. Pinning
@@ -362,7 +360,7 @@ app's) and edits it in place. The model lives in `src/radio.rs`; the page in
 With no live GPS source (`gps_rx.is_none()`, i.e. desktop), a bottom-anchored
 bar lets a position be typed as "lat, lon". A valid entry feeds the same
 `apply_gps_fix` pipeline a real fix would and recenters the map. It is shown on
-the Map and Data pages only.
+the Map and Status pages only.
 
 ## The compass (mobile)
 

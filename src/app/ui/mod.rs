@@ -128,33 +128,6 @@ fn content_page(
         });
 }
 
-/// Like [`content_page`] but with no margin or top spacing, for a page that
-/// lays out its own centered content (the Data page).
-fn background_area(
-    ctx: &egui::Context,
-    id: &str,
-    screen: egui::Rect,
-    add: impl FnOnce(&mut egui::Ui),
-) {
-    egui::Area::new(egui::Id::new(id))
-        .order(egui::Order::Background)
-        .fixed_pos(egui::Pos2::ZERO)
-        .movable(false)
-        .constrain(false)
-        .show(ctx, |ui| {
-            egui::Frame::NONE
-                .fill(ui.visuals().panel_fill)
-                .show(ui, |ui| {
-                    // Bounded width for the same reason as `content_page`: it
-                    // is what lets text wrap, and what the centering measures
-                    // against.
-                    ui.set_width(screen.width());
-                    ui.set_min_height(screen.height());
-                    add(ui);
-                });
-        });
-}
-
 /// A floating popup `Frame` in its own `Area`, used for the transient overlays
 /// (selection hint, download confirm/progress, marker info bubble, manual
 /// position bar).
@@ -204,17 +177,12 @@ fn status_bool(ui: &mut egui::Ui, label: &str, ok: bool) {
 
 /// Every page in menu order, each with its label and icon. Drives the page
 /// dropdown menu.
-fn page_items() -> [(Page, &'static str, egui::ImageSource<'static>); 7] {
+fn page_items() -> [(Page, &'static str, egui::ImageSource<'static>); 6] {
     [
         (
             Page::Map,
             "Map",
             egui::include_image!("../../../assets/icons/map.svg"),
-        ),
-        (
-            Page::Data,
-            "Data",
-            egui::include_image!("../../../assets/icons/data.svg"),
         ),
         (
             Page::Points,

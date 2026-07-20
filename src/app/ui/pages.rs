@@ -1,5 +1,5 @@
-//! The non-map pages: the plain Data read-out, the searchable Points list, the
-//! board Status page, the Beacon and Settings pages, and the desktop
+//! The non-map pages: the searchable Points list, the position and board
+//! Status page, the Beacon and Settings pages, and the desktop
 //! manual-position bar.
 
 use std::time::{Duration, SystemTime};
@@ -17,8 +17,8 @@ use crate::points::{age_text, PointSource, TrackPoint};
 use crate::radio::{EditVal, FieldType};
 
 use super::{
-    background_area, content_page, feedback_label, floating, icon_button, status_bool,
-    CORNER_MARGIN_FRAC, ERR_RED, OK_GREEN,
+    content_page, feedback_label, floating, icon_button, status_bool, CORNER_MARGIN_FRAC, ERR_RED,
+    OK_GREEN,
 };
 
 /// How long after connecting the board counts as warming up. The GPS/LoRa
@@ -163,53 +163,6 @@ impl MyApp {
         });
     }
 
-    /// The data page: a plain, large read-out of the current latitude and
-    /// longitude plus the beacon distance, centered on an otherwise empty
-    /// screen.
-    pub(crate) fn data_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
-        background_area(ctx, "data", screen, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(screen.height() * 0.3);
-                match self.current {
-                    Some(pos) => {
-                        ui.label(egui::RichText::new(format!("lat {:.5}", pos.y())).size(40.0));
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new(format!("lon {:.5}", pos.x())).size(40.0));
-                        if let Some(m) = self.distance_to_beacon() {
-                            ui.add_space(24.0);
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "dist {}",
-                                    self.config.distance.units.format(m)
-                                ))
-                                .size(40.0),
-                            );
-                        }
-                    }
-                    None => {
-                        ui.label(egui::RichText::new("waiting for GPS fix...").size(24.0));
-                    }
-                }
-
-                // The beacon's own data, when it is streaming.
-                if let (Some(b), Some(p)) = (self.beacon, self.beacon_packet) {
-                    ui.add_space(24.0);
-                    ui.label(
-                        egui::RichText::new(format!("beacon {:.5} {:.5}", b.y(), b.x())).size(24.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "sats {}  speed {:.1} m/s",
-                            p.sats,
-                            p.speed_mps()
-                        ))
-                        .size(24.0),
-                    );
-                }
-            });
-        });
-    }
-
     /// Bottom-anchored bar for entering a position by hand when no live GPS
     /// source is wired up (desktop). Accepts "lat, lon" or "lat lon"; a valid
     /// entry feeds the same pipeline a real fix would and recenters the map.
@@ -257,10 +210,11 @@ impl MyApp {
         );
     }
 
-    /// The status page: board health for the esp32c6-gps board. The BLE link
-    /// state comes from the connection itself; the WIO/GPS/LoRa figures come
-    /// from the board's telemetry characteristic, and the last line from its
-    /// log characteristic.
+    /// The status page: where we are, and board health for the esp32c6-gps
+    /// board. The position read-out is the app's own; the BLE link state comes
+    /// from the connection itself; the WIO/GPS/LoRa figures come from the
+    /// board's telemetry characteristic, and the last line from its log
+    /// characteristic.
     pub(crate) fn status_page(&mut self, ctx: &egui::Context, screen: egui::Rect) {
         let top = self.top_inset(ctx);
         content_page(ctx, "status", screen, top, |ui| {
@@ -268,7 +222,45 @@ impl MyApp {
                 ui.heading("Status");
                 ui.add_space(12.0);
 
+                // Where we are, and how far off the beacon is. First because it
+                // is the one section that needs no board at all.
+                ui.strong("Position");
+                match self.current {
+                    Some(pos) => {
+                        ui.label(
+                            egui::RichText::new(format!("{:.5}, {:.5}", pos.y(), pos.x()))
+                                .monospace(),
+                        );
+                        if let Some(m) = self.distance_to_beacon() {
+                            ui.label(format!(
+                                "Distance to beacon: {}",
+                                self.config.distance.units.format(m)
+                            ));
+                        }
+                    }
+                    None => {
+                        ui.label("Waiting for a GPS fix...");
+                    }
+                }
+
+                // The beacon's own position, when it is streaming.
+                if let (Some(b), Some(p)) = (self.beacon, self.beacon_packet) {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(format!("Beacon: {:.5}, {:.5}", b.y(), b.x()))
+                            .monospace(),
+                    );
+                    ui.label(format!("Beacon speed: {:.1} m/s", p.speed_mps()));
+                    // Satellite count from the packet only when there is no
+                    // telemetry to report it below, so it is never on screen
+                    // twice from two different sources.
+                    if self.telemetry.is_none() {
+                        ui.label(format!("Beacon satellites: {}", p.sats));
+                    }
+                }
+
                 // ESP32-C6 / BLE link.
+                ui.add_space(16.0);
                 ui.strong("ESP32-C6 (BLE)");
                 status_bool(ui, "Link", self.ble_connected);
                 ui.label(self.ble_intent_text());

@@ -166,11 +166,10 @@ fn far_enough(last: Option<&Position>, pos: Position, min_distance_m: f64) -> bo
 pub enum Page {
     /// The interactive map with the position marker and track.
     Map,
-    /// A plain read-out of the current latitude and longitude.
-    Data,
     /// Searchable list of all recorded GPS points.
     Points,
-    /// Board health for the esp32c6-gps board (ESP/WIO/GPS/LoRa).
+    /// The current position and beacon distance, plus board health for the
+    /// esp32c6-gps board (ESP/WIO/GPS/LoRa).
     Status,
     /// The BLE beacon: the link, and the board's own power and sleep settings.
     Beacon,
@@ -958,7 +957,6 @@ impl eframe::App for MyApp {
 
         match self.page {
             Page::Map => self.map_page(&ctx, screen),
-            Page::Data => self.data_page(&ctx, screen),
             Page::Points => self.points_page(&ctx, screen),
             Page::Status => self.status_page(&ctx, screen),
             Page::Beacon => self.beacon_page(&ctx, screen),
@@ -976,7 +974,7 @@ impl eframe::App for MyApp {
 
         // With no live GPS source (desktop), let a position be typed in. Shown
         // on the position-facing pages; the bar floats at the bottom.
-        if self.gps_rx.is_none() && matches!(self.page, Page::Map | Page::Data) {
+        if self.gps_rx.is_none() && matches!(self.page, Page::Map | Page::Status) {
             self.manual_gps_bar(&ctx, screen);
         }
     }
