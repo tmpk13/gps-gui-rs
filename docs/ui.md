@@ -97,7 +97,8 @@ is pushed off the edge.
   this, so adding one shrinks the row instead of pushing it off the edge.
 
 Constants at the top of `mod.rs` (`ICON_SIZE_*`, `BUTTON_PAD_*_FRAC`,
-`CORNER_MARGIN_FRAC`, `PAGE_MARGIN_FRAC`, `GAP_*`, `FIELD_*_EM`) and the
+`TOGGLE_PAD_FRAC`, `CORNER_MARGIN_FRAC`, `PAGE_MARGIN_FRAC`, `GAP_*`,
+`FIELD_*_EM`) and the
 `OK_GREEN` / `ERR_RED` colors are the tuning knobs for sizing and feedback.
 
 ## Sizing: nothing is a fixed pixel count
@@ -131,7 +132,11 @@ every page with its label and icon, in menu order, and drives both:
   inline at the right end of the controls bar; the trigger glyph crossfades
   between the hamburger and an X while open.
 - `page_toggle` - a floating copy of that menu in the top-right corner, drawn
-  on every page *except* the map (the map uses the inline one).
+  on every page *except* the map (the map uses the inline one). It pads its
+  glyph with `TOGGLE_PAD_FRAC`, not the toolbar's `BUTTON_PAD_*_FRAC`: in the
+  bar that padding doubles as the spacing between buttons and sits on the bar's
+  own fill, while here it would draw a slab three times the glyph over the page
+  text.
 
 To add a page: add a `Page` variant, a `match` arm in `MyApp::ui`, a renderer
 `impl MyApp` method, and an entry in `page_items()`.

@@ -16,11 +16,21 @@ const ICON_SIZE_FRAC: f32 = 0.05;
 const ICON_SIZE_MIN: f32 = 40.0;
 const ICON_SIZE_MAX: f32 = 70.0;
 
-/// Padding around an icon inside its button, as a fraction of the icon side.
-/// The horizontal one is what makes a toolbar button wider than its glyph, so
-/// it has to be part of any width budget (see [`icon_size_for_row`]).
+/// Padding around an icon inside a toolbar button, as a fraction of the icon
+/// side. The horizontal one is what makes a toolbar button wider than its
+/// glyph, so it has to be part of any width budget (see [`icon_size_for_row`]).
+///
+/// It is generous because in the bar it doubles as the spacing that keeps the
+/// buttons apart, and the bar's own fill sits behind all of it.
 const BUTTON_PAD_X_FRAC: f32 = 0.7;
 const BUTTON_PAD_Y_FRAC: f32 = 0.45;
+
+/// Padding around the floating corner toggle's glyph, as a fraction of the
+/// icon side. Far tighter than the toolbar's, and deliberately so: alone over
+/// the page, with nothing to space it from and its own fill showing, the
+/// toolbar's padding reads as an oversized slab around a small glyph - and
+/// covers that much more of the text underneath.
+const TOGGLE_PAD_FRAC: f32 = 0.2;
 
 /// Inset of the floating corner toggle from the screen edge, as a fraction of
 /// the smaller screen dimension.
@@ -341,8 +351,10 @@ impl MyApp {
             .movable(false)
             .constrain(false)
             .show(ctx, |ui| {
-                ui.spacing_mut().button_padding =
-                    egui::vec2(size * BUTTON_PAD_X_FRAC, size * BUTTON_PAD_Y_FRAC);
+                // Square padding, not the toolbar's wide-and-short pair: this
+                // button is on its own, so there is nothing for the extra width
+                // to space it from.
+                ui.spacing_mut().button_padding = egui::Vec2::splat(size * TOGGLE_PAD_FRAC);
                 self.page_menu(ui, size);
             });
     }
