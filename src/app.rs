@@ -972,9 +972,10 @@ impl eframe::App for MyApp {
         // Offline download progress floats above every page too.
         self.download_ui(&ctx, screen);
 
-        // With no live GPS source (desktop), let a position be typed in. Shown
-        // on the position-facing pages; the bar floats at the bottom.
-        if self.gps_rx.is_none() && matches!(self.page, Page::Map | Page::Status) {
+        // With no live GPS source (desktop), let a position be typed in. Only
+        // on the map, where the bar can float at the bottom without landing on
+        // top of a scrolling page.
+        if self.gps_rx.is_none() && matches!(self.page, Page::Map) {
             self.manual_gps_bar(&ctx, screen);
         }
     }

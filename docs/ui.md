@@ -360,7 +360,7 @@ app's) and edits it in place. The model lives in `src/radio.rs`; the page in
 With no live GPS source (`gps_rx.is_none()`, i.e. desktop), a bottom-anchored
 bar lets a position be typed as "lat, lon". A valid entry feeds the same
 `apply_gps_fix` pipeline a real fix would and recenters the map. It is shown on
-the Map and Status pages only.
+the Map page only.
 
 ## The compass (mobile)
 
