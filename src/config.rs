@@ -499,7 +499,7 @@ impl AppConfig {
              [distance]\n\
              show = {show}        # draw the distance label on the line to the beacon\n\
              units = \"{units}\"    # \"metric\" (km/m) or \"imperial\" (mi/ft)\n\
-             dotted = {dotted}       # draw that line dotted rather than solid\n\
+             dotted = {dotted}       # draw distance line dotted rather than solid\n\
              \n\
              [ble]\n\
              enabled = {enabled}       # master switch for the BLE GPS source\n\

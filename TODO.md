@@ -46,6 +46,20 @@ One at a time, picked from a scanned list, named in the app config (`[ble.names]
 
 Change `gps-config.toml` name.
 
-Beacon track is shared across boards, so the drawn path can span two of them after switching. Split it per board? (Points model change.)
+Beacon track is shared across boards, so the drawn path can span two of them after switching. Split it per board? (Points model change)
 
 Optimize.
+
+Page menu button much to large/in the way on mobile.
+
+Fix compass on mobile.
+
+GPS BLE mesh?
+
+Edit dialog is too small.
+
+Better color theme. Something visable in poor conditions.
+
+Clean up the pages.
+
+Show/hide path toggle instead of delete paths on map bar.

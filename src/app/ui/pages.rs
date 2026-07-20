@@ -464,7 +464,7 @@ impl MyApp {
                 );
                 ui.checkbox(
                     &mut self.config.distance.dotted,
-                    "Draw that line dotted rather than solid",
+                    "Draw distance line dotted rather than solid",
                 );
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Units:");
