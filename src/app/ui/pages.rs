@@ -384,8 +384,7 @@ impl MyApp {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "What the app draws and records, kept in its own TOML file. The link to \
-                         the beacon and the board's own settings are on the Beacon page.",
+                        "What the app draws and records, kept in its own TOML file.",
                     )
                     .weak(),
                 );
@@ -828,12 +827,7 @@ impl MyApp {
         ui.strong("Advertising window");
         ui.label(
             egui::RichText::new(format!(
-                "How long each wake advertises before going back to sleep. This is the duty \
-                 cycle, and so the battery life: advertising costs far more than deep sleep, \
-                 so at a fixed interval the draw follows the window. Shortening it asks more \
-                 of whoever is connecting, because the window has to overlap a phone's scan. \
-                 Clamped to {} - {}, and it only applies from the next wake. Only meaningful \
-                 while a wake check is set; a board that never sleeps advertises continuously.",
+                "How long each wake advertises before going back to sleep. Clamped to {} - {}.",
                 secs_text(ble::ESP_ADV_MIN_S),
                 secs_text(ble::ESP_ADV_MAX_S),
             ))
