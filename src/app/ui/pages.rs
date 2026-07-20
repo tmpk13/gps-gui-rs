@@ -89,7 +89,7 @@ impl MyApp {
             ui.horizontal_wrapped(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.points_search)
-                        .hint_text("search (e.g. 51.47 or central)")
+                        .hint_text("search (example 51.47 or central)")
                         .desired_width((screen.width() - 140.0).clamp(120.0, 320.0)),
                 );
                 if ui.button("Clear").clicked() {
@@ -203,7 +203,7 @@ impl MyApp {
                 if self.manual_gps_bad {
                     ui.colored_label(
                         ERR_RED,
-                        "Enter latitude and longitude, e.g. 51.4779, -0.0015",
+                        "Enter latitude and longitude, example 51.4779, -0.0015",
                     );
                 }
             },
@@ -638,8 +638,7 @@ impl MyApp {
             if ui
                 .add_enabled(!connected, egui::Button::new("Connect to sleeping"))
                 .on_hover_text(
-                    "Scan without stopping. A sleeping board advertises for only a short \
-                     window per wake, which a plain connect can keep missing.",
+                    "Scan without stopping. A sleeping board advertises for only a window per wake, a plain connect can miss.",
                 )
                 .clicked()
             {
@@ -691,8 +690,7 @@ impl MyApp {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
-                    "If the board is on a sleep interval it is only reachable during its \
-                     advertising windows, so this can take up to one full interval.",
+                    "During sleep intervals the board is only reachable on its advertising window.",
                 )
                 .weak(),
             );
@@ -715,9 +713,7 @@ impl MyApp {
         if self.settings_unsupported {
             ui.colored_label(ERR_RED, "This board's firmware is newer than the app.");
             ui.label(
-                "Its settings use a layout this build cannot decode, so what the board is set \
-                 to is unknown and these controls stay hidden rather than show defaults it \
-                 never reported. Update the app to change them.",
+                "Its settings use a layout this build cannot decode. Update the app to change them.",
             );
             return;
         }
@@ -769,9 +765,7 @@ impl MyApp {
         ui.strong("Wake check");
         ui.label(
             egui::RichText::new(format!(
-                "While this is set the board deep-sleeps whenever nothing is connected and \
-                 wakes every interval to advertise for the window below. The GPS/LoRa rail \
-                 stays off throughout. the interval survives a connect. Clamped to {} - {}.",
+                "When set, board deep-sleeps when nothing is connected. Wakes every interval to advertise for window. The GPS/LoRa stay off. the interval survives a connect. Clamped to {} - {}.",
                 secs_text(ble::ESP_SLEEP_MIN_S),
                 secs_text(ble::ESP_SLEEP_MAX_S),
             ))
