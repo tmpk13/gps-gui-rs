@@ -16,6 +16,12 @@ const ICON_SIZE_FRAC: f32 = 0.05;
 const ICON_SIZE_MIN: f32 = 40.0;
 const ICON_SIZE_MAX: f32 = 70.0;
 
+/// Padding around an icon inside its button, as a fraction of the icon side.
+/// The horizontal one is what makes a toolbar button wider than its glyph, so
+/// it has to be part of any width budget (see [`icon_size_for_row`]).
+const BUTTON_PAD_X_FRAC: f32 = 0.7;
+const BUTTON_PAD_Y_FRAC: f32 = 0.45;
+
 /// Inset of the floating corner toggle from the screen edge, as a fraction of
 /// the smaller screen dimension.
 const CORNER_MARGIN_FRAC: f32 = 0.03;
@@ -27,6 +33,27 @@ const ERR_RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 60);
 /// Square icon side length in points for the current screen size.
 fn icon_size_for(screen: egui::Rect) -> f32 {
     (screen.size().min_elem() * ICON_SIZE_FRAC).clamp(ICON_SIZE_MIN, ICON_SIZE_MAX)
+}
+
+/// Largest icon side that keeps a row of `count` icon buttons within `avail`
+/// points, so no button may claim more than its equal share of the width.
+///
+/// A button is wider than its icon by [`BUTTON_PAD_X_FRAC`] on each side, and
+/// the buttons are separated by `spacing`; `avail` is expected to already have
+/// the enclosing frame's margin taken off. The result is capped at the usual
+/// [`icon_size_for`] size, so the row only shrinks below it on a screen too
+/// narrow to hold the whole set - the share of the width is a ceiling, not a
+/// target. [`ICON_SIZE_MIN`] does not apply here: a button that overflows the
+/// screen is worse than a small one.
+fn icon_size_for_row(screen: egui::Rect, avail: f32, spacing: f32, count: usize) -> f32 {
+    let base = icon_size_for(screen);
+    if count == 0 {
+        return base;
+    }
+    let count = count as f32;
+    let per_button = (avail - (count - 1.0) * spacing) / count;
+    let fit = per_button / (1.0 + 2.0 * BUTTON_PAD_X_FRAC);
+    base.min(fit.max(1.0))
 }
 
 /// A square icon button. The icons are white SVGs tinted to the current text
@@ -278,7 +305,8 @@ impl MyApp {
             .movable(false)
             .constrain(false)
             .show(ctx, |ui| {
-                ui.spacing_mut().button_padding = egui::vec2(size * 0.7, size * 0.45);
+                ui.spacing_mut().button_padding =
+                    egui::vec2(size * BUTTON_PAD_X_FRAC, size * BUTTON_PAD_Y_FRAC);
                 self.page_menu(ui, size);
             });
     }

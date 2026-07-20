@@ -14,7 +14,10 @@ use crate::offline;
 use crate::points::age_text;
 use crate::tiles::MapLayer;
 
-use super::{floating, icon_button, icon_button_pulse, icon_size_for, ERR_RED};
+use super::{
+    floating, icon_button, icon_button_pulse, icon_size_for, icon_size_for_row, BUTTON_PAD_X_FRAC,
+    BUTTON_PAD_Y_FRAC, ERR_RED,
+};
 
 /// Where the map looks before the first GPS fix arrives.
 fn default_position() -> Position {
@@ -38,17 +41,33 @@ const MARKER_HIT_RADIUS: f32 = 40.0;
 const PULSE_PERIOD: f64 = 1.0;
 const PULSE_FRAME: f32 = 0.05;
 
+/// Inner margin of the controls bar frame, in points.
+const CONTROLS_MARGIN_X: i8 = 8;
+const CONTROLS_MARGIN_Y: i8 = 4;
+
 impl MyApp {
     fn controls(&mut self, ui: &mut egui::Ui, screen: egui::Rect) {
-        let icon = icon_size_for(screen);
-        ui.spacing_mut().button_padding = egui::vec2(icon * 0.7, icon * 0.45);
+        let spacing = ui.spacing().item_spacing.x;
+        // Which of the optional buttons are in the row this frame. Decided up
+        // front, before anything is laid out, because the button count is what
+        // sizes the row - and reused where the buttons are drawn, so the count
+        // cannot disagree with what ends up in the bar.
+        let show_rotate = self.has_direction() && self.tracking_beacon.is_none();
+        let zoom_buttons = if cfg!(target_os = "android") { 0 } else { 2 };
+        // Center, track, layer, clear and the page menu are always there.
+        let buttons = 5 + usize::from(show_rotate) + zoom_buttons;
+        // No button may take more than a 1/buttons share of the bar, padding and
+        // spacing included, so a full row always fits the screen instead of
+        // running off the right edge when the set grows.
+        let icon = icon_size_for_row(screen, ui.available_width(), spacing, buttons);
+        ui.spacing_mut().button_padding =
+            egui::vec2(icon * BUTTON_PAD_X_FRAC, icon * BUTTON_PAD_Y_FRAC);
         // egui lays a horizontal row out left-to-right and can't center it in a
         // single pass: its `main_align` is ignored and the row just fills the
         // width of any centering parent. So pad the left by half the leftover
         // space, using the row width measured last frame (it stays constant once
         // the button set is fixed). `add_space` counts as an item, so drop one
         // item spacing to keep the gap even on both sides.
-        let spacing = ui.spacing().item_spacing.x;
         let pad = if self.controls_width > 0.0 {
             ((ui.available_width() - self.controls_width) * 0.5 - spacing).max(0.0)
         } else {
@@ -87,9 +106,11 @@ impl MyApp {
                 // source (compass, or GPS course over ground); with none the map
                 // stays north-up and the button is hidden. It is hidden while
                 // tracking too, which owns the map's orientation - the track
-                // button below is the way out of that mode.
-                let has_direction = self.has_direction();
-                if has_direction && self.tracking_beacon.is_none() {
+                // button below is the way out of that mode. `show_rotate` is the
+                // same test taken before the row was sized, so the button that is
+                // drawn is the one that was counted even if the center button
+                // just left tracking mode; it then appears next frame.
+                if show_rotate {
                     // Shows the mode the button switches TO (like the old label).
                     let (rotate_icon, rotate_hint) = if self.heading_up {
                         (
@@ -108,7 +129,7 @@ impl MyApp {
                     {
                         self.heading_up = !self.heading_up;
                     }
-                } else if !has_direction {
+                } else if !self.has_direction() {
                     // No orientation available: nothing to toggle, so stay
                     // north-up and drop any stale heading-up flag.
                     self.heading_up = false;
@@ -534,9 +555,16 @@ impl MyApp {
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(ui.visuals().panel_fill)
-                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .inner_margin(egui::Margin::symmetric(
+                        CONTROLS_MARGIN_X,
+                        CONTROLS_MARGIN_Y,
+                    ))
                     .show(ui, |ui| {
-                        ui.set_width(screen.width());
+                        // The frame's margin is part of the screen width, so the
+                        // content gets what is left of it. Setting the full width
+                        // here would push the bar (and the button row it sizes)
+                        // past the right edge by the margin.
+                        ui.set_width(screen.width() - 2.0 * f32::from(CONTROLS_MARGIN_X));
                         ui.add_space(top);
                         self.controls(ui, screen);
                     });
