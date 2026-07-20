@@ -38,15 +38,12 @@ pub enum BleEvent {
     Log(String),
     /// The board's own view of its power and sleep settings, read on connect
     /// and notified on every change - including changes the board makes by
-    /// itself, such as clamping an interval or disarming stow on connect.
-    /// This, not the UI, is the authority on what the board is set to.
+    /// itself, such as clamping an interval. This, not the UI, is the
+    /// authority on what the board is set to.
     Settings(Settings),
     /// The settings blob did not decode: the board's layout version is newer
     /// than this build knows. Its settings are unreadable, not defaulted.
     SettingsUnsupported,
-    /// The board acked a stow arm and then dropped the link on purpose. It is
-    /// now asleep for `secs`, reachable only in its brief wake windows.
-    Stowed { secs: u32 },
 }
 
 /// UI -> worker.
@@ -76,7 +73,7 @@ pub enum ConfigWrite {
     Interval(u32),
     /// A board on/off setting: the power rail, WIO sleep or GPS backup mode.
     Flag { id: u8, on: bool },
-    /// A board interval in seconds: the wake-check cadence or the stow arm.
+    /// A board interval in seconds: the wake-check cadence.
     Seconds { id: u8, secs: u32 },
 }
 
@@ -113,16 +110,6 @@ fn settings_event(bytes: &[u8]) -> BleEvent {
         Some(s) => BleEvent::Settings(s),
         None => BleEvent::SettingsUnsupported,
     }
-}
-
-/// The applied stow interval an ack carries, when it is a stow arm the board
-/// accepted. Such an ack is followed by a deliberate disconnect, so both
-/// transports watch for it to tell that sleep apart from a dropped link.
-fn stow_armed(ack: &Ack) -> Option<u32> {
-    if ack.id != ble::CFG_ESP_STOW_S || ack.status != packet::ACK_OK {
-        return None;
-    }
-    ack.value_u32.filter(|&s| s > 0)
 }
 
 /// The UI's handle to the BLE worker.
@@ -167,13 +154,13 @@ mod tests {
         .encode();
         assert_eq!(&b[..n], &[ble::CFG_WIO_SLEEP, 1, 0]);
 
-        // 900 s = 0x0384, little endian.
+        // 300 s = 0x012C, little endian.
         let (b, n) = ConfigWrite::Seconds {
-            id: ble::CFG_ESP_STOW_S,
-            secs: 900,
+            id: ble::CFG_ESP_SLEEP_S,
+            secs: 300,
         }
         .encode();
-        assert_eq!(&b[..n], &[ble::CFG_ESP_STOW_S, 4, 0x84, 0x03, 0, 0]);
+        assert_eq!(&b[..n], &[ble::CFG_ESP_SLEEP_S, 4, 0x2C, 0x01, 0, 0]);
     }
 
     #[test]
@@ -181,32 +168,6 @@ mod tests {
         let (mine, n) = ConfigWrite::Interval(1500).encode();
         let (theirs, m) = packet::encode_config(packet::ConfigCommand::UpdateIntervalMs(1500));
         assert_eq!((&mine[..n], n), (&theirs[..m], m));
-    }
-
-    /// Only an accepted, non-zero stow arm predicts the deliberate disconnect.
-    /// Anything else that drops the link is a real fault to retry.
-    #[test]
-    fn stow_armed_only_on_accepted_arm() {
-        let ack = |id, status, value| Ack {
-            id,
-            status,
-            value_u32: Some(value),
-        };
-        assert_eq!(
-            stow_armed(&ack(ble::CFG_ESP_STOW_S, packet::ACK_OK, 43200)),
-            Some(43200)
-        );
-        // Disarm: acked, but the board stays awake and connected.
-        assert_eq!(stow_armed(&ack(ble::CFG_ESP_STOW_S, packet::ACK_OK, 0)), None);
-        assert_eq!(
-            stow_armed(&ack(ble::CFG_ESP_STOW_S, packet::ACK_BAD_VALUE, 0)),
-            None
-        );
-        // The wake-check interval sleeps too, but never drops a live link.
-        assert_eq!(
-            stow_armed(&ack(ble::CFG_ESP_SLEEP_S, packet::ACK_OK, 300)),
-            None
-        );
     }
 
     #[test]

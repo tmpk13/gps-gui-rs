@@ -34,7 +34,6 @@ fn setting_name(id: u8) -> &'static str {
         ble::CFG_WIO_SLEEP => "WIO-E5 sleep",
         ble::CFG_GPS_SLEEP => "GPS backup mode",
         ble::CFG_ESP_SLEEP_S => "wake-check interval",
-        ble::CFG_ESP_STOW_S => "stow",
         _ => "setting",
     }
 }
@@ -55,8 +54,6 @@ fn ack_message(ack: &Ack) -> Result<String, String> {
             ble::CFG_ESP_SLEEP_S => {
                 format!("Board applied: wake check every {}", secs_text(applied))
             }
-            ble::CFG_ESP_STOW_S if applied == 0 => "Board applied: stow disarmed".to_string(),
-            ble::CFG_ESP_STOW_S => format!("Board applied: stow for {}", secs_text(applied)),
             _ => format!("Board applied: {name}"),
         }),
         packet::ACK_UNKNOWN_ID => Err(format!(
@@ -76,6 +73,23 @@ fn ack_message(ack: &Ack) -> Result<String, String> {
         )),
         s => Err(format!("Board rejected {name}: status {s:#04x}")),
     }
+}
+
+/// What the user last told the BLE worker to do. Explicit rather than derived
+/// from the config, because "leave the board alone" is a real thing to want:
+/// the board only deep-sleeps while nothing is connected, so an app that
+/// always reconnects keeps it awake and its sleep interval never does
+/// anything. Disconnect is how you let it sleep.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BleIntent {
+    /// Stay off the air until asked. Nothing reconnects on its own.
+    Idle,
+    /// Connect, going straight to a pinned MAC when there is one.
+    Connect,
+    /// Connect expecting the board to be asleep: scan continuously so a wake
+    /// window cannot be missed. Costs more radio time, so it is not the
+    /// default.
+    ConnectSleeping,
 }
 
 /// A duration in seconds as a short human phrase ("45 s", "5 min", "12 h").
@@ -310,35 +324,23 @@ pub struct MyApp {
     board_log: Option<String>,
     /// The board's own power and sleep settings, as it last reported them.
     /// The controls read this rather than any local copy: the board is the
-    /// authority and changes these by itself (clamping, disarming stow).
+    /// authority and changes these by itself (clamping an interval).
     board_settings: Option<Settings>,
     /// The board's settings layout is newer than this build can decode, so
     /// its settings are unknown rather than defaulted.
     settings_unsupported: bool,
-    /// A stow arm waiting on confirmation, in seconds. Long stows put the
-    /// board out of reach for hours, so they are confirmed before writing.
-    stow_confirm: Option<u32>,
-    /// The stow interval the board last went to sleep for, once it has acked
-    /// an arm and dropped the link on purpose. Mirrors `config.ble.stowed_s`,
-    /// which is what carries it across a restart.
-    stowed: Option<u32>,
-    /// The current stow was written to the config file, so it will still be
-    /// known after a restart. False when there was no file to write it to.
-    stow_persisted: bool,
-    /// Keep scanning for a sleeping board until it answers. A sleeping board
-    /// advertises for only about 15 s per wake, so the only way to reach one
-    /// is to be listening when a window opens - which may be hours away.
-    /// Session state: closing the app is a natural way to give up.
-    wake_mode: bool,
-    /// When the current wake attempt started, for the elapsed read-out.
-    wake_started: Option<Instant>,
+    /// What the app is currently asking the BLE worker to do. Session state:
+    /// `config.ble.enabled` seeds it at startup and nothing writes it back, so
+    /// a Disconnect lasts until the next launch rather than becoming a setting.
+    ble_intent: BleIntent,
+    /// When `ble_intent` last changed, for the "trying for ..." read-out.
+    intent_since: Instant,
     /// When the current connection came up. The GPS/LoRa rail only powers on
     /// once a central connects, so telemetry is legitimately empty for the
     /// first seconds and the Status page says warming up, not broken.
     connected_at: Option<Instant>,
-    /// Wake-check and stow interval inputs (seconds) on the Settings page.
+    /// Wake-check interval input (seconds) on the Settings page.
     sleep_interval_text: String,
-    stow_interval_text: String,
     /// Which screen is currently shown.
     page: Page,
     /// Loaded configuration (marker colors, BLE settings).
@@ -447,16 +449,14 @@ impl MyApp {
             board_log: None,
             board_settings: None,
             settings_unsupported: false,
-            stow_confirm: None,
-            stowed: None,
-            stow_persisted: false,
-            wake_mode: false,
-            wake_started: None,
+            // Overwritten by `apply_config`/`sync_ble_to_config` below, which
+            // is what actually decides whether to connect at startup.
+            ble_intent: BleIntent::Idle,
+            intent_since: Instant::now(),
             connected_at: None,
-            // Both start at the low end of their clamp range, so a stray press
-            // arms the shortest sleep rather than the longest.
+            // The low end of the clamp range, so a stray press arms the
+            // shortest sleep rather than the longest.
             sleep_interval_text: ble::ESP_SLEEP_MIN_S.to_string(),
-            stow_interval_text: ble::ESP_STOW_MIN_S.to_string(),
             page: Page::Map,
             config: AppConfig::default(),
             // The path the auto-load below tries, so Save writes back to the
@@ -496,63 +496,61 @@ impl MyApp {
     /// Adopt a loaded config: colors, the MAC input, and the BLE connection.
     fn apply_config(&mut self, cfg: AppConfig) {
         self.ble_mac_text = cfg.ble.mac.clone().unwrap_or_default();
-        // A stow recorded in the file is one this app armed in an earlier run.
-        self.stowed = (cfg.ble.stowed_s > 0).then_some(cfg.ble.stowed_s);
-        self.stow_persisted = self.stowed.is_some();
         self.config = cfg;
         self.sync_ble_to_config();
     }
 
-    /// Tell the BLE worker what the config wants (connect or stay away).
-    ///
-    /// A remembered stow keeps us away regardless of `enabled`: connecting is
-    /// what disarms a stow on the board, so auto-connecting to one we put to
-    /// sleep on purpose would undo it - every launch, until the battery went.
-    /// Reconnect is the way back in.
+    /// Seed the intent from the config at startup: auto-connect unless the
+    /// master switch is off.
     fn sync_ble_to_config(&mut self) {
-        let chasing = self.wake_mode;
-        let cmd = if chasing || (self.config.ble.enabled && self.config.ble.stowed_s == 0) {
-            BleCommand::Connect {
-                mac: self.config.ble.mac.clone(),
-                chase: chasing,
-            }
+        let intent = if self.config.ble.enabled {
+            BleIntent::Connect
         } else {
-            BleCommand::Disconnect
+            BleIntent::Idle
+        };
+        self.set_ble_intent(intent);
+    }
+
+    /// Ask the worker for a new connection state, and say so even when the
+    /// intent has not changed - that is what makes the buttons re-send a
+    /// request with an edited MAC, or restart a scan that has given up.
+    ///
+    /// Each button sends exactly one command. They must not be composed (a
+    /// Disconnect followed by a Connect, say): the worker drains its whole
+    /// queue in one pass, so the later command simply overwrites the earlier
+    /// one and the disconnect never happens.
+    pub(crate) fn set_ble_intent(&mut self, intent: BleIntent) {
+        if self.ble_intent != intent {
+            self.intent_since = Instant::now();
+        }
+        self.ble_intent = intent;
+        let cmd = match intent {
+            BleIntent::Idle => BleCommand::Disconnect,
+            BleIntent::Connect => BleCommand::Connect {
+                mac: self.config.ble.mac.clone(),
+                chase: false,
+            },
+            BleIntent::ConnectSleeping => BleCommand::Connect {
+                mac: self.config.ble.mac.clone(),
+                chase: true,
+            },
         };
         let _ = self.ble.commands.send(cmd);
     }
 
-    /// Turn the keep-trying-to-wake mode on or off.
-    ///
-    /// Unlike Reconnect this leaves the stow memory alone: giving up on waking
-    /// a board should put things back exactly as they were, still stowed and
-    /// still not auto-connected, rather than quietly arming the app to disarm
-    /// the stow the next time it drifts past.
-    pub(crate) fn set_wake_mode(&mut self, on: bool) {
-        self.wake_mode = on;
-        self.wake_started = on.then(Instant::now);
-        self.sync_ble_to_config();
-    }
-
-    /// Remember that the board stowed itself, or - with 0 - that it is awake
-    /// and reachable again. Records it in the config file too, so a restart
-    /// does not walk straight back into disarming the stow, writing only that
-    /// one key so unsaved Settings-page edits are left alone.
-    fn set_stow_memory(&mut self, secs: u32) {
-        self.stowed = (secs > 0).then_some(secs);
-        if self.config.ble.stowed_s == secs {
-            return;
+    /// What the app is doing about the link, for the Settings and Status
+    /// pages. Separate from `ble_status`, which is the worker's own running
+    /// commentary on the attempt.
+    pub(crate) fn ble_intent_text(&self) -> String {
+        let waiting = secs_text((self.intent_since.elapsed().as_secs() as u32).max(1));
+        match (self.ble_intent, self.ble_connected) {
+            (BleIntent::Idle, _) => "Not connecting. The board is free to sleep.".to_string(),
+            (_, true) => "Connected. The board stays awake until you disconnect.".to_string(),
+            (BleIntent::Connect, false) => format!("Connecting for {waiting}."),
+            (BleIntent::ConnectSleeping, false) => {
+                format!("Scanning for a sleeping board for {waiting}.")
+            }
         }
-        self.config.ble.stowed_s = secs;
-        self.stow_persisted =
-            AppConfig::save_stowed(&self.config_path, secs).unwrap_or(false);
-    }
-
-    /// The Settings page's Reconnect: a deliberate attempt to reach the board,
-    /// which is also the one thing that overrides a remembered stow.
-    pub(crate) fn reconnect_ble(&mut self) {
-        self.set_stow_memory(0);
-        self.sync_ble_to_config();
     }
 
     /// Queue one config write to the board and wait for its ack. The controls
@@ -859,10 +857,6 @@ impl MyApp {
             self.compass = None;
         }
 
-        // Set inside the drain loop, applied after it: remembering a stow
-        // writes the config file, which needs all of `self` rather than the
-        // disjoint field borrows the loop body can take.
-        let mut stow_memory: Option<u32> = None;
         while let Ok(event) = self.ble.events.try_recv() {
             match event {
                 BleEvent::Status(s) => self.ble_status = s,
@@ -871,13 +865,11 @@ impl MyApp {
                     self.connected_at = c.then(Instant::now);
                     if c {
                         // A fresh link re-reads everything below; nothing from
-                        // the last session still describes the board. Reaching
-                        // it also means the board has disarmed any stow, so
-                        // the memory of one goes with it.
-                        stow_memory = Some(0);
-                        // Whatever we were waiting for has happened.
-                        self.wake_mode = false;
-                        self.wake_started = None;
+                        // the last session still describes the board.
+                        //
+                        // The intent is left alone: it says what to do when
+                        // there is no link, so a board that sleeps again should
+                        // still be chased if that is what was asked for.
                         self.board_settings = None;
                         self.settings_unsupported = false;
                         self.telemetry = None;
@@ -927,14 +919,7 @@ impl MyApp {
                     self.board_settings = None;
                     self.settings_unsupported = true;
                 }
-                BleEvent::Stowed { secs } => {
-                    stow_memory = Some(secs);
-                    self.ble_ack_pending = false;
-                }
             }
-        }
-        if let Some(secs) = stow_memory {
-            self.set_stow_memory(secs);
         }
 
         // Offline center-button fallback: apply the zoom the probe picked (the
@@ -1020,14 +1005,14 @@ mod tests {
         assert!(wio.contains("WIO-E5"), "{wio}");
         let bad = ack_message(&ack(ble::CFG_PWR_EN, packet::ACK_BAD_VALUE)).unwrap_err();
         assert!(bad.contains("GPS/LoRa power"), "{bad}");
-        // A stow arm of 0 is a disarm, and must not read as "stow for off".
+        // An interval of 0 turns sleep off, and must not read as "every off".
         assert_eq!(
             ack_message(&Ack {
-                id: ble::CFG_ESP_STOW_S,
+                id: ble::CFG_ESP_SLEEP_S,
                 status: packet::ACK_OK,
                 value_u32: Some(0),
             }),
-            Ok("Board applied: stow disarmed".to_string())
+            Ok("Board applied: sleep disabled".to_string())
         );
     }
 }

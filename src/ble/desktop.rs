@@ -16,7 +16,7 @@ use midair_proto::ble;
 use midair_proto::link::Telemetry;
 use uuid::Uuid;
 
-use super::{settings_event, stow_armed, BleCommand, BleEvent, BleHandle, ConfigWrite};
+use super::{settings_event, BleCommand, BleEvent, BleHandle, ConfigWrite};
 
 const SERVICE_UUID: Uuid = Uuid::from_u128(packet::SERVICE_UUID_U128);
 const POSITION_UUID: Uuid = Uuid::from_u128(packet::POSITION_UUID_U128);
@@ -103,20 +103,6 @@ fn drain_commands(
             Err(TryRecvError::Disconnected) => return Err(()),
         }
     }
-}
-
-/// The link went down. After the board acked a stow arm that is it sleeping
-/// on purpose, so report the sleep and stop wanting a connection: reconnecting
-/// would only disarm the stow that was just asked for. Otherwise the drop is a
-/// fault and the caller should retry.
-fn link_lost(report: &Reporter, wanted: &mut Wanted, stow: Option<u32>) -> Result<(), String> {
-    let Some(secs) = stow else {
-        return Err("connection lost".into());
-    };
-    // The caller's teardown reports the disconnection itself.
-    wanted.connect = false;
-    report.send(BleEvent::Stowed { secs });
-    Ok(())
 }
 
 async fn worker(ctx: egui::Context, tx: Sender<BleEvent>, cmd_rx: Receiver<BleCommand>) {
@@ -287,7 +273,7 @@ async fn connected(
         let _ = peripheral.subscribe(c).await;
     }
     // Subscribe before the read below, so a change the board makes between the
-    // two (it disarms stow on connect) still reaches us.
+    // two (a clamped interval, say) still reaches us.
     if let Some(c) = &settings {
         let _ = peripheral.subscribe(c).await;
     }
@@ -313,9 +299,6 @@ async fn connected(
         }
     }
 
-    // Set once the board acks a stow arm: the disconnect that follows is the
-    // board sleeping as asked, not a fault.
-    let mut stow: Option<u32> = None;
     let mut since_check = 0u32;
     loop {
         // Apply queued config writes.
@@ -338,7 +321,6 @@ async fn connected(
                     }
                 } else if n.uuid == ACK_UUID {
                     if let Some(a) = packet::parse_ack(&n.value) {
-                        stow = stow.or(stow_armed(&a));
                         report.send(BleEvent::Ack(a));
                     }
                 } else if n.uuid == TELEMETRY_UUID {
@@ -351,7 +333,7 @@ async fn connected(
                     report.send(settings_event(&n.value));
                 }
             }
-            Ok(None) => return link_lost(report, wanted, stow),
+            Ok(None) => return Err("connection lost".into()),
             Err(_) => {
                 // Timeout: periodically confirm the link is still up (the
                 // stream does not always end on disconnect).
@@ -359,7 +341,7 @@ async fn connected(
                 if since_check >= 8 {
                     since_check = 0;
                     if !peripheral.is_connected().await.unwrap_or(false) {
-                        return link_lost(report, wanted, stow);
+                        return Err("connection lost".into());
                     }
                 }
             }

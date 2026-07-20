@@ -22,7 +22,7 @@ use gps_proto::packet::{self, PositionPacket};
 use midair_proto::ble;
 use midair_proto::link::Telemetry;
 
-use super::{settings_event, stow_armed, BleCommand, BleEvent, BleHandle, ConfigWrite};
+use super::{settings_event, BleCommand, BleEvent, BleHandle, ConfigWrite};
 
 /// The compiled dex with rs.gps.gui.BleBridge (see android/build-dex.sh).
 const BRIDGE_DEX: &[u8] = include_bytes!("../../assets/ble-bridge.dex");
@@ -347,7 +347,7 @@ fn session(
     // Optional board-status subscriptions (esp32c6-gps; absent on the c3
     // beacon, so a missing characteristic is not an error). Settings is
     // subscribed before it is read below, so a change the board makes between
-    // the two (it disarms stow on connect) still reaches us.
+    // the two (a clamped interval, say) still reaches us.
     for chr in [ble::TELEMETRY_UUID, ble::LOG_UUID, ble::SETTINGS_UUID] {
         if bridge.set_notify(packet::SERVICE_UUID, chr, true) {
             let _ = wait_for(cb_rx, Duration::from_secs(5), |cb| {
@@ -364,10 +364,6 @@ fn session(
     // routes the read value through the notify callback, so the pump below
     // decodes it on the same path a change notification takes.
     bridge.read_characteristic(packet::SERVICE_UUID, ble::SETTINGS_UUID);
-
-    // Set once the board acks a stow arm: the disconnect that follows is the
-    // board sleeping as asked, not a fault.
-    let mut stow: Option<u32> = None;
 
     // Pump: notifications out, commands in, until disconnect.
     loop {
@@ -386,7 +382,6 @@ fn session(
                     }
                 } else if uuid.eq_ignore_ascii_case(packet::ACK_UUID) {
                     if let Some(a) = packet::parse_ack(&value) {
-                        stow = stow.or(stow_armed(&a));
                         report.send(BleEvent::Ack(a));
                     }
                 } else if uuid.eq_ignore_ascii_case(ble::TELEMETRY_UUID) {
@@ -399,19 +394,7 @@ fn session(
                     report.send(settings_event(&value));
                 }
             }
-            // After the board acks a stow arm it drops the link on purpose, so
-            // report the sleep and stop connecting: reconnecting would only
-            // disarm the stow that was just asked for.
-            Ok(Cb::ConnectionState { new_state: 0 }) => {
-                let Some(secs) = stow else {
-                    return Err("connection lost".into());
-                };
-                bridge.disconnect();
-                *wanted_connect = false;
-                report.send(BleEvent::Stowed { secs });
-                report.send(BleEvent::Connected(false));
-                return Ok(());
-            }
+            Ok(Cb::ConnectionState { new_state: 0 }) => return Err("connection lost".into()),
             Ok(Cb::WriteDone { status }) if status != 0 => {
                 report.status(format!("config write rejected (status {status})"));
             }

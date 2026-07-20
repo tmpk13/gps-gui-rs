@@ -82,9 +82,15 @@ content rather than boilerplate:
 - `icon_size_for(screen)` - icon side length as a fraction of the smaller
   screen dimension, clamped, so the toolbar stays proportional on phone and
   desktop.
+- `icon_size_for_row(screen, avail, spacing, count)` - the same size, but capped
+  so `count` buttons still fit `avail` points: no button may exceed a `1/count`
+  share of the width, counting its padding and the gaps between buttons. The
+  controls bar counts its buttons before laying any out and sizes itself with
+  this, so adding one shrinks the row instead of pushing it off the edge.
 
-Constants at the top of `mod.rs` (`ICON_SIZE_*`, `CORNER_MARGIN_FRAC`) and the
-`OK_GREEN` / `ERR_RED` colors are the tuning knobs for sizing and feedback.
+Constants at the top of `mod.rs` (`ICON_SIZE_*`, `BUTTON_PAD_*_FRAC`,
+`CORNER_MARGIN_FRAC`) and the `OK_GREEN` / `ERR_RED` colors are the tuning knobs
+for sizing and feedback.
 
 ## Pages and navigation
 
@@ -226,8 +232,7 @@ these in flash and is the authority on them.
   `BleEvent::Settings` and lands in `MyApp::board_settings`. Every checkbox
   binds to a copy of that blob, so a click sends a write and the checkbox only
   moves once the board reports it moved. This matters because the board changes
-  these by itself: it clamps an out-of-range interval, and it disarms stow the
-  moment a central connects.
+  these by itself: it clamps an out-of-range interval.
 - **One write in flight.** `MyApp::send_config` sets `ble_ack_pending`, which
   disables the controls until the ack arrives. The text inputs are seeded from
   the first settings blob of a session only, so a later notification cannot
@@ -236,33 +241,37 @@ these in flash and is the authority on them.
   a layout-version mismatch, which becomes `BleEvent::SettingsUnsupported` and
   hides the controls behind an explanation - never a fall back to defaults the
   board never reported.
-- **Arming stow is confirmed** (`stow_confirm_popup`, drawn at the top level
-  like the radio page's popup). A stow can put the board out of reach for
-  hours, and each wake advertises for only about 15 s, so the confirmation
-  names the interval the board will actually use after clamping.
-- **The disconnect after a stow arm is the success path.** Both transports
-  watch for the ack on `CFG_ESP_STOW_S` and treat the drop that follows as
-  `BleEvent::Stowed` rather than a fault, and stop wanting a connection -
-  reconnecting would immediately disarm the stow just asked for.
-- **A stow outlives the process** (`[ble] stowed_s`). Suppressing auto-connect
-  only in memory would last until the next launch, when `sync_ble_to_config`
-  would connect, the board would disarm, and the stow would be gone - every
-  restart, silently. So `MyApp::set_stow_memory` records it in the config file
-  and `sync_ble_to_config` refuses to connect while it is set. It clears on a
-  successful connect (the board has disarmed by then anyway) or on Reconnect,
-  which is the deliberate override. The write goes through
-  `AppConfig::save_stowed`, which edits that one key: a stow arrives on a BLE
-  event that can land while the Settings page holds unsaved edits, and a full
-  `save` would commit those behind the user's back. With no config file to
-  write to, the page says so in red rather than pretending it was remembered.
-- **Getting a sleeping board back** (`wake_mode_ui`). A sleeping board - stowed
-  or just on a wake-check interval - advertises for only about 15 s per wake,
-  so the only way in is to be listening when a window opens. The toggle sets
-  `MyApp::wake_mode`, which makes `sync_ble_to_config` send
-  `Connect { chase: true }` and overrides the stow suppression above without
-  clearing it: switching the toggle off puts things back exactly as they were,
-  still stowed. It clears itself on a successful connect. Unlike Reconnect,
-  which *is* the deliberate "forget the stow and connect" action.
+- **One sleep control, and it never disarms itself.** The board has a single
+  wake-check interval (`CFG_ESP_SLEEP_S`), clamped to 5 s - 5 min. Connecting
+  does not clear it, so the app needs no memory of what the board is doing:
+  auto-connect is simply `config.ble.enabled`, and `sync_ble_to_config` has no
+  special case. The 5 min ceiling is what makes that safe - deep sleep has no
+  wake source but the timer, so the ceiling is the longest the board can be out
+  of reach, and a wait that long needs no confirmation, no persisted state and
+  no way back in beyond waiting.
+- **The link is three explicit buttons, not a toggle** (`ble_link_ui`,
+  `MyApp::ble_intent`). Connect / Connect to sleeping / Disconnect map one to
+  one onto `BleIntent::{Connect, ConnectSleeping, Idle}`, and each button sends
+  exactly one `BleCommand`. Disconnect is not a nicety: the board only
+  deep-sleeps while nothing is connected, so an app that reconnects on its own
+  keeps it awake and its sleep interval never does anything. There was no way
+  to express "leave it alone" while connecting was a checkbox the app
+  re-applied itself.
+- **Buttons must never compose commands.** `drain_commands` empties the whole
+  channel in one pass, so a Disconnect queued just before a Connect is
+  overwritten and never happens. `set_ble_intent` therefore sends a single
+  command per press, and there is no "reconnect" that is secretly two.
+- **Intent is session state, not config.** `[ble] enabled` seeds it at startup
+  and is never written back, so a Disconnect lasts until the next launch rather
+  than quietly becoming a saved preference. The checkbox is labelled for what
+  it actually is: connect automatically at startup.
+- **Intent survives a connect.** It says what to do when there is *no* link, so
+  a board that goes back to sleep is still chased if that is what was asked
+  for. Only Disconnect clears it.
+- **Two status lines, and they say different things.** `ble_intent_text()` is
+  what the app was asked to do; `ble_status` is the worker's running commentary
+  on the attempt. Showing only the second was most of why "nothing seems to
+  happen" - a scan that is working looks identical to one that is not.
 - **`chase` is what makes the two transports behave the same.** Desktop always
   finds its device by scanning, so chasing only changes its status line. The
   Android worker normally shortcuts a pinned MAC straight to `connectGatt`,
