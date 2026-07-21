@@ -497,19 +497,21 @@ impl MyApp {
                 });
 
                 gap(ui, GAP_ITEM);
-                // The two surfaces everything else is drawn on. Read out of the
-                // live visuals, so an unticked row shows what the theme is
-                // actually using and ticking it starts from there.
+                // The surfaces and the text everything else is drawn with. Read
+                // out of the live visuals, so an unticked row shows what the
+                // theme is actually using and ticking it starts from there.
                 let bg = ui.visuals().panel_fill;
                 let button = ui.visuals().widgets.inactive.weak_bg_fill;
+                let text = ui.visuals().text_color();
                 theme_color(ui, "Set the background", &mut self.config.ui.background, bg);
                 theme_color(ui, "Set the buttons", &mut self.config.ui.button, button);
+                theme_color(ui, "Set the text", &mut self.config.ui.text, text);
                 gap(ui, GAP_HAIR);
                 ui.label(
                     egui::RichText::new(
-                        "Unticked follows the light/dark theme. The text color follows it \
-                         either way, so these are for a shade of the theme rather than a \
-                         different one.",
+                        "Unticked follows the light/dark theme, which is what keeps these \
+                         three readable against each other. Setting one is taking that on \
+                         yourself.",
                     )
                     .weak(),
                 );

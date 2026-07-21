@@ -23,8 +23,9 @@ More statuses in the app.
 
 Toml color theme control. (partly done)
 `[colors] outline` and a new `[ui]` table (`ok`, `error`, `pulse`) replaced the
-hardcoded colors, and `[ui] background` / `button` override the theme's two
-surfaces (empty = follow the theme). Text colors still follow the egui theme.
+hardcoded colors, and `[ui] background` / `button` / `text` override the theme
+(empty = follow it). What is left: the text-edit fill, the faint stripe and the
+selection color, and nothing checks that an overridden pair stays readable.
 
 More color changes.
 

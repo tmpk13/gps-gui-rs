@@ -81,8 +81,10 @@ is pushed off the edge.
 - `floating(ctx, id, order, pos, pivot, constrain, add)` - a popup `Frame` in
   its own area, for the transient overlays (selection hint, download confirm
   and progress, marker info bubble, manual position bar).
-- `feedback_label` / `status_bool` / `color_swatch` - the small repeated result
-  and status rows.
+- `feedback_label` / `status_bool` - the small repeated result and status rows,
+  each taking the `[ui]` colors to draw with. (`theme_color`, the checkbox-plus-
+  picker row for a color that may be left to the theme, lives in `pages.rs`
+  beside its only user.)
 - `icon_button` / `icon_button_pulse` - a square icon button. Icons are white
   SVGs tinted to the current text color, so they follow the light/dark theme.
   `icon_button_pulse` oscillates the background red to flag an action with no
@@ -282,18 +284,30 @@ sending you back here for it, writing the same file and sharing the same
 - **Colors are in two tables.** `[colors]` is the map (`track`, `fixed`, and the
   `outline` ring around both dots); `[ui]` is the pages: `ok`, `error` and the
   `pulse` on a toolbar button with no target, where the color *is* the message,
-  plus `background` and `button`, the two surfaces everything else is drawn on.
-- **The two surface colors are theme overrides, and empty means "don't".**
+  plus `background`, `button` and `text` - the surfaces and the text everything
+  else is drawn with.
+- **Those three are theme overrides, and empty means "don't".**
   `Option<Color32>`, written as `""` when unset so the key stays in the file.
   `MyApp::apply_ui_colors` pushes them into the visuals before any page is
   drawn: it starts from `Theme::default_visuals` every time rather than editing
   what is there, so clearing an override (or switching theme) restores the theme
   without the app holding a copy of it. It runs only when the theme or one of
-  the two colors moved - writing the style clones it, and the map repaints
-  continuously. The hover and press fills are blended from `button` toward the
-  text color, which is lighter than the button in a dark theme and darker in a
-  light one, so one color yields three states in either. The text color itself
-  stays the theme's, so these are for shading a theme, not replacing one.
+  the colors moved - writing the style clones it, and the map repaints
+  continuously.
+- **One color, several states.** `button` fills `inactive`, `hovered`, `active`
+  and `open`, the last three blended toward the text color: lighter than the
+  button in a dark theme, darker in a light one, so one setting yields three
+  states in either. `text` is written into every state's `fg_stroke` rather than
+  into `override_text_color`, which only reaches plain labels - the stroke is
+  what the toolbar glyphs (tinted with `text_color()`), the checkmarks and the
+  button text all read. `strong` text takes the *active* state, which the theme
+  keeps a step past the body, so it gets the same color shaded 0.35 toward white
+  (dark theme) or black (light); weak text is alpha off the body color and
+  follows by itself.
+- The three are independent, so nothing stops a background and a text color that
+  cannot be read against each other. The theme is what normally keeps them in
+  step; the Settings page and the generated TOML both say that setting one is
+  taking that on yourself.
 - `[track] show_path` and `[ble] show_path` are the per-path overlay settings.
   The map bar's path button is a session-only master switch over both
   (`MyApp::show_paths`) and never writes them, so the saved settings survive it.

@@ -20,6 +20,7 @@
 //! pulse = "#c82828"   # a toolbar button flagging that it has no target
 //! background = ""     # pages, map bar and popups; empty follows the theme
 //! button = ""         # a button at rest; empty follows the theme
+//! text = ""           # body text and the toolbar glyphs; empty follows the theme
 //!
 //! [sizes]             # screen points; each overlay is sized independently
 //! marker = 8.0        # current-position dot radius
@@ -79,13 +80,14 @@ impl Default for MarkerColors {
 }
 
 /// Colors of the pages rather than the map: the feedback and status lines, the
-/// pulse on a toolbar button that has nothing to act on, and the two surfaces
-/// everything else is drawn on.
+/// pulse on a toolbar button that has nothing to act on, and the surfaces and
+/// text everything else is drawn with.
 ///
-/// The first three carry meaning by color and so are always set. The last two
+/// The first three carry meaning by color and so are always set. The last three
 /// are overrides of the light/dark theme and default to `None`, which leaves the
-/// theme's own: the text color is still the theme's, so these are for a shade of
-/// it rather than a way to invert it.
+/// theme's own. They are independent, so setting only one of them is a way to
+/// end up with text that cannot be read on its background - the theme is what
+/// keeps them in step, and an override is a promise to do that by hand.
 #[derive(Clone, Copy)]
 pub struct UiColors {
     /// "yes" on the Status page, and the `Ok` feedback lines.
@@ -100,6 +102,9 @@ pub struct UiColors {
     /// Fill of a button at rest; the hover and press shades are derived from it.
     /// `None` keeps the theme's own.
     pub button: Option<Color32>,
+    /// Body text, and with it the toolbar glyphs and the weak and strong
+    /// shades derived from it. `None` keeps the theme's own.
+    pub text: Option<Color32>,
 }
 
 impl Default for UiColors {
@@ -110,6 +115,7 @@ impl Default for UiColors {
             pulse: Color32::from_rgb(200, 40, 40),
             background: None,
             button: None,
+            text: None,
         }
     }
 }
@@ -381,6 +387,7 @@ struct RawUi {
     pulse: Option<String>,
     background: Option<String>,
     button: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -569,6 +576,7 @@ impl AppConfig {
             hex_opt(self.ui.background).into(),
         );
         set(&mut doc, "ui", "button", hex_opt(self.ui.button).into());
+        set(&mut doc, "ui", "text", hex_opt(self.ui.text).into());
         set(&mut doc, "sizes", "marker", f32_value(self.sizes.marker));
         set(&mut doc, "sizes", "beacon", f32_value(self.sizes.beacon));
         set(&mut doc, "sizes", "track", f32_value(self.sizes.track));
@@ -654,10 +662,11 @@ impl AppConfig {
              ok = \"{ok}\"      # \"yes\" and the green feedback lines\n\
              error = \"{error}\"   # \"no\", errors, and the red feedback lines\n\
              pulse = \"{pulse}\"   # a toolbar button flagging that it has no target\n\
-             # Empty follows the light/dark theme. The text color follows it either\n\
-             # way, so these are for a shade of the theme, not a different one.\n\
+             # Empty follows the light/dark theme, which is what keeps these three\n\
+             # readable against each other. Setting one is taking that on yourself.\n\
              background = \"{background}\"      # behind the pages, the map bar and the popups\n\
              button = \"{button}\"          # a button at rest; hover and press are shaded from it\n\
+             text = \"{text}\"            # body text; weak and strong are shaded from it\n\
              \n\
              [sizes]              # screen points; each overlay is sized independently\n\
              marker = {marker:?}          # current-position dot radius\n\
@@ -694,6 +703,7 @@ impl AppConfig {
             pulse = hex(self.ui.pulse),
             background = hex_opt(self.ui.background),
             button = hex_opt(self.ui.button),
+            text = hex_opt(self.ui.text),
             marker = s.marker,
             beacon = s.beacon,
             track_w = s.track,
@@ -739,6 +749,9 @@ impl AppConfig {
         }
         if let Some(s) = raw.ui.button {
             config.ui.button = parse_hex_opt(&s)?;
+        }
+        if let Some(s) = raw.ui.text {
+            config.ui.text = parse_hex_opt(&s)?;
         }
         if let Some(v) = raw.sizes.marker {
             config.sizes.marker = parse_size("marker", v)?;
@@ -963,8 +976,11 @@ mod tests {
     /// what would otherwise quietly turn the override back on.
     #[test]
     fn empty_surface_colors_mean_the_theme() {
-        let cfg = AppConfig::from_toml("[ui]\nbackground = \"\"\nbutton = \"#202020\"").unwrap();
+        let cfg =
+            AppConfig::from_toml("[ui]\nbackground = \"\"\nbutton = \"#202020\"\ntext = \"\"")
+                .unwrap();
         assert_eq!(cfg.ui.background, None);
+        assert_eq!(cfg.ui.text, None);
         assert_eq!(cfg.ui.button, Some(Color32::from_rgb(32, 32, 32)));
 
         let path = std::env::temp_dir().join("gps-gui-rs-config-surface-test.toml");
@@ -973,6 +989,7 @@ mod tests {
         assert!(cfg.save(path).unwrap());
         let back = AppConfig::load(path).unwrap();
         assert_eq!(back.ui.background, None);
+        assert_eq!(back.ui.text, None);
         assert_eq!(back.ui.button, Some(Color32::from_rgb(32, 32, 32)));
         let _ = std::fs::remove_file(path);
     }

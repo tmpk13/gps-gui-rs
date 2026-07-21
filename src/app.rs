@@ -323,6 +323,17 @@ fn http_options(cache_dir: Option<PathBuf>) -> HttpOptions {
     }
 }
 
+/// What [`MyApp::apply_ui_colors`] last pushed into the egui visuals: the theme
+/// it was built from, and the `[ui]` overrides laid over it. Compared whole, so
+/// the style is rewritten when any one of them moves and at no other time.
+#[derive(Clone, Copy, PartialEq)]
+struct AppliedColors {
+    theme: egui::Theme,
+    background: Option<egui::Color32>,
+    button: Option<egui::Color32>,
+    text: Option<egui::Color32>,
+}
+
 pub struct MyApp {
     /// Standard OpenStreetMap tiles.
     tiles: HttpTiles,
@@ -418,9 +429,9 @@ pub struct MyApp {
     page: Page,
     /// Loaded configuration (marker colors, BLE settings).
     config: AppConfig,
-    /// Theme and `[ui]` surface colors last pushed into the egui visuals, so
-    /// [`MyApp::apply_ui_colors`] only writes the style when one of them moved.
-    colors_applied: Option<(egui::Theme, Option<egui::Color32>, Option<egui::Color32>)>,
+    /// What was last pushed into the egui visuals, so
+    /// [`MyApp::apply_ui_colors`] only writes the style when something moved.
+    colors_applied: Option<AppliedColors>,
     /// The config-file path typed on the Settings page.
     config_path: String,
     /// Result of the last load/save: `Ok` message (green) or error (red).
@@ -593,8 +604,8 @@ impl MyApp {
         self.sync_ble_to_config();
     }
 
-    /// Push the config's surface colors (`[ui] background` and `button`) into
-    /// the egui visuals for the active theme.
+    /// Push the config's surface and text colors (`[ui] background`, `button`
+    /// and `text`) into the egui visuals for the active theme.
     ///
     /// Each application starts from `Theme::default_visuals` rather than editing
     /// what is already there, so clearing an override restores the theme without
@@ -606,7 +617,12 @@ impl MyApp {
     fn apply_ui_colors(&mut self, ctx: &egui::Context) {
         let colors = self.config.ui;
         let theme = ctx.theme();
-        let wanted = (theme, colors.background, colors.button);
+        let wanted = AppliedColors {
+            theme,
+            background: colors.background,
+            button: colors.button,
+            text: colors.text,
+        };
         if self.colors_applied == Some(wanted) {
             return;
         }
@@ -616,6 +632,33 @@ impl MyApp {
         if let Some(c) = colors.background {
             visuals.panel_fill = c;
             visuals.window_fill = c;
+        }
+        // Text before buttons: the button shades below are blended toward
+        // whatever the text color ends up being, configured or not.
+        if let Some(c) = colors.text {
+            // Every widget state's foreground, which is where egui reads text,
+            // the toolbar glyphs (tinted with `text_color`) and the checkmarks
+            // from - rather than `override_text_color`, which reaches the plain
+            // labels only and would leave the rest on the theme.
+            for widget in [
+                &mut visuals.widgets.noninteractive,
+                &mut visuals.widgets.inactive,
+                &mut visuals.widgets.hovered,
+                &mut visuals.widgets.open,
+            ] {
+                widget.fg_stroke.color = c;
+            }
+            // `strong` text (the section headings) reads the active state, which
+            // the theme keeps a step past the body text - brighter in the dark
+            // theme, darker in the light one. Shading the configured color the
+            // same way keeps the emphasis without a second setting for it.
+            let past = if visuals.dark_mode {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::BLACK
+            };
+            visuals.widgets.active.fg_stroke.color = c.lerp_to_gamma(past, 0.35);
+            // Weak text is derived from the body color by alpha, so it follows.
         }
         if let Some(c) = colors.button {
             // The hover and press shades are blended toward the text color, not
