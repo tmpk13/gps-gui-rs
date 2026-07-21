@@ -59,6 +59,32 @@ fn radio_input(ui: &mut egui::Ui, key: &str, ty: &FieldType, val: &mut EditVal) 
     }
 }
 
+/// A color that may be left to the light/dark theme: a checkbox that turns the
+/// override on and off, and a picker beside it, enabled only while it is on.
+///
+/// `theme` is what the theme is drawing with right now, which is both what the
+/// disabled picker shows and what ticking the box starts from - so turning an
+/// override on changes nothing until the color is moved, and turning it off
+/// leaves nothing behind to be saved.
+fn theme_color(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut Option<egui::Color32>,
+    theme: egui::Color32,
+) {
+    ui.horizontal(|ui| {
+        let mut on = value.is_some();
+        if ui.checkbox(&mut on, label).changed() {
+            *value = on.then_some(theme);
+        }
+        let mut color = value.unwrap_or(theme);
+        ui.add_enabled_ui(on, |ui| ui.color_edit_button_srgba(&mut color));
+        if on {
+            *value = Some(color);
+        }
+    });
+}
+
 /// Parse "lat, lon" or "lat lon" into decimal degrees. `None` unless it is
 /// exactly two finite numbers within the valid latitude/longitude range.
 fn parse_lat_lon(s: &str) -> Option<(f64, f64)> {
@@ -469,6 +495,24 @@ impl MyApp {
                     ui.color_edit_button_srgba(&mut self.config.ui.pulse);
                     ui.end_row();
                 });
+
+                gap(ui, GAP_ITEM);
+                // The two surfaces everything else is drawn on. Read out of the
+                // live visuals, so an unticked row shows what the theme is
+                // actually using and ticking it starts from there.
+                let bg = ui.visuals().panel_fill;
+                let button = ui.visuals().widgets.inactive.weak_bg_fill;
+                theme_color(ui, "Set the background", &mut self.config.ui.background, bg);
+                theme_color(ui, "Set the buttons", &mut self.config.ui.button, button);
+                gap(ui, GAP_HAIR);
+                ui.label(
+                    egui::RichText::new(
+                        "Unticked follows the light/dark theme. The text color follows it \
+                         either way, so these are for a shade of the theme rather than a \
+                         different one.",
+                    )
+                    .weak(),
+                );
 
                 gap(ui, GAP_SECTION);
                 ui.strong("Overlay sizes (points)");

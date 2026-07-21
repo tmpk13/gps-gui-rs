@@ -18,6 +18,8 @@
 //! ok = "#3cb44b"      # "yes" and the green feedback lines
 //! error = "#dc503c"   # "no", errors, and the red feedback lines
 //! pulse = "#c82828"   # a toolbar button flagging that it has no target
+//! background = ""     # pages, map bar and popups; empty follows the theme
+//! button = ""         # a button at rest; empty follows the theme
 //!
 //! [sizes]             # screen points; each overlay is sized independently
 //! marker = 8.0        # current-position dot radius
@@ -76,11 +78,14 @@ impl Default for MarkerColors {
     }
 }
 
-/// Colors of the pages rather than the map: the feedback and status lines, and
-/// the pulse on a toolbar button that has nothing to act on.
+/// Colors of the pages rather than the map: the feedback and status lines, the
+/// pulse on a toolbar button that has nothing to act on, and the two surfaces
+/// everything else is drawn on.
 ///
-/// Everything else on a page follows the egui theme; these are the few places
-/// that carry meaning by color and so cannot be left to it.
+/// The first three carry meaning by color and so are always set. The last two
+/// are overrides of the light/dark theme and default to `None`, which leaves the
+/// theme's own: the text color is still the theme's, so these are for a shade of
+/// it rather than a way to invert it.
 #[derive(Clone, Copy)]
 pub struct UiColors {
     /// "yes" on the Status page, and the `Ok` feedback lines.
@@ -89,6 +94,12 @@ pub struct UiColors {
     pub error: Color32,
     /// Background pulse on a toolbar button with no target.
     pub pulse: Color32,
+    /// Fill behind the pages, the map's controls bar and the popups. `None`
+    /// keeps the theme's own.
+    pub background: Option<Color32>,
+    /// Fill of a button at rest; the hover and press shades are derived from it.
+    /// `None` keeps the theme's own.
+    pub button: Option<Color32>,
 }
 
 impl Default for UiColors {
@@ -97,6 +108,8 @@ impl Default for UiColors {
             ok: Color32::from_rgb(60, 180, 75),
             error: Color32::from_rgb(220, 80, 60),
             pulse: Color32::from_rgb(200, 40, 40),
+            background: None,
+            button: None,
         }
     }
 }
@@ -366,6 +379,8 @@ struct RawUi {
     ok: Option<String>,
     error: Option<String>,
     pulse: Option<String>,
+    background: Option<String>,
+    button: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -415,9 +430,25 @@ fn parse_hex(s: &str) -> Result<Color32, String> {
     Ok(Color32::from_rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
 }
 
+/// Parse a color that may be left to the theme: an empty string is "unset", so
+/// the key can stay in the file with nothing in it rather than being deleted to
+/// turn the override off.
+fn parse_hex_opt(s: &str) -> Result<Option<Color32>, String> {
+    if s.trim().is_empty() {
+        return Ok(None);
+    }
+    parse_hex(s).map(Some)
+}
+
 /// `#rrggbb` for a color: the form [`parse_hex`] reads back.
 fn hex(c: Color32) -> String {
     format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
+
+/// `#rrggbb` for a color left to the theme when unset - an empty string, which
+/// [`parse_hex_opt`] reads back as "unset".
+fn hex_opt(c: Option<Color32>) -> String {
+    c.map(hex).unwrap_or_default()
 }
 
 /// A TOML float for an `f32` setting. Widening straight to `f64` exposes the
@@ -529,6 +560,15 @@ impl AppConfig {
         set(&mut doc, "ui", "ok", hex(self.ui.ok).into());
         set(&mut doc, "ui", "error", hex(self.ui.error).into());
         set(&mut doc, "ui", "pulse", hex(self.ui.pulse).into());
+        // Left in the file as an empty string rather than dropped, so the key is
+        // there to fill in by hand.
+        set(
+            &mut doc,
+            "ui",
+            "background",
+            hex_opt(self.ui.background).into(),
+        );
+        set(&mut doc, "ui", "button", hex_opt(self.ui.button).into());
         set(&mut doc, "sizes", "marker", f32_value(self.sizes.marker));
         set(&mut doc, "sizes", "beacon", f32_value(self.sizes.beacon));
         set(&mut doc, "sizes", "track", f32_value(self.sizes.track));
@@ -614,6 +654,10 @@ impl AppConfig {
              ok = \"{ok}\"      # \"yes\" and the green feedback lines\n\
              error = \"{error}\"   # \"no\", errors, and the red feedback lines\n\
              pulse = \"{pulse}\"   # a toolbar button flagging that it has no target\n\
+             # Empty follows the light/dark theme. The text color follows it either\n\
+             # way, so these are for a shade of the theme, not a different one.\n\
+             background = \"{background}\"      # behind the pages, the map bar and the popups\n\
+             button = \"{button}\"          # a button at rest; hover and press are shaded from it\n\
              \n\
              [sizes]              # screen points; each overlay is sized independently\n\
              marker = {marker:?}          # current-position dot radius\n\
@@ -648,6 +692,8 @@ impl AppConfig {
             ok = hex(self.ui.ok),
             error = hex(self.ui.error),
             pulse = hex(self.ui.pulse),
+            background = hex_opt(self.ui.background),
+            button = hex_opt(self.ui.button),
             marker = s.marker,
             beacon = s.beacon,
             track_w = s.track,
@@ -687,6 +733,12 @@ impl AppConfig {
         }
         if let Some(s) = raw.ui.pulse {
             config.ui.pulse = parse_hex(&s)?;
+        }
+        if let Some(s) = raw.ui.background {
+            config.ui.background = parse_hex_opt(&s)?;
+        }
+        if let Some(s) = raw.ui.button {
+            config.ui.button = parse_hex_opt(&s)?;
         }
         if let Some(v) = raw.sizes.marker {
             config.sizes.marker = parse_size("marker", v)?;
@@ -904,6 +956,25 @@ mod tests {
         let cfg = AppConfig::from_toml("[compass]\nmarker_arrow = false\narrow_hz = 2.0").unwrap();
         assert!(!cfg.compass.marker_arrow);
         assert_eq!(cfg.compass.arrow_hz, 2.0);
+    }
+
+    /// An empty string is how a surface color says "leave it to the theme", so
+    /// the key can sit in the file unset. It has to survive a save, which is
+    /// what would otherwise quietly turn the override back on.
+    #[test]
+    fn empty_surface_colors_mean_the_theme() {
+        let cfg = AppConfig::from_toml("[ui]\nbackground = \"\"\nbutton = \"#202020\"").unwrap();
+        assert_eq!(cfg.ui.background, None);
+        assert_eq!(cfg.ui.button, Some(Color32::from_rgb(32, 32, 32)));
+
+        let path = std::env::temp_dir().join("gps-gui-rs-config-surface-test.toml");
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(cfg.save(path).unwrap());
+        let back = AppConfig::load(path).unwrap();
+        assert_eq!(back.ui.background, None);
+        assert_eq!(back.ui.button, Some(Color32::from_rgb(32, 32, 32)));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

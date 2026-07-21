@@ -280,9 +280,20 @@ sending you back here for it, writing the same file and sharing the same
   be saved. On desktop the cache is relative, leaving the plain filename in the
   working directory. It is both what starts loaded and what Save writes back to.
 - **Colors are in two tables.** `[colors]` is the map (`track`, `fixed`, and the
-  `outline` ring around both dots); `[ui]` is the pages (`ok`, `error`, and the
-  `pulse` on a toolbar button with no target). Everything else follows the egui
-  theme - `[ui]` holds only the few places where the color *is* the message.
+  `outline` ring around both dots); `[ui]` is the pages: `ok`, `error` and the
+  `pulse` on a toolbar button with no target, where the color *is* the message,
+  plus `background` and `button`, the two surfaces everything else is drawn on.
+- **The two surface colors are theme overrides, and empty means "don't".**
+  `Option<Color32>`, written as `""` when unset so the key stays in the file.
+  `MyApp::apply_ui_colors` pushes them into the visuals before any page is
+  drawn: it starts from `Theme::default_visuals` every time rather than editing
+  what is there, so clearing an override (or switching theme) restores the theme
+  without the app holding a copy of it. It runs only when the theme or one of
+  the two colors moved - writing the style clones it, and the map repaints
+  continuously. The hover and press fills are blended from `button` toward the
+  text color, which is lighter than the button in a dark theme and darker in a
+  light one, so one color yields three states in either. The text color itself
+  stays the theme's, so these are for shading a theme, not replacing one.
 - `[track] show_path` and `[ble] show_path` are the per-path overlay settings.
   The map bar's path button is a session-only master switch over both
   (`MyApp::show_paths`) and never writes them, so the saved settings survive it.

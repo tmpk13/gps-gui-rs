@@ -418,6 +418,9 @@ pub struct MyApp {
     page: Page,
     /// Loaded configuration (marker colors, BLE settings).
     config: AppConfig,
+    /// Theme and `[ui]` surface colors last pushed into the egui visuals, so
+    /// [`MyApp::apply_ui_colors`] only writes the style when one of them moved.
+    colors_applied: Option<(egui::Theme, Option<egui::Color32>, Option<egui::Color32>)>,
     /// The config-file path typed on the Settings page.
     config_path: String,
     /// Result of the last load/save: `Ok` message (green) or error (red).
@@ -544,6 +547,7 @@ impl MyApp {
             adv_window_text: ble::ESP_ADV_DEFAULT_S.to_string(),
             page: Page::Map,
             config: AppConfig::default(),
+            colors_applied: None,
             // The path the auto-load below tries, so Save writes back to the
             // same file without the user having to type it.
             config_path: default_config_path(cache_dir.as_deref()),
@@ -587,6 +591,50 @@ impl MyApp {
         self.name_edits.clear();
         self.config = cfg;
         self.sync_ble_to_config();
+    }
+
+    /// Push the config's surface colors (`[ui] background` and `button`) into
+    /// the egui visuals for the active theme.
+    ///
+    /// Each application starts from `Theme::default_visuals` rather than editing
+    /// what is already there, so clearing an override restores the theme without
+    /// the app keeping a copy of it - and so does switching theme, which is why
+    /// the theme is part of what is compared below.
+    ///
+    /// Only run when something changed: writing the style clones it, and a map
+    /// that repaints continuously would pay for that every frame.
+    fn apply_ui_colors(&mut self, ctx: &egui::Context) {
+        let colors = self.config.ui;
+        let theme = ctx.theme();
+        let wanted = (theme, colors.background, colors.button);
+        if self.colors_applied == Some(wanted) {
+            return;
+        }
+        self.colors_applied = Some(wanted);
+
+        let mut visuals = theme.default_visuals();
+        if let Some(c) = colors.background {
+            visuals.panel_fill = c;
+            visuals.window_fill = c;
+        }
+        if let Some(c) = colors.button {
+            // The hover and press shades are blended toward the text color, not
+            // toward black or white: that is lighter than the button on a dark
+            // theme and darker on a light one, so one configured color reads as
+            // three states in either.
+            let text = visuals.text_color();
+            for (widget, shade) in [
+                (&mut visuals.widgets.inactive, 0.0),
+                (&mut visuals.widgets.hovered, 0.15),
+                (&mut visuals.widgets.active, 0.3),
+                (&mut visuals.widgets.open, 0.15),
+            ] {
+                let fill = c.lerp_to_gamma(text, shade);
+                widget.bg_fill = fill;
+                widget.weak_bg_fill = fill;
+            }
+        }
+        ctx.set_visuals_of(theme, visuals);
     }
 
     /// Seed the intent from the config at startup: auto-connect unless the
@@ -1160,6 +1208,9 @@ impl eframe::App for MyApp {
         self.sync_compass_power();
 
         let ctx = ui.ctx().clone();
+        // Before anything is drawn: the pages read these colors out of the
+        // visuals rather than being handed them.
+        self.apply_ui_colors(&ctx);
         let screen = ctx.input(|i| i.viewport_rect());
 
         match self.page {

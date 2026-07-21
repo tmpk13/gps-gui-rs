@@ -23,7 +23,8 @@ More statuses in the app.
 
 Toml color theme control. (partly done)
 `[colors] outline` and a new `[ui]` table (`ok`, `error`, `pulse`) replaced the
-hardcoded colors. The rest of the pages still follow the egui theme.
+hardcoded colors, and `[ui] background` / `button` override the theme's two
+surfaces (empty = follow the theme). Text colors still follow the egui theme.
 
 More color changes.
 
@@ -68,3 +69,5 @@ Clean up the pages.
 The bar button is a session-only master switch over both paths (`show_paths`);
 `[track] show_path` / `[ble] show_path` say which ones a shown map draws. The
 line to the beacon and its distance stay. Discarding points moved to Settings.
+
+better documentation of systems. Maybe mermaid block diagram?

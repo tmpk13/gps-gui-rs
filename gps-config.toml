@@ -4,13 +4,18 @@ fixed = "#ff5028"
 # Ring around the position and beacon dots.
 outline = "#ffffff"
 
-# Colors of the pages, not of the map: the few places that carry meaning by
-# color. Everything else follows the theme.
+# Colors of the pages, not of the map: the places that carry meaning by color,
+# and the two surfaces the rest is drawn on.
 [ui]
 ok = "#3cb44b"
 error = "#dc503c"
 # A toolbar button flagging that it has no target.
 pulse = "#c82828"
+# The two surfaces everything else is drawn on. Empty follows the light/dark
+# theme; the text color follows it either way, so these are for a shade of the
+# theme rather than a different one.
+background = ""
+button = ""
 
 [ble]
 enabled = true
