@@ -18,8 +18,7 @@ use crate::radio::{EditVal, FieldType};
 
 use super::{
     content_page, em, feedback_label, field_width, floating, gap, icon_button, page_margin,
-    status_bool, CORNER_MARGIN_FRAC, ERR_RED, GAP_BLOCK, GAP_HAIR, GAP_ITEM, GAP_SECTION,
-    GAP_TIGHT, OK_GREEN,
+    status_bool, CORNER_MARGIN_FRAC, GAP_BLOCK, GAP_HAIR, GAP_ITEM, GAP_SECTION, GAP_TIGHT,
 };
 
 /// How long after connecting the board counts as warming up. The GPS/LoRa
@@ -209,7 +208,7 @@ impl MyApp {
                 });
                 if self.manual_gps_bad {
                     ui.colored_label(
-                        ERR_RED,
+                        self.config.ui.error,
                         "Enter latitude and longitude, example 51.4779, -0.0015",
                     );
                 }
@@ -269,7 +268,7 @@ impl MyApp {
                 // ESP32-C6 / BLE link.
                 gap(ui, GAP_SECTION);
                 ui.strong("ESP32-C6 (BLE)");
-                status_bool(ui, "Link", self.ble_connected);
+                status_bool(ui, self.config.ui, "Link", self.ble_connected);
                 ui.label(self.ble_intent_text());
                 ui.label(egui::RichText::new(format!("BLE: {}", self.ble_status)).weak());
                 if let Some(secs) = self
@@ -330,7 +329,7 @@ impl MyApp {
                 // GPS (via the WIO's MAX-M10).
                 gap(ui, GAP_SECTION);
                 ui.strong("GPS");
-                status_bool(ui, "Fix", t.flags & TELEM_FLAG_GPS_FIX != 0);
+                status_bool(ui, self.config.ui, "Fix", t.flags & TELEM_FLAG_GPS_FIX != 0);
                 ui.label(format!("Satellites: {}", t.sats));
 
                 // LoRa mesh link (WIO-E5 radio).
@@ -353,8 +352,18 @@ impl MyApp {
                 // WIO-E5 housekeeping.
                 gap(ui, GAP_SECTION);
                 ui.strong("WIO-E5");
-                status_bool(ui, "SD logging", t.flags & TELEM_FLAG_SD_OK != 0);
-                status_bool(ui, "Radio config", t.flags & TELEM_FLAG_CFG_LOADED != 0);
+                status_bool(
+                    ui,
+                    self.config.ui,
+                    "SD logging",
+                    t.flags & TELEM_FLAG_SD_OK != 0,
+                );
+                status_bool(
+                    ui,
+                    self.config.ui,
+                    "Radio config",
+                    t.flags & TELEM_FLAG_CFG_LOADED != 0,
+                );
 
                 if let Some(line) = &self.board_log {
                     gap(ui, GAP_SECTION);
@@ -423,7 +432,7 @@ impl MyApp {
                 });
 
                 gap(ui, GAP_ITEM);
-                feedback_label(ui, &self.config_feedback);
+                feedback_label(ui, self.config.ui, &self.config_feedback);
 
                 gap(ui, GAP_SECTION);
                 ui.strong("Marker colors");
@@ -433,6 +442,31 @@ impl MyApp {
                     ui.end_row();
                     ui.label("beacon");
                     ui.color_edit_button_srgba(&mut self.config.colors.fixed);
+                    ui.end_row();
+                    ui.label("marker outline");
+                    ui.color_edit_button_srgba(&mut self.config.colors.outline);
+                    ui.end_row();
+                });
+
+                gap(ui, GAP_SECTION);
+                ui.strong("Page colors");
+                gap(ui, GAP_TIGHT);
+                ui.label(
+                    egui::RichText::new(
+                        "The few places off the map that carry meaning by color; the rest \
+                         follows the theme.",
+                    )
+                    .weak(),
+                );
+                egui::Grid::new("cfg_ui_colors").num_columns(2).show(ui, |ui| {
+                    ui.label("ok");
+                    ui.color_edit_button_srgba(&mut self.config.ui.ok);
+                    ui.end_row();
+                    ui.label("error");
+                    ui.color_edit_button_srgba(&mut self.config.ui.error);
+                    ui.end_row();
+                    ui.label("no-target pulse");
+                    ui.color_edit_button_srgba(&mut self.config.ui.pulse);
                     ui.end_row();
                 });
 
@@ -457,7 +491,22 @@ impl MyApp {
 
                 gap(ui, GAP_SECTION);
                 ui.strong("Map overlays");
+                // "Central" is what the Points page calls this device's own
+                // fixes, so the two pages name the same track the same way.
+                ui.checkbox(&mut self.config.track.show_path, "Show central path on map")
+                    .on_hover_text(
+                        "This device's own track. Hiding a path never stops it being recorded",
+                    );
                 ui.checkbox(&mut self.config.ble.show_path, "Show beacon path on map");
+                gap(ui, GAP_HAIR);
+                ui.label(
+                    egui::RichText::new(
+                        "The map's path button hides both at once without changing these; \
+                         the line to the beacon and its distance stay drawn either way.",
+                    )
+                    .weak(),
+                );
+                gap(ui, GAP_HAIR);
                 ui.checkbox(
                     &mut self.config.distance.show,
                     "Show distance on the line to the beacon",
@@ -519,6 +568,20 @@ impl MyApp {
                             .range(0.0..=1000.0),
                     );
                 });
+                gap(ui, GAP_ITEM);
+                // The map bar's old Clear button is a path toggle now, and
+                // discarding the recorded points is not something to leave a
+                // finger's width from the buttons used while moving.
+                let points = self.track.len() + self.beacon_track.len();
+                if ui
+                    .add_enabled(points > 0, egui::Button::new("Discard recorded points"))
+                    .on_hover_text("Drops both tracks, yours and the beacon's. Not undoable")
+                    .clicked()
+                {
+                    self.track.clear();
+                    self.beacon_track.clear();
+                }
+                ui.label(egui::RichText::new(format!("{points} points recorded")).weak());
 
                 // Offline maps: start a region download. Only when tiles are cached
                 // to disk; jumps to the map and begins the box selection there.
@@ -607,7 +670,7 @@ impl MyApp {
                 {
                     self.save_config();
                 }
-                feedback_label(ui, &self.config_feedback);
+                feedback_label(ui, self.config.ui, &self.config_feedback);
 
                 gap(ui, GAP_ITEM);
                 ui.horizontal_wrapped(|ui| {
@@ -632,7 +695,7 @@ impl MyApp {
                 if self.ble_ack.is_none() && self.ble_ack_pending {
                     ui.label("waiting for device ack...");
                 } else {
-                    feedback_label(ui, &self.ble_ack);
+                    feedback_label(ui, self.config.ui, &self.ble_ack);
                 }
 
                 gap(ui, GAP_SECTION);
@@ -733,7 +796,8 @@ impl MyApp {
                     // Only a running scan measures this, so its absence during
                     // a scan is the useful signal: that board is not answering.
                     Some(rssi) => {
-                        ui.label(egui::RichText::new(format!("{rssi} dBm")).color(OK_GREEN));
+                        let text = egui::RichText::new(format!("{rssi} dBm"));
+                        ui.label(text.color(self.config.ui.ok));
                     }
                     None if scanning => {
                         ui.label(egui::RichText::new("not answering").weak());
@@ -798,7 +862,7 @@ impl MyApp {
         // link state means little without knowing whose it is.
         ui.label(format!("Board: {}", self.selected_device_label()));
         if connected {
-            ui.colored_label(OK_GREEN, self.ble_intent_text());
+            ui.colored_label(self.config.ui.ok, self.ble_intent_text());
         } else if idle {
             ui.label(egui::RichText::new(self.ble_intent_text()).weak());
         } else {
@@ -854,7 +918,10 @@ impl MyApp {
             return;
         }
         if self.settings_unsupported {
-            ui.colored_label(ERR_RED, "This board's firmware is newer than the app.");
+            ui.colored_label(
+                self.config.ui.error,
+                "This board's firmware is newer than the app.",
+            );
             ui.label(
                 "Its settings use a layout this build cannot decode. Update the app to change them.",
             );
@@ -1013,7 +1080,7 @@ impl MyApp {
                     }
                 });
                 gap(ui, GAP_TIGHT);
-                feedback_label(ui, &self.radio_feedback);
+                feedback_label(ui, self.config.ui, &self.radio_feedback);
 
                 if self.radio.is_some() {
                     gap(ui, GAP_ITEM);

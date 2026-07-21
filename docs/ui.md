@@ -98,8 +98,10 @@ is pushed off the edge.
 
 Constants at the top of `mod.rs` (`ICON_SIZE_*`, `BUTTON_PAD_*_FRAC`,
 `TOGGLE_PAD_FRAC`, `CORNER_MARGIN_FRAC`, `PAGE_MARGIN_FRAC`, `GAP_*`,
-`FIELD_*_EM`) and the
-`OK_GREEN` / `ERR_RED` colors are the tuning knobs for sizing and feedback.
+`FIELD_*_EM`) are the tuning knobs for sizing. The colors that carry meaning are
+not among them: `feedback_label`, `status_bool` and `icon_button_pulse` take a
+`config::UiColors` from the `[ui]` table, so a theme reaches the pages and not
+just the map.
 
 ## Sizing: nothing is a fixed pixel count
 
@@ -199,11 +201,22 @@ edges. The key wrinkles:
   mobile relies on pinch, so the buttons would only crowd the small toolbar.
 - **Panning** is by primary-button drag, suppressed while pinching or while a
   download box is being picked.
+- **The path button** is a session-only master switch (`MyApp::show_paths`) over
+  both recorded paths. It only ever hides: which of the two a shown map draws is
+  `[track] show_path` and `[ble] show_path` on the Settings page, and the button
+  changes neither, so a press is undone by a press. The line to the beacon and
+  its distance label are not paths and stay drawn either way - they say where the
+  beacon is *now*, which is what is worth keeping when the map is too busy to
+  read. It replaced the old "clear tracks" button; discarding the points moved to
+  the Settings page, off the bar used while moving.
 - **Marker info.** A double-click/tap projects each marker to screen space (the
   same projection + rotation the marker layer draws with) and selects the
   closest one within a hit radius; a miss dismisses the popup.
 - **Overlay drawing (`marker.rs`).** `GpsLayer` draws the track, beacon, and the
-  line between them. Sizes come from the config `[sizes]` table (each overlay is
+  line between them. It draws whatever paths it is handed and decides no
+  visibility itself: a hidden path arrives as an empty `Vec`, so the map page is
+  the only place the button and the two settings are combined. Sizes come from
+  the config `[sizes]` table (each overlay is
   independent). The user->beacon line is dotted when `[distance] dotted` - both
   it and the distance label below are toggleable on the Settings page.
 - **The distance label** (`MyApp::distance_label`, units from `[distance]`, shown
@@ -266,8 +279,16 @@ sending you back here for it, writing the same file and sharing the same
   directory there can be read but never written, so a bare filename could never
   be saved. On desktop the cache is relative, leaving the plain filename in the
   working directory. It is both what starts loaded and what Save writes back to.
-- `[ble] show_path` is the single source of truth for the beacon-path overlay
-  (there is no separate runtime flag). `mac` is an `Option<String>` where `None`
+- **Colors are in two tables.** `[colors]` is the map (`track`, `fixed`, and the
+  `outline` ring around both dots); `[ui]` is the pages (`ok`, `error`, and the
+  `pulse` on a toolbar button with no target). Everything else follows the egui
+  theme - `[ui]` holds only the few places where the color *is* the message.
+- `[track] show_path` and `[ble] show_path` are the per-path overlay settings.
+  The map bar's path button is a session-only master switch over both
+  (`MyApp::show_paths`) and never writes them, so the saved settings survive it.
+  Neither affects recording: the points are kept either way, which is why
+  discarding them is its own button under "Track recording". `mac` is an
+  `Option<String>` where `None`
   means "any board"; it is no longer typed by hand but chosen in the Beacon
   page's device picker.
 

@@ -9,6 +9,7 @@ mod map;
 mod pages;
 
 use crate::app::{MyApp, Page};
+use crate::config::UiColors;
 
 /// Icon side length as a fraction of the smaller screen dimension, clamped to
 /// this point range. Keeps the toolbar proportional across phone and desktop.
@@ -57,10 +58,6 @@ const GAP_SECTION: f32 = 1.0;
 /// across a desktop window.
 const FIELD_MIN_EM: f32 = 8.0;
 const FIELD_MAX_EM: f32 = 22.0;
-
-/// Green "ok" and red "error" used for the feedback lines across the pages.
-const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(60, 180, 75);
-const ERR_RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 60);
 
 /// Square icon side length in points for the current screen size.
 ///
@@ -116,17 +113,17 @@ fn icon_size_for_row(screen: egui::Rect, avail: f32, spacing: f32, count: usize)
 /// A square icon button. The icons are white SVGs tinted to the current text
 /// color so they follow the theme.
 fn icon_button(ui: &mut egui::Ui, size: f32, source: egui::ImageSource<'_>) -> egui::Response {
-    icon_button_pulse(ui, size, source, false)
+    icon_button_pulse(ui, size, source, None)
 }
 
-/// Same as [`icon_button`], but when `pulse` is set the button background
-/// oscillates red to flag that the action currently has no target (used by the
-/// center button when there is no marker to center on).
+/// Same as [`icon_button`], but when `pulse` carries a color the button
+/// background oscillates in it to flag that the action currently has no target
+/// (used by the center button when there is no marker to center on).
 fn icon_button_pulse(
     ui: &mut egui::Ui,
     size: f32,
     source: egui::ImageSource<'_>,
-    pulse: bool,
+    pulse: Option<egui::Color32>,
 ) -> egui::Response {
     let tint = ui.visuals().text_color();
     let mut button = egui::Button::image(
@@ -134,12 +131,12 @@ fn icon_button_pulse(
             .fit_to_exact_size(egui::vec2(size, size))
             .tint(tint),
     );
-    if pulse {
+    if let Some(color) = pulse {
         // 0..1 oscillation, one cycle every ~1.6s.
         let t = ui.input(|i| i.time);
         let wave = 0.5 + 0.5 * (t * std::f64::consts::PI * 1.25).sin() as f32;
         let alpha = (60.0 + wave * 150.0) as u8;
-        button = button.fill(egui::Color32::from_rgba_unmultiplied(200, 40, 40, alpha));
+        button = button.fill(color.gamma_multiply(f32::from(alpha) / 255.0));
         // Keep the animation running even when nothing else asks for a repaint.
         ui.ctx().request_repaint();
     }
@@ -209,26 +206,32 @@ fn floating(
         });
 }
 
-/// Show a stored result as a colored line: green on `Ok`, red on `Err`, and
-/// nothing on `None`. Used for the config-load and BLE-ack feedback.
-fn feedback_label(ui: &mut egui::Ui, feedback: &Option<Result<String, String>>) {
+/// Show a stored result as a colored line: the ok color on `Ok`, the error
+/// color on `Err`, and nothing on `None`. Used for the config-load and BLE-ack
+/// feedback. The colors come from the config, so a theme carries through the
+/// pages as well as the map.
+fn feedback_label(ui: &mut egui::Ui, colors: UiColors, feedback: &Option<Result<String, String>>) {
     match feedback {
         Some(Ok(msg)) => {
-            ui.colored_label(OK_GREEN, msg);
+            ui.colored_label(colors.ok, msg);
         }
         Some(Err(msg)) => {
-            ui.colored_label(ERR_RED, msg);
+            ui.colored_label(colors.error, msg);
         }
         None => {}
     }
 }
 
-/// A labeled boolean status row: the label followed by a green "yes" or a red
-/// "no", for the Status page's health indicators.
-fn status_bool(ui: &mut egui::Ui, label: &str, ok: bool) {
+/// A labeled boolean status row: the label followed by an ok-colored "yes" or
+/// an error-colored "no", for the Status page's health indicators.
+fn status_bool(ui: &mut egui::Ui, colors: UiColors, label: &str, ok: bool) {
     ui.horizontal(|ui| {
         ui.label(format!("{label}:"));
-        let (text, color) = if ok { ("yes", OK_GREEN) } else { ("no", ERR_RED) };
+        let (text, color) = if ok {
+            ("yes", colors.ok)
+        } else {
+            ("no", colors.error)
+        };
         ui.colored_label(color, text);
     });
 }

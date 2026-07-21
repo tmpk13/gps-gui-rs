@@ -12,6 +12,12 @@
 //! [colors]
 //! track = "#0078ff"   # phone track, heading arrow, position dot
 //! fixed = "#ff5028"   # BLE beacon marker, distance line, beacon path
+//! outline = "#ffffff" # ring around the position and beacon dots
+//!
+//! [ui]                # colors of the pages, not of the map
+//! ok = "#3cb44b"      # "yes" and the green feedback lines
+//! error = "#dc503c"   # "no", errors, and the red feedback lines
+//! pulse = "#c82828"   # a toolbar button flagging that it has no target
 //!
 //! [sizes]             # screen points; each overlay is sized independently
 //! marker = 8.0        # current-position dot radius
@@ -35,6 +41,7 @@
 //!
 //! [track]
 //! min_distance = 3.0  # meters of movement before a new track point is recorded
+//! show_path = true    # draw the phone's own recorded path
 //!
 //! [compass]
 //! marker_arrow = true # point the marker arrow with the compass outside heading-up
@@ -54,6 +61,9 @@ pub struct MarkerColors {
     pub track: Color32,
     /// BLE beacon marker, the line drawn to it, and its path.
     pub fixed: Color32,
+    /// Ring around both dots, which is what keeps them apart from the tiles
+    /// under them whatever the base map looks like there.
+    pub outline: Color32,
 }
 
 impl Default for MarkerColors {
@@ -61,6 +71,32 @@ impl Default for MarkerColors {
         Self {
             track: Color32::from_rgb(0, 120, 255),
             fixed: Color32::from_rgb(255, 80, 40),
+            outline: Color32::WHITE,
+        }
+    }
+}
+
+/// Colors of the pages rather than the map: the feedback and status lines, and
+/// the pulse on a toolbar button that has nothing to act on.
+///
+/// Everything else on a page follows the egui theme; these are the few places
+/// that carry meaning by color and so cannot be left to it.
+#[derive(Clone, Copy)]
+pub struct UiColors {
+    /// "yes" on the Status page, and the `Ok` feedback lines.
+    pub ok: Color32,
+    /// "no" on the Status page, error text, and the `Err` feedback lines.
+    pub error: Color32,
+    /// Background pulse on a toolbar button with no target.
+    pub pulse: Color32,
+}
+
+impl Default for UiColors {
+    fn default() -> Self {
+        Self {
+            ok: Color32::from_rgb(60, 180, 75),
+            error: Color32::from_rgb(220, 80, 60),
+            pulse: Color32::from_rgb(200, 40, 40),
         }
     }
 }
@@ -247,11 +283,17 @@ pub struct TrackSettings {
     /// Minimum distance in meters from the last recorded point before another
     /// is appended to a track. Decimates GPS jitter; 0 records every fix.
     pub min_distance: f64,
+    /// Draw the phone's own recorded path on the map. Recording is unaffected:
+    /// the points are kept either way, this only hides the line.
+    pub show_path: bool,
 }
 
 impl Default for TrackSettings {
     fn default() -> Self {
-        Self { min_distance: 3.0 }
+        Self {
+            min_distance: 3.0,
+            show_path: true,
+        }
     }
 }
 
@@ -284,6 +326,7 @@ impl Default for CompassSettings {
 #[derive(Clone, Default)]
 pub struct AppConfig {
     pub colors: MarkerColors,
+    pub ui: UiColors,
     pub sizes: MarkerSizes,
     pub distance: DistanceSettings,
     pub ble: BleSettings,
@@ -297,6 +340,8 @@ pub struct AppConfig {
 struct RawConfig {
     #[serde(default)]
     colors: RawColors,
+    #[serde(default)]
+    ui: RawUi,
     #[serde(default)]
     sizes: RawSizes,
     #[serde(default)]
@@ -313,6 +358,14 @@ struct RawConfig {
 struct RawColors {
     track: Option<String>,
     fixed: Option<String>,
+    outline: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawUi {
+    ok: Option<String>,
+    error: Option<String>,
+    pulse: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -343,6 +396,7 @@ struct RawBle {
 #[derive(Deserialize, Default)]
 struct RawTrack {
     min_distance: Option<f64>,
+    show_path: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -466,6 +520,15 @@ impl AppConfig {
         let mut doc: DocumentMut = text.parse().map_err(|e| format!("{path}: {e}"))?;
         set(&mut doc, "colors", "track", hex(self.colors.track).into());
         set(&mut doc, "colors", "fixed", hex(self.colors.fixed).into());
+        set(
+            &mut doc,
+            "colors",
+            "outline",
+            hex(self.colors.outline).into(),
+        );
+        set(&mut doc, "ui", "ok", hex(self.ui.ok).into());
+        set(&mut doc, "ui", "error", hex(self.ui.error).into());
+        set(&mut doc, "ui", "pulse", hex(self.ui.pulse).into());
         set(&mut doc, "sizes", "marker", f32_value(self.sizes.marker));
         set(&mut doc, "sizes", "beacon", f32_value(self.sizes.beacon));
         set(&mut doc, "sizes", "track", f32_value(self.sizes.track));
@@ -505,6 +568,7 @@ impl AppConfig {
             "min_distance",
             self.track.min_distance.into(),
         );
+        set(&mut doc, "track", "show_path", self.track.show_path.into());
         set(
             &mut doc,
             "compass",
@@ -544,6 +608,12 @@ impl AppConfig {
              [colors]\n\
              track = \"{track}\"   # phone track, heading arrow, position dot\n\
              fixed = \"{fixed}\"   # BLE beacon marker, distance line, beacon path\n\
+             outline = \"{outline}\" # ring around the position and beacon dots\n\
+             \n\
+             [ui]                 # colors of the pages, not of the map\n\
+             ok = \"{ok}\"      # \"yes\" and the green feedback lines\n\
+             error = \"{error}\"   # \"no\", errors, and the red feedback lines\n\
+             pulse = \"{pulse}\"   # a toolbar button flagging that it has no target\n\
              \n\
              [sizes]              # screen points; each overlay is sized independently\n\
              marker = {marker:?}          # current-position dot radius\n\
@@ -567,12 +637,17 @@ impl AppConfig {
              \n\
              [track]\n\
              min_distance = {min_distance:?}   # meters of movement before a new track point\n\
+             show_path = {show_track}    # draw the phone's own recorded path\n\
              \n\
              [compass]            # heading-up always runs the sensor at full rate\n\
              marker_arrow = {marker_arrow}  # point the marker arrow with the compass in north-up and tracking\n\
              arrow_hz = {arrow_hz:?}       # sensor rate while only that arrow needs it\n",
             track = hex(self.colors.track),
             fixed = hex(self.colors.fixed),
+            outline = hex(self.colors.outline),
+            ok = hex(self.ui.ok),
+            error = hex(self.ui.error),
+            pulse = hex(self.ui.pulse),
             marker = s.marker,
             beacon = s.beacon,
             track_w = s.track,
@@ -586,6 +661,7 @@ impl AppConfig {
             mac = self.ble.mac.clone().unwrap_or_default(),
             names = names,
             min_distance = self.track.min_distance,
+            show_track = self.track.show_path,
             marker_arrow = self.compass.marker_arrow,
             arrow_hz = self.compass.arrow_hz,
         )
@@ -599,6 +675,18 @@ impl AppConfig {
         }
         if let Some(s) = raw.colors.fixed {
             config.colors.fixed = parse_hex(&s)?;
+        }
+        if let Some(s) = raw.colors.outline {
+            config.colors.outline = parse_hex(&s)?;
+        }
+        if let Some(s) = raw.ui.ok {
+            config.ui.ok = parse_hex(&s)?;
+        }
+        if let Some(s) = raw.ui.error {
+            config.ui.error = parse_hex(&s)?;
+        }
+        if let Some(s) = raw.ui.pulse {
+            config.ui.pulse = parse_hex(&s)?;
         }
         if let Some(v) = raw.sizes.marker {
             config.sizes.marker = parse_size("marker", v)?;
@@ -647,6 +735,9 @@ impl AppConfig {
                 return Err(format!("track.min_distance must be >= 0, got {v}"));
             }
             config.track.min_distance = v;
+        }
+        if let Some(v) = raw.track.show_path {
+            config.track.show_path = v;
         }
         if let Some(v) = raw.compass.marker_arrow {
             config.compass.marker_arrow = v;
@@ -698,9 +789,14 @@ mod tests {
         let cfg = AppConfig::default();
         let back = AppConfig::from_toml(&cfg.to_toml()).unwrap();
         assert_eq!(back.colors.fixed, cfg.colors.fixed);
+        assert_eq!(back.colors.outline, cfg.colors.outline);
+        assert_eq!(back.ui.ok, cfg.ui.ok);
+        assert_eq!(back.ui.error, cfg.ui.error);
+        assert_eq!(back.ui.pulse, cfg.ui.pulse);
         assert_eq!(back.sizes.distance_text, cfg.sizes.distance_text);
         assert_eq!(back.distance.units, cfg.distance.units);
         assert_eq!(back.track.min_distance, cfg.track.min_distance);
+        assert_eq!(back.track.show_path, cfg.track.show_path);
         assert_eq!(back.compass.marker_arrow, cfg.compass.marker_arrow);
         assert_eq!(back.compass.arrow_hz, cfg.compass.arrow_hz);
         // The generated `mac = ""` means "scan by service", not a pinned MAC.

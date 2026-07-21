@@ -1,7 +1,7 @@
 //! Map overlay that draws the current GPS position, heading, the track, and
 //! the BLE beacon (ESP32-C3 GPS) with its optional path.
 
-use egui::{Color32, Response, Shape, Stroke, Ui, Vec2};
+use egui::{Response, Shape, Stroke, Ui, Vec2};
 use walkers::{MapMemory, Plugin, Position, Projector};
 
 use crate::config::{MarkerColors, MarkerSizes};
@@ -16,15 +16,18 @@ const PULSE_REACH: f32 = 2.5;
 /// it needs to draw.
 pub struct GpsLayer {
     pub current: Option<Position>,
+    /// The phone's own path so far. Empty when it is hidden, like
+    /// [`Self::beacon_track`].
     pub track: Vec<Position>,
     /// Heading in degrees clockwise from north, if known.
     pub heading: Option<f32>,
     /// Live position of the BLE GPS beacon; a line is drawn to it from the
     /// current position.
     pub beacon: Option<Position>,
-    /// The beacon's path so far; drawn dashed when `show_beacon_path` is on.
+    /// The beacon's path so far, drawn dashed to tell it apart from the phone's.
+    /// Empty when it is hidden: the map page decides that, and hands over only
+    /// what is to be drawn.
     pub beacon_track: Vec<Position>,
-    pub show_beacon_path: bool,
     /// Heartbeat phase (0..1) for the ring pulsing out of the beacon marker
     /// while the BLE link is up. `None` leaves the marker still, which is how a
     /// disconnected beacon reads.
@@ -48,6 +51,7 @@ impl Plugin for GpsLayer {
         let painter = ui.painter();
         let track_color = self.colors.track;
         let beacon_color = self.colors.fixed;
+        let outline_color = self.colors.outline;
         let sizes = self.sizes;
 
         // The travelled track as a polyline.
@@ -61,7 +65,7 @@ impl Plugin for GpsLayer {
         }
 
         // The beacon's path, dashed to tell it apart from the phone track.
-        if self.show_beacon_path && self.beacon_track.len() >= 2 {
+        if self.beacon_track.len() >= 2 {
             let points: Vec<_> = self
                 .beacon_track
                 .iter()
@@ -112,7 +116,7 @@ impl Plugin for GpsLayer {
                 );
             }
             painter.circle_filled(beacon_screen, sizes.beacon, beacon_color);
-            painter.circle_stroke(beacon_screen, sizes.beacon, Stroke::new(2.0, Color32::WHITE));
+            painter.circle_stroke(beacon_screen, sizes.beacon, Stroke::new(2.0, outline_color));
         }
 
         let Some(pos) = self.current else { return };
@@ -134,6 +138,6 @@ impl Plugin for GpsLayer {
 
         // The current position on top.
         painter.circle_filled(screen, sizes.marker, track_color);
-        painter.circle_stroke(screen, sizes.marker, Stroke::new(2.0, Color32::WHITE));
+        painter.circle_stroke(screen, sizes.marker, Stroke::new(2.0, outline_color));
     }
 }

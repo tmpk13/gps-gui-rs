@@ -1,6 +1,16 @@
 [colors]
 track = "#0078ff"
 fixed = "#ff5028"
+# Ring around the position and beacon dots.
+outline = "#ffffff"
+
+# Colors of the pages, not of the map: the few places that carry meaning by
+# color. Everything else follows the theme.
+[ui]
+ok = "#3cb44b"
+error = "#dc503c"
+# A toolbar button flagging that it has no target.
+pulse = "#c82828"
 
 [ble]
 enabled = true
@@ -11,6 +21,9 @@ mac = ""
 
 [track]
 min_distance = 3.0
+# Draw the phone's own recorded path. Recording is unaffected either way; the
+# map bar's path button hides this and the beacon path together.
+show_path = true
 
 [sizes]
 marker = 8.0

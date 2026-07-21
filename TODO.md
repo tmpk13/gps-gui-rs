@@ -21,7 +21,9 @@ Should be a force reconnect from scratch button.
 
 More statuses in the app.
 
-Toml color theme control.
+Toml color theme control. (partly done)
+`[colors] outline` and a new `[ui]` table (`ok`, `error`, `pulse`) replaced the
+hardcoded colors. The rest of the pages still follow the egui theme.
 
 More color changes.
 
@@ -53,11 +55,7 @@ Beacon track is shared across boards, so the drawn path can span two of them aft
 
 Optimize.
 
-Page menu button much to large/in the way on mobile.
-
-Fix compass on mobile.
-
-GPS BLE mesh?
+GPS BLE mesh? 1 central shares coords with others over BLE?
 
 Edit dialog is too small.
 
@@ -65,4 +63,8 @@ Better color theme. Something visible in poor conditions.
 
 Clean up the pages.
 
-Show/hide path toggle instead of delete paths on map bar.
+~~Show/hide path toggle instead of delete paths on map bar.~~
+~~Setting for toggling central path as well.~~
+The bar button is a session-only master switch over both paths (`show_paths`);
+`[track] show_path` / `[ble] show_path` say which ones a shown map draws. The
+line to the beacon and its distance stay. Discarding points moved to Settings.

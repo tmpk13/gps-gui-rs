@@ -11,12 +11,12 @@ use walkers::{lat_lon, Map, Position, Projector, Tiles};
 use crate::app::{ease_heading, MarkerKind, MyApp, RegionSelect, ARROW_TAU, ROTATE_TAU};
 use crate::marker::GpsLayer;
 use crate::offline;
-use crate::points::age_text;
+use crate::points::{age_text, TrackPoint};
 use crate::tiles::MapLayer;
 
 use super::{
     floating, gap, icon_button, icon_button_pulse, icon_size_for, icon_size_for_row,
-    BUTTON_PAD_X_FRAC, BUTTON_PAD_Y_FRAC, CORNER_MARGIN_FRAC, ERR_RED, GAP_ITEM,
+    BUTTON_PAD_X_FRAC, BUTTON_PAD_Y_FRAC, CORNER_MARGIN_FRAC, GAP_ITEM,
 };
 
 /// Where the map looks before the first GPS fix arrives.
@@ -73,7 +73,7 @@ impl MyApp {
         // cannot disagree with what ends up in the bar.
         let show_rotate = self.has_direction() && self.tracking_beacon.is_none();
         let zoom_buttons = if cfg!(target_os = "android") { 0 } else { 2 };
-        // Center, track, layer, clear and the page menu are always there.
+        // Center, track, layer, paths and the page menu are always there.
         let buttons = 5 + usize::from(show_rotate) + zoom_buttons;
         // No button may take more than a 1/buttons share of the bar, padding and
         // spacing included, so a full row always fits the screen instead of
@@ -105,7 +105,7 @@ impl MyApp {
                     ui,
                     icon,
                     egui::include_image!("../../../assets/icons/center.svg"),
-                    targets.is_empty(),
+                    targets.is_empty().then_some(self.config.ui.pulse),
                 )
                 .on_hover_text("Center on position (hold for markers)");
                 if center.clicked() {
@@ -173,7 +173,7 @@ impl MyApp {
                     ui,
                     icon,
                     egui::include_image!("../../../assets/icons/track.svg"),
-                    !can_track,
+                    (!can_track).then_some(self.config.ui.pulse),
                 )
                 .on_hover_text(tracking_hint)
                 .clicked()
@@ -230,12 +230,31 @@ impl MyApp {
                         let _ = self.map_memory.zoom_out();
                     }
                 }
-                if icon_button(ui, icon, egui::include_image!("../../../assets/icons/clear.svg"))
-                    .on_hover_text("Clear tracks")
+                // Paths on/off: a master switch over both recorded paths, which
+                // only ever hides - the per-path settings decide which of the
+                // two a switched-on map draws. It leaves the line to the beacon
+                // and its distance label alone, those being what is worth
+                // keeping when the map is too busy to read. Session state, so a
+                // glance at a clear map does not overwrite either setting.
+                //
+                // Like the rotate and layer buttons, the glyph is the state the
+                // press switches TO.
+                let (path_icon, path_hint) = if self.show_paths {
+                    (
+                        egui::include_image!("../../../assets/icons/path-off.svg"),
+                        "Hide paths",
+                    )
+                } else {
+                    (
+                        egui::include_image!("../../../assets/icons/path.svg"),
+                        "Show paths",
+                    )
+                };
+                if icon_button(ui, icon, path_icon)
+                    .on_hover_text(path_hint)
                     .clicked()
                 {
-                    self.track.clear();
-                    self.beacon_track.clear();
+                    self.show_paths = !self.show_paths;
                 }
 
                 // The region download is started from the Settings page, which
@@ -289,17 +308,22 @@ impl MyApp {
             self.smoothed_arrow = None;
         }
 
-        let layer = GpsLayer {
-            current: self.current,
-            track: self.track.iter().map(|t| t.pos).collect(),
-            heading: arrow,
-            beacon: self.beacon,
-            beacon_track: if self.config.ble.show_path {
-                self.beacon_track.iter().map(|t| t.pos).collect()
+        // A hidden path is an empty one: the plugin draws whatever it is given,
+        // so the map page is the only place that decides what is visible. The
+        // bar's toggle is a master switch over both per-path settings.
+        let paths = |shown: bool, points: &[TrackPoint]| -> Vec<Position> {
+            if self.show_paths && shown {
+                points.iter().map(|t| t.pos).collect()
             } else {
                 Vec::new()
-            },
-            show_beacon_path: self.config.ble.show_path,
+            }
+        };
+        let layer = GpsLayer {
+            current: self.current,
+            track: paths(self.config.track.show_path, &self.track),
+            heading: arrow,
+            beacon: self.beacon,
+            beacon_track: paths(self.config.ble.show_path, &self.beacon_track),
             beacon_pulse,
             colors: self.config.colors,
             sizes: self.config.sizes,
@@ -877,6 +901,7 @@ impl MyApp {
             }
             RegionSelect::Confirm { a, b, mut max_zoom } => {
                 let mut close = false;
+                let error_color = self.config.ui.error;
                 // Topo tiles stop at zoom 17; don't offer levels the server 404s.
                 let layer_max = self.layer.max_zoom();
                 floating(
@@ -907,7 +932,7 @@ impl MyApp {
                         ));
                         if count > MAX_REGION_TILES {
                             ui.colored_label(
-                                ERR_RED,
+                                error_color,
                                 "Too many tiles: shrink the box or lower the max zoom.",
                             );
                         }

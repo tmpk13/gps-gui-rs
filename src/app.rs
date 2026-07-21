@@ -352,6 +352,14 @@ pub struct MyApp {
     compass_heading: Option<f32>,
     /// When set, the map is rotated so the current heading points up.
     heading_up: bool,
+    /// Master switch for the recorded paths on the map, from the bar's toggle.
+    /// It only hides: which of the two paths a shown map draws is
+    /// `config.track.show_path` / `config.ble.show_path`. The line to the
+    /// beacon and its distance label are not paths and stay either way.
+    ///
+    /// Session state, like `heading_up` and the base layer: it clears the map
+    /// for a moment, and the settings it overrides are the saved ones.
+    show_paths: bool,
     /// Tracking mode: index into the available beacons of the one being kept in
     /// frame (user near the bottom, beacon near the top). `None` is off. The
     /// track button cycles it; the heading button exits.
@@ -503,6 +511,7 @@ impl MyApp {
             heading: None,
             compass_heading: None,
             heading_up: false,
+            show_paths: true,
             tracking_beacon: None,
             smoothed_heading: None,
             smoothed_arrow: None,
