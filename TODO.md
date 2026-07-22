@@ -72,3 +72,5 @@ The bar button is a session-only master switch over both paths (`show_paths`);
 line to the beacon and its distance stay. Discarding points moved to Settings.
 
 better documentation of systems. Maybe mermaid block diagram?
+
+Add name to status page.
