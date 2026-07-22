@@ -140,22 +140,28 @@ impl MyApp {
                     PointFilter::Esp,
                     PointSource::Esp.label(),
                 );
+                // One entry for all remote nodes; a node's own address shows in
+                // its rows below rather than as its own filter button.
+                ui.selectable_value(&mut self.points_filter, PointFilter::Remote, "nodes");
             });
             gap(ui, GAP_ITEM);
 
             let query = self.points_search.trim().to_lowercase();
+            let remote_points = self.remotes.values().flat_map(|n| n.track.iter());
             let mut rows: Vec<TrackPoint> = self
                 .track
                 .iter()
                 .chain(self.beacon_track.iter())
+                .chain(remote_points)
                 .filter(|p| self.points_filter.admits(p.source))
                 .filter(|p| query.is_empty() || p.matches(&query))
                 .copied()
                 .collect();
-            // Newest first; the two tracks interleave by record time.
+            // Newest first; every track interleaves by record time.
             rows.sort_by(|x, y| y.time.cmp(&x.time));
 
-            let total = self.track.len() + self.beacon_track.len();
+            let remote_total: usize = self.remotes.values().map(|n| n.track.len()).sum();
+            let total = self.track.len() + self.beacon_track.len() + remote_total;
             ui.label(format!("{} of {total} points", rows.len()));
             gap(ui, GAP_HAIR);
 
@@ -263,9 +269,14 @@ impl MyApp {
                             egui::RichText::new(format!("{:.5}, {:.5}", pos.y(), pos.x()))
                                 .monospace(),
                         );
-                        if let Some(m) = self.distance_to_beacon() {
+                        // Names the board it is measured to: the tracked one
+                        // when tracking, otherwise the connected board.
+                        if let (Some((kind, _)), Some(m)) =
+                            (self.distance_target(), self.distance_to_target())
+                        {
                             ui.label(format!(
-                                "Distance to beacon: {}",
+                                "Distance to {}: {}",
+                                self.marker_label(kind),
                                 self.config.distance.units.format(m)
                             ));
                         }
@@ -288,6 +299,31 @@ impl MyApp {
                     // twice from two different sources.
                     if self.telemetry.is_none() {
                         ui.label(format!("Beacon satellites: {}", p.sats));
+                    }
+                }
+
+                // Remote nodes heard over LoRa and relayed by the connected
+                // board, each with its last position and the signal it came in
+                // at. Collected first so the config lookup below is free of the
+                // borrow on `remotes`.
+                let heard: Vec<(u8, Position, i16)> = self
+                    .remotes
+                    .iter()
+                    .filter_map(|(&addr, n)| n.pos.map(|p| (addr, p, n.rssi)))
+                    .collect();
+                if !heard.is_empty() {
+                    gap(ui, GAP_SECTION);
+                    ui.strong("Remote nodes");
+                    for (addr, p, rssi) in heard {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}: {:.5}, {:.5}  (rssi {rssi})",
+                                self.config.lora.label_of(addr),
+                                p.y(),
+                                p.x()
+                            ))
+                            .monospace(),
+                        );
                     }
                 }
 
@@ -544,10 +580,15 @@ impl MyApp {
                         "This device's own track. Hiding a path never stops it being recorded",
                     );
                 ui.checkbox(&mut self.config.ble.show_path, "Show beacon path on map");
+                ui.checkbox(
+                    &mut self.config.lora.show_path,
+                    "Show remote node paths on map",
+                )
+                .on_hover_text("The LoRa nodes relayed by the connected board, one color each");
                 gap(ui, GAP_HAIR);
                 ui.label(
                     egui::RichText::new(
-                        "The map's path button hides both at once without changing these; \
+                        "The map's path button hides them all at once without changing these; \
                          the line to the beacon and its distance stay drawn either way.",
                     )
                     .weak(),
@@ -618,14 +659,18 @@ impl MyApp {
                 // The map bar's old Clear button is a path toggle now, and
                 // discarding the recorded points is not something to leave a
                 // finger's width from the buttons used while moving.
-                let points = self.track.len() + self.beacon_track.len();
+                let remote_points: usize = self.remotes.values().map(|n| n.track.len()).sum();
+                let points = self.track.len() + self.beacon_track.len() + remote_points;
                 if ui
                     .add_enabled(points > 0, egui::Button::new("Discard recorded points"))
-                    .on_hover_text("Drops both tracks, yours and the beacon's. Not undoable")
+                    .on_hover_text("Drops every track: yours, the beacon's and the nodes'. Not undoable")
                     .clicked()
                 {
                     self.track.clear();
                     self.beacon_track.clear();
+                    for node in self.remotes.values_mut() {
+                        node.track.clear();
+                    }
                 }
                 ui.label(egui::RichText::new(format!("{points} points recorded")).weak());
 

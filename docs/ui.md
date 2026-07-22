@@ -172,27 +172,31 @@ edges. The key wrinkles:
   the compass runs at a few Hz, so the raw readings would step it round in
   visible jumps. Both easings share `app::ease_heading`.
 - **The center button.** A plain tap centers on you (falling back to the first
-  beacon with no fix yet); holding it - or right-clicking on desktop, both being
-  `Response::secondary_clicked` - opens `center_menu_ui`, a list of every marker
-  with a known position (`MyApp::center_targets`). Either path goes through
-  `MyApp::center_on`, which leaves tracking mode, centers (following the live
-  position only for you), and kicks off the offline zoom probe.
+  beacon board with no fix yet); holding it - or right-clicking on desktop, both
+  being `Response::secondary_clicked` - opens `center_menu_ui`, a list of every
+  marker with a known position (`MyApp::center_targets`): you, the connected
+  board, then each remote node under its config nickname (`MyApp::marker_label`).
+  Either path goes through `MyApp::center_on`, which leaves tracking mode,
+  centers (following the live position only for you), and kicks off the offline
+  zoom probe.
 - **Beacon heartbeat.** While the BLE link is up, a ring expands out of the
   beacon marker and fades, one beat per `PULSE_PERIOD`. The phase is computed in
   `MyApp::map` and handed to `GpsLayer` as `beacon_pulse`; the animation runs on
   `request_repaint_after(PULSE_FRAME)` rather than a per-frame repaint, so an
   otherwise idle map is not pinned at full frame rate.
 - **Tracking mode.** The track button (`tracking_beacon: Option<usize>` is the
-  active beacon index) frames the user and a beacon together: `tracking_orientation`
-  centers the view on their midpoint, picks a zoom that fits the pair inside the
-  screen height less a top/bottom margin (`TRACK_MARGIN_FRAC`), and returns the
-  user->beacon bearing that feeds the same rotation easing as heading-up - so the
-  beacon rides near the top and the user near the bottom. It reuses
-  `smoothed_heading` (tracking bearing and heading-up are mutually exclusive) and
-  locks pan/zoom on every platform (the center and zoom are recomputed each
-  frame). The track button is the only way in and out: tapping it enters the
-  mode, walks along the beacon list, and leaves the mode on the press after the
-  last beacon. The heading button is hidden while tracking (which owns the map's
+  active index into `MyApp::beacon_targets`) frames the user and one beacon board
+  together: `tracking_orientation` centers the view on their midpoint, picks a
+  zoom that fits the pair inside the screen height less a top/bottom margin
+  (`TRACK_MARGIN_FRAC`), and returns the user->board bearing that feeds the same
+  rotation easing as heading-up - so the board rides near the top and the user
+  near the bottom. It reuses `smoothed_heading` (tracking bearing and heading-up
+  are mutually exclusive) and locks pan/zoom on every platform (the center and
+  zoom are recomputed each frame). The track button is the only way in and out:
+  tapping it enters the mode and **cycles through every beacon board** - the
+  connected board first, then each remote node (`beacon_targets`, connected board
+  then remotes in address order) - leaving the mode on the press after the last
+  one. The heading button is hidden while tracking (which owns the map's
   orientation), as it is whenever no heading source is available at all.
 - **Zoom is driven manually.** The map lives in a `Background` area, and
   walkers' built-in zoom only fires when the map is the top interactable layer
@@ -204,31 +208,42 @@ edges. The key wrinkles:
 - **Panning** is by primary-button drag, suppressed while pinching or while a
   download box is being picked.
 - **The path button** is a session-only master switch (`MyApp::show_paths`) over
-  both recorded paths. It only ever hides: which of the two a shown map draws is
-  `[track] show_path` and `[ble] show_path` on the Settings page, and the button
-  changes neither, so a press is undone by a press. The line to the beacon and
-  its distance label are not paths and stay drawn either way - they say where the
-  beacon is *now*, which is what is worth keeping when the map is too busy to
-  read. It replaced the old "clear tracks" button; discarding the points moved to
-  the Settings page, off the bar used while moving.
+  every recorded path. It only ever hides: which paths a shown map draws is
+  `[track] show_path`, `[ble] show_path` and `[lora] show_path` on the Settings
+  page (the phone track, the connected board's path, and the remote nodes' paths
+  respectively), and the button changes none of them, so a press is undone by a
+  press. The line to the tracked board and its distance label are not paths and
+  stay drawn either way - they say where that board is *now*, which is what is
+  worth keeping when the map is too busy to read. It replaced the old "clear
+  tracks" button; discarding the points moved to the Settings page, off the bar
+  used while moving.
 - **Marker info.** A double-click/tap projects each marker to screen space (the
   same projection + rotation the marker layer draws with) and selects the
   closest one within a hit radius; a miss dismisses the popup.
-- **Overlay drawing (`marker.rs`).** `GpsLayer` draws the track, beacon, and the
-  line between them. It draws whatever paths it is handed and decides no
-  visibility itself: a hidden path arrives as an empty `Vec`, so the map page is
-  the only place the button and the two settings are combined. Sizes come from
-  the config `[sizes]` table (each overlay is
-  independent). The user->beacon line is dotted when `[distance] dotted` - both
-  it and the distance label below are toggleable on the Settings page.
+- **Overlay drawing (`marker.rs`).** `GpsLayer` draws the phone track, the
+  connected board and its path, every remote node (`RemoteDraw`: a marker and a
+  dashed path each, in the node's palette color), and the line from the user to
+  the distance target. It draws whatever it is handed and decides no visibility
+  itself: a hidden path arrives as an empty `Vec`, so the map page is the only
+  place the button and the per-path settings are combined. Remote colors are the
+  built-in `config::remote_color(addr)` palette, cycled by LoRa address so a
+  handful of nodes read apart; the connected board keeps the configurable
+  `[colors] fixed`. Sizes come from `[sizes]` (each overlay independent). The
+  distance line is dotted when `[distance] dotted` - both it and the distance
+  label below are toggleable on the Settings page.
+- **The distance target.** The user->board line and the distance label follow
+  `MyApp::distance_target`: the board tracking mode currently has selected, or
+  the connected board when not tracking. The line is drawn in that board's color
+  (`fixed` for the connected board, its palette color for a remote), and
+  `distance_to_target` measures to it.
 - **The distance label** (`MyApp::distance_label`, units from `[distance]`, shown
   when `[distance] show`) is the one overlay NOT drawn by the plugin. Text needs
   an angle as well as a position, and leaving that to the rotation pass left the
   glyphs level, so the label is painted after the pass with both set outright: it
-  projects the user and beacon the same way the plugin does, turns the midpoint
-  about the same pivot, and hands the map's angle to the text. It is painted as
-  eight offset copies in the contrasting theme color (the outline) under the
-  label itself, all sharing one laid-out galley.
+  projects the user and the distance target the same way the plugin does, turns
+  the midpoint about the same pivot, and hands the map's angle to the text. It is
+  painted as eight offset copies in the contrasting theme color (the outline)
+  under the label itself, all sharing one laid-out galley.
 
 ## Offline region download flow
 
@@ -308,14 +323,26 @@ sending you back here for it, writing the same file and sharing the same
   cannot be read against each other. The theme is what normally keeps them in
   step; the Settings page and the generated TOML both say that setting one is
   taking that on yourself.
-- `[track] show_path` and `[ble] show_path` are the per-path overlay settings.
-  The map bar's path button is a session-only master switch over both
-  (`MyApp::show_paths`) and never writes them, so the saved settings survive it.
-  Neither affects recording: the points are kept either way, which is why
-  discarding them is its own button under "Track recording". `mac` is an
-  `Option<String>` where `None`
-  means "any board"; it is no longer typed by hand but chosen in the Beacon
-  page's device picker.
+- `[track] show_path`, `[ble] show_path` and `[lora] show_path` are the per-path
+  overlay settings (the phone track, the connected board's path, and every remote
+  node's path). The map bar's path button is a session-only master switch over
+  all three (`MyApp::show_paths`) and never writes them, so the saved settings
+  survive it. None affects recording: the points are kept either way, which is
+  why discarding them is its own button under "Track recording" (it clears the
+  phone, beacon and every remote track). `mac` is an `Option<String>` where
+  `None` means "any board"; it is no longer typed by hand but chosen in the
+  Beacon page's device picker.
+- **Remote LoRa nodes** are relayed to the app by the connected board over the
+  `midair_proto::ble::REMOTE_UUID` characteristic (`[src, rssi, PositionPacket]`);
+  the transports decode it with `ble::remote_event` into `BleEvent::Remote`, and
+  `drain_sources` buckets them by `src` into `MyApp::remotes` (a `RemoteNode` per
+  address: live position, last packet, RSSI, and its own track). The board keeps
+  only one remote slot and re-notifies it each interval, so the drain treats only
+  a changed packet as a new report. Each node's nickname lives in `[lora.names]`
+  (keyed by address; "Node N" when unset) and is resolved through
+  `MyApp::marker_label`, so every page names a node the same way. Switching the
+  connected board (`forget_board_state`) drops the live remote positions but
+  keeps their tracks, the same bargain the connected board's own path strikes.
 
 ## The Beacon page (`pages.rs` + `ble/`)
 

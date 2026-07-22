@@ -22,7 +22,9 @@ use gps_proto::packet::{self, PositionPacket};
 use midair_proto::ble;
 use midair_proto::link::Telemetry;
 
-use super::{settings_event, BleCommand, BleEvent, BleHandle, ConfigWrite, DiscoveredDevice};
+use super::{
+    remote_event, settings_event, BleCommand, BleEvent, BleHandle, ConfigWrite, DiscoveredDevice,
+};
 
 /// The compiled dex with rs.gps.gui.BleBridge (see android/build-dex.sh).
 const BRIDGE_DEX: &[u8] = include_bytes!("../../assets/ble-bridge.dex");
@@ -441,7 +443,12 @@ fn session(
     // beacon, so a missing characteristic is not an error). Settings is
     // subscribed before it is read below, so a change the board makes between
     // the two (a clamped interval, say) still reaches us.
-    for chr in [ble::TELEMETRY_UUID, ble::LOG_UUID, ble::SETTINGS_UUID] {
+    for chr in [
+        ble::TELEMETRY_UUID,
+        ble::LOG_UUID,
+        ble::SETTINGS_UUID,
+        ble::REMOTE_UUID,
+    ] {
         if bridge.set_notify(packet::SERVICE_UUID, chr, true) {
             let _ = wait_for(cb_rx, Duration::from_secs(5), |cb| {
                 matches!(cb, Cb::DescriptorWrite { status: 0 })
@@ -483,6 +490,10 @@ fn session(
                     }
                 } else if uuid.eq_ignore_ascii_case(ble::LOG_UUID) {
                     report.send(BleEvent::Log(String::from_utf8_lossy(&value).into_owned()));
+                } else if uuid.eq_ignore_ascii_case(ble::REMOTE_UUID) {
+                    if let Some(e) = remote_event(&value) {
+                        report.send(e);
+                    }
                 } else if uuid.eq_ignore_ascii_case(ble::SETTINGS_UUID) {
                     report.send(settings_event(&value));
                 }

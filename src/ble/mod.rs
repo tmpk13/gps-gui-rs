@@ -45,8 +45,17 @@ pub enum BleEvent {
     Discovered(DiscoveredDevice),
     /// Connection state changed; gates the config controls.
     Connected(bool),
-    /// A decoded position packet from the beacon.
+    /// A decoded position packet from the connected board's own GPS.
     Fix(PositionPacket),
+    /// A remote node's position, relayed over LoRa by the connected board and
+    /// read off the remote characteristic. `src` is the originating LoRa
+    /// address (1-255); the UI keeps a separate track per address. `rssi` is
+    /// the LoRa signal the relay heard it at.
+    Remote {
+        src: u8,
+        rssi: i16,
+        packet: PositionPacket,
+    },
     /// A config ack: the device confirmed (or rejected) a setting.
     Ack(Ack),
     /// Board telemetry (LoRa link, GPS, SD) from the esp32c6-gps board.
@@ -139,6 +148,24 @@ fn settings_event(bytes: &[u8]) -> BleEvent {
     }
 }
 
+/// Decode a remote-position blob (`[src u8, rssi i16le, PositionPacket]`) from
+/// the remote characteristic into a [`BleEvent::Remote`]. `None` for a short
+/// blob, an undecodable packet, or `src` 0 - the board notifies the remote
+/// slot with a zero source when nothing has been heard yet, and 0 is the local
+/// GPS in any case, delivered on the position characteristic instead.
+fn remote_event(bytes: &[u8]) -> Option<BleEvent> {
+    if bytes.len() < midair_proto::ble::REMOTE_LEN {
+        return None;
+    }
+    let src = bytes[0];
+    if src == 0 {
+        return None;
+    }
+    let rssi = i16::from_le_bytes([bytes[1], bytes[2]]);
+    let packet = PositionPacket::decode(&bytes[3..])?;
+    Some(BleEvent::Remote { src, rssi, packet })
+}
+
 /// The UI's handle to the BLE worker.
 pub struct BleHandle {
     pub events: Receiver<BleEvent>,
@@ -196,6 +223,38 @@ mod tests {
         let (mine, n) = ConfigWrite::Interval(1500).encode();
         let (theirs, m) = packet::encode_config(packet::ConfigCommand::UpdateIntervalMs(1500));
         assert_eq!((&mine[..n], n), (&theirs[..m], m));
+    }
+
+    #[test]
+    fn remote_event_carries_src_and_rejects_local() {
+        use gps_proto::packet::{PositionPacket, FLAG_FIX};
+
+        let packet = PositionPacket {
+            lat_e7: 481_173_000,
+            lon_e7: -1_226_760_000,
+            flags: FLAG_FIX,
+            sats: 6,
+            ..PositionPacket::default()
+        };
+        let mut blob = [0u8; ble::REMOTE_LEN];
+        blob[0] = 7; // src address
+        blob[1..3].copy_from_slice(&(-92i16).to_le_bytes());
+        blob[3..].copy_from_slice(&packet.encode());
+
+        match remote_event(&blob) {
+            Some(BleEvent::Remote { src, rssi, packet: p }) => {
+                assert_eq!(src, 7);
+                assert_eq!(rssi, -92);
+                assert_eq!(p, packet);
+            }
+            _ => panic!("expected a remote event"),
+        }
+
+        // Source 0 is the local GPS / "nothing heard yet"; not a remote.
+        blob[0] = 0;
+        assert!(remote_event(&blob).is_none());
+        // A short blob decodes to nothing rather than panicking.
+        assert!(remote_event(&blob[..ble::REMOTE_LEN - 1]).is_none());
     }
 
     #[test]

@@ -9,7 +9,8 @@ use egui::{epaint::TextShape, Pos2, Shape};
 use walkers::{lat_lon, Map, Position, Projector, Tiles};
 
 use crate::app::{ease_heading, MarkerKind, MyApp, RegionSelect, ARROW_TAU, ROTATE_TAU};
-use crate::marker::GpsLayer;
+use crate::config::remote_color;
+use crate::marker::{GpsLayer, RemoteDraw};
 use crate::offline;
 use crate::points::{age_text, TrackPoint};
 use crate::tiles::MapLayer;
@@ -318,6 +319,26 @@ impl MyApp {
                 Vec::new()
             }
         };
+        // Each remote node draws in its address palette color; its path follows
+        // the single `[lora] show_path` toggle under the same master switch.
+        let remotes: Vec<RemoteDraw> = self
+            .remotes
+            .iter()
+            .map(|(&addr, node)| RemoteDraw {
+                pos: node.pos,
+                track: paths(self.config.lora.show_path, &node.track),
+                color: remote_color(addr),
+            })
+            .collect();
+        // The user->target line goes to the tracked board (or the connected
+        // board when not tracking), drawn in that board's color.
+        let distance_line = self.distance_target().map(|(kind, pos)| {
+            let color = match kind {
+                MarkerKind::Remote(addr) => remote_color(addr),
+                _ => self.config.colors.fixed,
+            };
+            (pos, color)
+        });
         let layer = GpsLayer {
             current: self.current,
             track: paths(self.config.track.show_path, &self.track),
@@ -325,6 +346,8 @@ impl MyApp {
             beacon: self.beacon,
             beacon_track: paths(self.config.ble.show_path, &self.beacon_track),
             beacon_pulse,
+            remotes,
+            distance_line,
             colors: self.config.colors,
             sizes: self.config.sizes,
             distance_dotted: self.config.distance.dotted,
@@ -443,8 +466,8 @@ impl MyApp {
         if !self.config.distance.show {
             return;
         }
-        let (Some(user), Some(beacon), Some(meters)) =
-            (self.current, self.beacon, self.distance_to_beacon())
+        let (Some(user), Some((_, target)), Some(meters)) =
+            (self.current, self.distance_target(), self.distance_to_target())
         else {
             return;
         };
@@ -453,12 +476,12 @@ impl MyApp {
         // it was given (the overscanned one when the map is rotated).
         let projector = Projector::new(map_rect, &self.map_memory, user);
         let user_px = projector.project(user).to_pos2();
-        let beacon_px = projector.project(beacon).to_pos2();
+        let target_px = projector.project(target).to_pos2();
 
         // Follow the line: turn its midpoint about the pivot the map turned
         // about, and turn the "above the line" offset with it.
         let rot = rotation.unwrap_or(Rot2::IDENTITY);
-        let mid = user_px + (beacon_px - user_px) * 0.5;
+        let mid = user_px + (target_px - user_px) * 0.5;
         let size = self.config.sizes.distance_text;
         // Lift off the line by a fraction of the label's own font size, so the
         // gap stays the same to the eye at any configured text size.
@@ -651,6 +674,12 @@ impl MyApp {
 
         let icon = icon_size_for(screen);
         let top = self.top_inset(ctx);
+        // Resolve each entry's name up front (a remote's comes from the config),
+        // so the popup closure need not reach back into `self`.
+        let labelled: Vec<(MarkerKind, Position, String)> = targets
+            .iter()
+            .map(|&(kind, pos)| (kind, pos, self.marker_label(kind)))
+            .collect();
         let mut chosen: Option<(MarkerKind, Position)> = None;
         let mut close = false;
         floating(
@@ -669,22 +698,9 @@ impl MyApp {
                 ui.spacing_mut().item_spacing.y = icon * 0.12;
                 ui.set_min_width(icon * 3.5);
                 ui.label(egui::RichText::new("Center on").strong());
-                // Number the beacons only when there is more than one to tell
-                // apart; a single one reads better as just "Beacon".
-                let beacons = targets
-                    .iter()
-                    .filter(|(kind, _)| *kind == MarkerKind::Beacon)
-                    .count();
-                let mut nth = 0;
-                for &(kind, pos) in &targets {
-                    let label = if kind == MarkerKind::Beacon && beacons > 1 {
-                        nth += 1;
-                        format!("{} {nth}", kind.label())
-                    } else {
-                        kind.label().to_string()
-                    };
+                for (kind, pos, label) in &labelled {
                     if ui.button(label).clicked() {
-                        chosen = Some((kind, pos));
+                        chosen = Some((*kind, *pos));
                     }
                 }
                 if ui.button("Cancel").clicked() {
@@ -729,9 +745,15 @@ impl MyApp {
             }
         };
 
-        // Present markers, nearest-first is resolved below by distance.
-        let markers: [(MarkerKind, Option<Position>); 2] =
-            [(MarkerKind::You, self.current), (MarkerKind::Beacon, self.beacon)];
+        // Present markers, nearest-first is resolved below by distance: you,
+        // the connected board, then every remote node.
+        let mut markers: Vec<(MarkerKind, Option<Position>)> =
+            vec![(MarkerKind::You, self.current), (MarkerKind::Beacon, self.beacon)];
+        markers.extend(
+            self.remotes
+                .iter()
+                .map(|(&addr, node)| (MarkerKind::Remote(addr), node.pos)),
+        );
 
         // On a double-click, pick the closest marker within the hit radius; a
         // miss clears the current selection.
@@ -753,6 +775,10 @@ impl MyApp {
         let (pos, time) = match kind {
             MarkerKind::You => (self.current, self.current_time),
             MarkerKind::Beacon => (self.beacon, self.beacon_time),
+            MarkerKind::Remote(addr) => match self.remotes.get(&addr) {
+                Some(node) => (node.pos, node.time),
+                None => (None, None),
+            },
         };
         // The marker may have vanished (e.g. beacon disconnected) since it was
         // selected; drop the popup if so.
@@ -761,6 +787,7 @@ impl MyApp {
             return;
         };
         let anchor = to_screen(pos);
+        let label = self.marker_label(kind);
 
         let now = SystemTime::now();
         let age = match time {
@@ -777,7 +804,7 @@ impl MyApp {
             egui::Align2::CENTER_BOTTOM,
             true,
             |ui| {
-                ui.label(egui::RichText::new(kind.label()).strong());
+                ui.label(egui::RichText::new(&label).strong());
                 ui.label(age);
             },
         );

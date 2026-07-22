@@ -19,7 +19,9 @@ use midair_proto::ble;
 use midair_proto::link::Telemetry;
 use uuid::Uuid;
 
-use super::{settings_event, BleCommand, BleEvent, BleHandle, ConfigWrite, DiscoveredDevice};
+use super::{
+    remote_event, settings_event, BleCommand, BleEvent, BleHandle, ConfigWrite, DiscoveredDevice,
+};
 
 const SERVICE_UUID: Uuid = Uuid::from_u128(packet::SERVICE_UUID_U128);
 const POSITION_UUID: Uuid = Uuid::from_u128(packet::POSITION_UUID_U128);
@@ -31,6 +33,10 @@ const ACK_UUID: Uuid = Uuid::from_u128(packet::ACK_UUID_U128);
 const TELEMETRY_UUID: Uuid = Uuid::from_u128(ble::TELEMETRY_UUID_U128);
 const LOG_UUID: Uuid = Uuid::from_u128(ble::LOG_UUID_U128);
 const SETTINGS_UUID: Uuid = Uuid::from_u128(ble::SETTINGS_UUID_U128);
+// Remote-position characteristic: the connected board relays a LoRa node's
+// position here, tagged with the node's address. Absent on the esp32c3 beacon,
+// so optional like the other board-status characteristics.
+const REMOTE_UUID: Uuid = Uuid::from_u128(ble::REMOTE_UUID_U128);
 
 pub fn spawn(ctx: egui::Context) -> BleHandle {
     let (event_tx, event_rx) = channel();
@@ -335,6 +341,10 @@ async fn connected(
         .find(|c| c.uuid == LOG_UUID && c.properties.contains(CharPropFlags::NOTIFY))
         .cloned();
     let settings = chars.iter().find(|c| c.uuid == SETTINGS_UUID).cloned();
+    let remote = chars
+        .iter()
+        .find(|c| c.uuid == REMOTE_UUID && c.properties.contains(CharPropFlags::NOTIFY))
+        .cloned();
 
     peripheral
         .subscribe(&position)
@@ -348,6 +358,9 @@ async fn connected(
         let _ = peripheral.subscribe(c).await;
     }
     if let Some(c) = &log {
+        let _ = peripheral.subscribe(c).await;
+    }
+    if let Some(c) = &remote {
         let _ = peripheral.subscribe(c).await;
     }
     // Subscribe before the read below, so a change the board makes between the
@@ -407,6 +420,10 @@ async fn connected(
                     }
                 } else if n.uuid == LOG_UUID {
                     report.send(BleEvent::Log(String::from_utf8_lossy(&n.value).into_owned()));
+                } else if n.uuid == REMOTE_UUID {
+                    if let Some(e) = remote_event(&n.value) {
+                        report.send(e);
+                    }
                 } else if n.uuid == SETTINGS_UUID {
                     report.send(settings_event(&n.value));
                 }

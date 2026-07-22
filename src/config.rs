@@ -42,6 +42,12 @@
 //! [ble.names]         # nicknames for known boards, keyed by MAC
 //! "AA:BB:CC:DD:EE:FF" = "Truck"
 //!
+//! [lora]
+//! show_path = true    # draw the remote LoRa nodes' paths on the map
+//!
+//! [lora.names]        # nicknames for remote nodes, keyed by LoRa address
+//! 3 = "Truck"
+//!
 //! [track]
 //! min_distance = 3.0  # meters of movement before a new track point is recorded
 //! show_path = true    # draw the phone's own recorded path
@@ -77,6 +83,29 @@ impl Default for MarkerColors {
             outline: Color32::WHITE,
         }
     }
+}
+
+/// Distinct colors for the remote LoRa nodes, cycled by address so each node
+/// keeps a stable color across a session. Deliberately not in the config: these
+/// exist to tell many nodes apart at a glance rather than to carry a meaning
+/// worth editing, and they steer clear of the phone track's blue and the
+/// connected board's orange-red so the three groups never read as the same.
+pub const REMOTE_PALETTE: [Color32; 8] = [
+    Color32::from_rgb(255, 165, 0),   // orange
+    Color32::from_rgb(60, 180, 75),   // green
+    Color32::from_rgb(145, 30, 180),  // purple
+    Color32::from_rgb(70, 190, 220),  // cyan
+    Color32::from_rgb(240, 50, 230),  // magenta
+    Color32::from_rgb(0, 128, 128),   // teal
+    Color32::from_rgb(210, 245, 60),  // lime
+    Color32::from_rgb(245, 130, 200), // pink
+];
+
+/// The palette color for a remote node at LoRa address `addr`. Two addresses a
+/// palette-length apart share a color; with a handful of nodes in the air that
+/// is rare, and the marker's own position tells them apart regardless.
+pub fn remote_color(addr: u8) -> Color32 {
+    REMOTE_PALETTE[addr as usize % REMOTE_PALETTE.len()]
 }
 
 /// Colors of the pages rather than the map: the feedback and status lines, the
@@ -296,6 +325,59 @@ pub fn normalize_mac(mac: &str) -> String {
         .join(":")
 }
 
+/// Remote LoRa node settings: whether to draw their paths, and their
+/// nicknames.
+///
+/// A node's identity is its LoRa address (1-255), a namespace of its own,
+/// separate from the BLE MACs the [`BleSettings`] nicknames key on: the same
+/// physical board could be reached over BLE by MAC and heard over LoRa by
+/// address, and the two never meet in one table.
+#[derive(Clone)]
+pub struct LoraSettings {
+    /// Draw the remote nodes' paths on the map. The map bar's path button and
+    /// the per-node color are separate; this only hides the lines.
+    pub show_path: bool,
+    /// Nicknames for known nodes, keyed by LoRa address.
+    pub names: BTreeMap<u8, String>,
+}
+
+impl Default for LoraSettings {
+    fn default() -> Self {
+        // Shown by default: relaying these onto the map is the whole reason the
+        // nodes are received, unlike the connected board's own path.
+        Self {
+            show_path: true,
+            names: BTreeMap::new(),
+        }
+    }
+}
+
+impl LoraSettings {
+    /// The nickname for `addr`, if one is set.
+    pub fn name_of(&self, addr: u8) -> Option<&str> {
+        self.names.get(&addr).map(String::as_str)
+    }
+
+    /// Name `addr`, or forget it when `name` is blank.
+    pub fn set_name(&mut self, addr: u8, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.names.remove(&addr);
+        } else {
+            self.names.insert(addr, name.to_string());
+        }
+    }
+
+    /// How this node should be labelled: its nickname, or "Node N" when it has
+    /// none. This is the one place a remote's nickname is resolved, so every
+    /// page names the same node the same way.
+    pub fn label_of(&self, addr: u8) -> String {
+        self.name_of(addr)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Node {addr}"))
+    }
+}
+
 /// Track recording settings.
 #[derive(Clone, Copy)]
 pub struct TrackSettings {
@@ -349,6 +431,7 @@ pub struct AppConfig {
     pub sizes: MarkerSizes,
     pub distance: DistanceSettings,
     pub ble: BleSettings,
+    pub lora: LoraSettings,
     pub track: TrackSettings,
     pub compass: CompassSettings,
 }
@@ -367,6 +450,8 @@ struct RawConfig {
     distance: RawDistance,
     #[serde(default)]
     ble: RawBle,
+    #[serde(default)]
+    lora: RawLora,
     #[serde(default)]
     track: RawTrack,
     #[serde(default)]
@@ -411,6 +496,14 @@ struct RawBle {
     enabled: Option<bool>,
     show_path: Option<bool>,
     mac: Option<String>,
+    #[serde(default)]
+    names: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawLora {
+    show_path: Option<bool>,
+    // TOML table keys are strings; parsed to a u8 address on the way in.
     #[serde(default)]
     names: BTreeMap<String, String>,
 }
@@ -520,6 +613,42 @@ fn set_names(doc: &mut DocumentMut, names: &BTreeMap<String, String>) {
     }
 }
 
+/// Rewrite `[lora.names]` to match `names`, mirroring [`set_names`]: entries
+/// still present keep their decor, ones no longer known are dropped. Keys are
+/// the numeric address written as a string; a bare TOML key of ASCII digits is
+/// legal, so `toml_edit` writes `3 = "Truck"` without quoting.
+fn set_lora_names(doc: &mut DocumentMut, names: &BTreeMap<u8, String>) {
+    let table = doc
+        .entry("lora")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let Some(table) = table.as_table_mut() else {
+        return;
+    };
+    let names_table = table
+        .entry("names")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let Some(names_table) = names_table.as_table_mut() else {
+        return;
+    };
+    // Drop keys no longer known, and any that do not parse to an address we
+    // hold (a stale or malformed key would otherwise linger).
+    names_table.retain(|key, _| {
+        key.trim()
+            .parse::<u8>()
+            .is_ok_and(|addr| names.contains_key(&addr))
+    });
+    for (addr, name) in names {
+        let key = addr.to_string();
+        if let Some(old) = names_table.get(&key).and_then(Item::as_value) {
+            let mut value: Value = name.as_str().into();
+            *value.decor_mut() = old.decor().clone();
+            names_table.insert(&key, Item::Value(value));
+        } else {
+            names_table.insert(&key, Item::Value(name.as_str().into()));
+        }
+    }
+}
+
 /// Range the marker-arrow compass rate is accepted (and edited) in. The floor
 /// keeps the arrow from lagging behind a turn; the ceiling is about where the
 /// sensor stops being the cheap background reader this rate is meant to be.
@@ -610,6 +739,7 @@ impl AppConfig {
             "mac",
             self.ble.mac.clone().unwrap_or_default().into(),
         );
+        set(&mut doc, "lora", "show_path", self.lora.show_path.into());
         set(
             &mut doc,
             "track",
@@ -630,6 +760,7 @@ impl AppConfig {
             f32_value(self.compass.arrow_hz),
         );
         set_names(&mut doc, &self.ble.names);
+        set_lora_names(&mut doc, &self.lora.names);
         std::fs::write(path, doc.to_string()).map_err(|e| format!("{path}: {e}"))?;
         Ok(false)
     }
@@ -648,6 +779,16 @@ impl AppConfig {
                 .names
                 .iter()
                 .map(|(mac, name)| format!("{mac:?} = {name:?}\n"))
+                .collect()
+        };
+        // Same treatment for the LoRa node names, keyed by numeric address.
+        let lora_names = if self.lora.names.is_empty() {
+            "# 3 = \"Truck\"\n".to_string()
+        } else {
+            self.lora
+                .names
+                .iter()
+                .map(|(addr, name)| format!("{addr} = {name:?}\n"))
                 .collect()
         };
         format!(
@@ -688,6 +829,12 @@ impl AppConfig {
              [ble.names]          # nicknames for known boards; they all advertise the same name\n\
              {names}\
              \n\
+             [lora]               # remote nodes heard over LoRa and relayed by the connected board\n\
+             show_path = {lora_show_path}    # draw the remote nodes' paths on the map\n\
+             \n\
+             [lora.names]         # nicknames for remote nodes, keyed by LoRa address (1-255)\n\
+             {lora_names}\
+             \n\
              [track]\n\
              min_distance = {min_distance:?}   # meters of movement before a new track point\n\
              show_path = {show_track}    # draw the phone's own recorded path\n\
@@ -716,6 +863,8 @@ impl AppConfig {
             show_path = self.ble.show_path,
             mac = self.ble.mac.clone().unwrap_or_default(),
             names = names,
+            lora_show_path = self.lora.show_path,
+            lora_names = lora_names,
             min_distance = self.track.min_distance,
             show_track = self.track.show_path,
             marker_arrow = self.compass.marker_arrow,
@@ -795,6 +944,24 @@ impl AppConfig {
             .filter(|(_, name)| !name.trim().is_empty())
             .map(|(mac, name)| (normalize_mac(&mac), name.trim().to_string()))
             .collect();
+        if let Some(v) = raw.lora.show_path {
+            config.lora.show_path = v;
+        }
+        // LoRa node keys are addresses (1-255); 0 is the local GPS, not a
+        // remote. A key that is not one is a typo worth surfacing rather than
+        // silently dropping, since the file is hand-editable.
+        for (key, name) in raw.lora.names {
+            if name.trim().is_empty() {
+                continue;
+            }
+            let addr = key.trim().parse::<u8>().ok().filter(|&a| a != 0);
+            let Some(addr) = addr else {
+                return Err(format!(
+                    "invalid lora.names address {key:?}, expected a number 1-255"
+                ));
+            };
+            config.lora.names.insert(addr, name.trim().to_string());
+        }
         if let Some(v) = raw.track.min_distance {
             if !v.is_finite() || v < 0.0 {
                 return Err(format!("track.min_distance must be >= 0, got {v}"));
@@ -959,6 +1126,52 @@ mod tests {
         let back = AppConfig::load(path).unwrap();
         assert_eq!(back.ble.name_of("AA:BB:CC:DD:EE:FF"), Some("Truck"));
         assert_eq!(back.ble.name_of("11:22:33:44:55:66"), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn lora_names_parse_by_address_and_round_trip() {
+        let cfg = AppConfig::from_toml(
+            "[lora]\nshow_path = false\n\n[lora.names]\n3 = \"Truck\"\n7 = \"Drone\"\n",
+        )
+        .unwrap();
+        assert!(!cfg.lora.show_path);
+        assert_eq!(cfg.lora.name_of(3), Some("Truck"));
+        assert_eq!(cfg.lora.label_of(7), "Drone");
+        // No entry falls back to the address.
+        assert_eq!(cfg.lora.label_of(12), "Node 12");
+
+        // Address 0 is the local GPS, never a remote, so it is a bad key.
+        assert!(AppConfig::from_toml("[lora.names]\n0 = \"nope\"").is_err());
+        assert!(AppConfig::from_toml("[lora.names]\nfoo = \"nope\"").is_err());
+
+        // The generated default file reads back unchanged.
+        let back = AppConfig::from_toml(&AppConfig::default().to_toml()).unwrap();
+        assert!(back.lora.show_path);
+        assert!(back.lora.names.is_empty());
+    }
+
+    #[test]
+    fn saved_lora_names_round_trip_and_forgetting_sticks() {
+        let path = std::env::temp_dir().join("gps-gui-rs-config-lora-test.toml");
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+
+        let mut cfg = AppConfig::default();
+        cfg.lora.set_name(3, "Truck");
+        cfg.lora.set_name(7, "Drone");
+        assert!(cfg.save(path).unwrap());
+        let back = AppConfig::load(path).unwrap();
+        assert_eq!(back.lora.name_of(3), Some("Truck"));
+        assert_eq!(back.lora.name_of(7), Some("Drone"));
+
+        // Forget one and save over the file: the line must go, not linger.
+        let mut cfg = back;
+        cfg.lora.set_name(7, "");
+        assert!(!cfg.save(path).unwrap());
+        let back = AppConfig::load(path).unwrap();
+        assert_eq!(back.lora.name_of(3), Some("Truck"));
+        assert_eq!(back.lora.name_of(7), None);
         let _ = std::fs::remove_file(path);
     }
 

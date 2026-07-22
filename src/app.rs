@@ -281,6 +281,8 @@ pub enum PointFilter {
     All,
     Phone,
     Esp,
+    /// Any remote LoRa node, whatever its address.
+    Remote,
 }
 
 impl PointFilter {
@@ -289,6 +291,7 @@ impl PointFilter {
             PointFilter::All => true,
             PointFilter::Phone => source == PointSource::Phone,
             PointFilter::Esp => source == PointSource::Esp,
+            PointFilter::Remote => matches!(source, PointSource::Remote(_)),
         }
     }
 }
@@ -298,15 +301,21 @@ impl PointFilter {
 pub enum MarkerKind {
     /// The phone / manual position dot.
     You,
-    /// The BLE GPS beacon.
+    /// The connected board's own GPS.
     Beacon,
+    /// A remote LoRa node relayed by the connected board, keyed by its address.
+    Remote(u8),
 }
 
 impl MarkerKind {
-    fn label(self) -> &'static str {
+    /// The generic label, before any nickname is applied. A remote's nickname
+    /// lives in the config, so [`MyApp::marker_label`] is what resolves it;
+    /// this is the fallback that names a node by its address.
+    fn label(self) -> String {
         match self {
-            MarkerKind::You => "You",
-            MarkerKind::Beacon => "Beacon",
+            MarkerKind::You => "You".to_string(),
+            MarkerKind::Beacon => "Beacon".to_string(),
+            MarkerKind::Remote(addr) => format!("Node {addr}"),
         }
     }
 }
@@ -332,6 +341,25 @@ struct AppliedColors {
     background: Option<egui::Color32>,
     button: Option<egui::Color32>,
     text: Option<egui::Color32>,
+}
+
+/// A remote LoRa node relayed over BLE by the connected board, keyed in
+/// [`MyApp::remotes`] by its address. Each keeps its own live position and
+/// recorded path, so different boards draw as different tracks and list as
+/// different sources.
+#[derive(Default)]
+struct RemoteNode {
+    /// Live position, `None` until a fix is heard (and cleared when the board
+    /// is switched, since it described the old relay's view of the mesh).
+    pos: Option<Position>,
+    /// When `pos` was last updated, for the marker info popup.
+    time: Option<SystemTime>,
+    /// The last packet decoded for this node (speed, sats, ...).
+    packet: PositionPacket,
+    /// LoRa signal the relay last heard this node at, in dBm.
+    rssi: i16,
+    /// Every recorded position, for the path drawing and the points list.
+    track: Vec<TrackPoint>,
 }
 
 pub struct MyApp {
@@ -391,6 +419,9 @@ pub struct MyApp {
     beacon_packet: Option<PositionPacket>,
     /// Every beacon position recorded, for the path drawing and points list.
     beacon_track: Vec<TrackPoint>,
+    /// Remote LoRa nodes relayed by the connected board, keyed by address. Each
+    /// draws as its own colored path and marker, and lists as its own source.
+    remotes: BTreeMap<u8, RemoteNode>,
     /// Last BLE status line, for the Beacon page.
     ble_status: String,
     ble_connected: bool,
@@ -534,6 +565,7 @@ impl MyApp {
             beacon_time: None,
             beacon_packet: None,
             beacon_track: Vec::new(),
+            remotes: BTreeMap::new(),
             ble_status: "idle".to_string(),
             ble_connected: false,
             ble_interval_text: packet::UPDATE_INTERVAL_DEFAULT_MS.to_string(),
@@ -750,13 +782,20 @@ impl MyApp {
     /// it: the map would go on drawing the old board's last fix as if it were
     /// the one now selected.
     ///
-    /// `beacon_track` is deliberately kept. It is recorded history that also
-    /// backs the Points page, so discarding it would delete data the user may
-    /// want; the points carry their own timestamps and source.
+    /// `beacon_track` and the remote nodes' tracks are deliberately kept. They
+    /// are recorded history that also backs the Points page, so discarding them
+    /// would delete data the user may want; the points carry their own
+    /// timestamps and source. Only the live view (positions the old relay was
+    /// showing) is dropped, so the map stops drawing them as the new board's.
     fn forget_board_state(&mut self) {
         self.beacon = None;
         self.beacon_time = None;
         self.beacon_packet = None;
+        for node in self.remotes.values_mut() {
+            node.pos = None;
+            node.time = None;
+            node.packet = PositionPacket::default();
+        }
         self.board_settings = None;
         self.settings_unsupported = false;
         self.telemetry = None;
@@ -1031,32 +1070,67 @@ impl MyApp {
     }
 
     /// The markers the center button can center on, in menu order: you first
-    /// (the plain tap's target), then each beacon. Only markers with a known
-    /// position are listed, so an entry always has somewhere to go.
+    /// (the plain tap's target), then each beacon board (the connected board,
+    /// then each remote node). Only markers with a known position are listed,
+    /// so an entry always has somewhere to go.
     fn center_targets(&self) -> Vec<(MarkerKind, Position)> {
         let mut targets: Vec<(MarkerKind, Position)> =
             self.current.map(|p| (MarkerKind::You, p)).into_iter().collect();
+        targets.extend(self.beacon_targets());
+        targets
+    }
+
+    /// The beacon boards the map can point to: the connected board first, then
+    /// each remote node in address order, each with a known position. Tracking
+    /// mode cycles through this and the center menu jumps to it, so the two
+    /// keep the same order and the tracking index stays meaningful.
+    fn beacon_targets(&self) -> Vec<(MarkerKind, Position)> {
+        let mut targets: Vec<(MarkerKind, Position)> = self
+            .beacon
+            .map(|p| (MarkerKind::Beacon, p))
+            .into_iter()
+            .collect();
         targets.extend(
-            self.beacon_positions()
-                .into_iter()
-                .map(|p| (MarkerKind::Beacon, p)),
+            self.remotes
+                .iter()
+                .filter_map(|(&addr, node)| node.pos.map(|p| (MarkerKind::Remote(addr), p))),
         );
         targets
     }
 
-    /// Great-circle distance from the current position to the BLE beacon, in
-    /// meters. `None` until both a fix and a beacon position are known.
-    fn distance_to_beacon(&self) -> Option<f64> {
-        match (self.current, self.beacon) {
-            (Some(cur), Some(beacon)) => Some(haversine_m(cur, beacon)),
+    /// The board the distance read-out and its line refer to: the one tracking
+    /// mode currently has selected, or the connected board when not tracking.
+    /// `None` until that board has a position.
+    fn distance_target(&self) -> Option<(MarkerKind, Position)> {
+        match self.tracking_beacon {
+            Some(idx) => self.beacon_targets().get(idx).copied(),
+            None => self.beacon.map(|p| (MarkerKind::Beacon, p)),
+        }
+    }
+
+    /// Great-circle distance from the current position to the distance target
+    /// (see [`Self::distance_target`]), in meters. `None` until both a fix and
+    /// that board's position are known.
+    fn distance_to_target(&self) -> Option<f64> {
+        match (self.current, self.distance_target()) {
+            (Some(cur), Some((_, target))) => Some(haversine_m(cur, target)),
             _ => None,
         }
     }
 
-    /// The beacons that tracking mode can cycle through. One entry today (the
-    /// single BLE beacon); the list keeps the cycling logic ready for more.
+    /// The beacon boards tracking mode can cycle through, as positions. Backs
+    /// the tracking index and the "can track" test.
     fn beacon_positions(&self) -> Vec<Position> {
-        self.beacon.into_iter().collect()
+        self.beacon_targets().into_iter().map(|(_, p)| p).collect()
+    }
+
+    /// A marker's display name, resolving a remote node's nickname from the
+    /// config. The one place a node's name is decided, so every page agrees.
+    fn marker_label(&self, kind: MarkerKind) -> String {
+        match kind {
+            MarkerKind::Remote(addr) => self.config.lora.label_of(addr),
+            other => other.label(),
+        }
     }
 
     /// While tracking a beacon, recenter the map between the user and that
@@ -1196,6 +1270,31 @@ impl MyApp {
                             self.beacon_track.push(TrackPoint {
                                 pos,
                                 source: PointSource::Esp,
+                                time: SystemTime::now(),
+                            });
+                        }
+                    }
+                }
+                BleEvent::Remote { src, rssi, packet } => {
+                    // Bucket by address so each node keeps its own path, even
+                    // though the board relays only one remote slot at a time.
+                    let min_distance = self.config.track.min_distance;
+                    let node = self.remotes.entry(src).or_default();
+                    // The board re-notifies that one slot every interval, so the
+                    // same packet arrives repeatedly. Only a changed one counts
+                    // as a new report, so the "updated ago" time and the path
+                    // reflect real movement rather than the relay's cadence.
+                    let fresh = node.pos.is_none() || node.packet != packet;
+                    node.rssi = rssi;
+                    if fresh && packet.has_fix() {
+                        node.packet = packet;
+                        let pos = lat_lon(packet.lat_deg(), packet.lon_deg());
+                        node.pos = Some(pos);
+                        node.time = Some(SystemTime::now());
+                        if far_enough(node.track.last().map(|t| &t.pos), pos, min_distance) {
+                            node.track.push(TrackPoint {
+                                pos,
+                                source: PointSource::Remote(src),
                                 time: SystemTime::now(),
                             });
                         }

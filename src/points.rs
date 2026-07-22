@@ -10,19 +10,25 @@ use walkers::Position;
 pub enum PointSource {
     /// The phone's own GNSS (a simulated loop on desktop).
     Phone,
-    /// The ESP32-C3 BLE GPS beacon.
+    /// The connected board's own GPS (esp32c6-gps / esp32c3 beacon).
     Esp,
+    /// A remote node heard over LoRa and relayed by the connected board,
+    /// keyed by its LoRa address (1-255). Each address is its own track.
+    Remote(u8),
 }
 
 impl PointSource {
     /// How the source is named in the points list and its filter.
     ///
     /// The phone is the BLE central of the link the ESP beacon sits on the far
-    /// end of, which is the name it goes by everywhere else in the system.
-    pub fn label(self) -> &'static str {
+    /// end of, which is the name it goes by everywhere else in the system. A
+    /// remote node has no app-side nickname here (that lives in the config and
+    /// is applied where the config is in reach); the list names it by address.
+    pub fn label(self) -> String {
         match self {
-            PointSource::Phone => "Central",
-            PointSource::Esp => "esp",
+            PointSource::Phone => "Central".to_string(),
+            PointSource::Esp => "esp".to_string(),
+            PointSource::Remote(addr) => format!("Node {addr}"),
         }
     }
 }
@@ -93,6 +99,15 @@ mod tests {
     fn source_search_ignores_label_case() {
         // The query arrives lowercased; a capitalized label still matches.
         assert!(point(PointSource::Phone).matches("central"));
+    }
+
+    #[test]
+    fn remote_nodes_are_named_and_searchable_by_address() {
+        let p = point(PointSource::Remote(7));
+        assert_eq!(p.source.label(), "Node 7");
+        assert!(p.matches("node 7"));
+        assert!(p.matches("node"));
+        assert!(!p.matches("central"));
     }
 
     #[test]
